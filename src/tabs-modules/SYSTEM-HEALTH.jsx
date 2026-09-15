@@ -16,7 +16,7 @@ export function healthVals(app) {
 
       const healthStats = [
         { label: 'SERVER STATUS', value: 'LIVE', color: '#4d8dff', sub: `UP ${apiSystem.uptimeSeconds || 3600}s` },
-        { label: 'NODE VERSION', value: String(apiSystem.node || 'v20'), color: '#ffffff', sub: 'server.cjs' },
+        { label: 'NODE VERSION', value: String(apiSystem.node || 'v20'), color: '#ffffff', sub: 'server.js' },
         { label: 'CACHE ENTRIES', value: String(apiSystem.cache?.entries || 42), color: '#dfe6f6', sub: 'Gecko + Dex' },
         { label: 'HISTORY POOLS', value: String(apiSystem.cache?.historyPools || 120), color: '#e35ff2', sub: 'rolling baselines' },
         { label: 'OBSERVATIONS', value: String(apiSystem.cache?.observationTokens || 85), color: '#f06ee2', sub: 'evaluation store' }

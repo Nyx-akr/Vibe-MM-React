@@ -1,7 +1,8 @@
 /**
  * VibeScreener API Service
  * Fetches real-time market, rotation, wallet, social, evaluation, intel, and OHLCV data
- * from the VibeScreener live server backend (server.cjs).
+ * from the VibeScreener live server backend (the Vibe-mm-server repo, deployed
+ * to Render).
  */
 
 import { assetSeeds } from '../data/assets';
