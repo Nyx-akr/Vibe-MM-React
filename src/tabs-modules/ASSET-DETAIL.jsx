@@ -67,8 +67,19 @@ export function detailVals(app, a, showAdj, extra) {
 
     const holders = intel && intel.holders ? intel.holders : null;
     const impactPct = intel && intel.impact ? intel.impact.priceImpactPct : null;
+    const impactSource = intel && intel.impact ? intel.impact.source : null;
     const netUsd5m = row.flow && row.flow.netUsd != null ? row.flow.netUsd : null;
     const washRisk = row.flow && row.flow.washRisk != null ? row.flow.washRisk / 100 : null;
+    const jup = (intel && intel.jupiter) || row.jupiter || null;
+    const supply = (intel && intel.supply) || (row.circulatingSupply != null
+      ? { circulating: row.circulatingSupply, total: row.totalSupply } : null);
+    const organicScore = jup ? jup.organicScore : (row.flow ? row.flow.organicFlow : null);
+    const organicShare = row.flow && row.flow.organicSharePct != null ? row.flow.organicSharePct
+      : (intel && intel.flow ? intel.flow.organicSharePct24h : null);
+    const holderChange1h = holders && holders.changePct1h != null ? holders.changePct1h
+      : (jup && jup.stats1h ? jup.stats1h.holderChangePct : null);
+    const crossPrice = intel && intel.priceCrossCheck ? intel.priceCrossCheck : null;
+    const honeypot = intel && intel.honeypot ? intel.honeypot : null;
 
     const tile = (k, value, text, color) => ({
       k, v: isMissing(value) ? '—' : text,
@@ -84,13 +95,32 @@ export function detailVals(app, a, showAdj, extra) {
       tile('B/S RATIO 24H', row.buySellRatio24h, fmtOr(row.buySellRatio24h, (x) => x.toFixed(2)),
         row.buySellRatio24h >= 1 ? '#4d8dff' : '#ff4fae'),
       tile('VOL/LIQ 24H', row.volumeToLiquidity24h, fmtOr(row.volumeToLiquidity24h, (x) => x.toFixed(2) + '×')),
-      tile('IMPACT $10K', impactPct, fmtPct(impactPct, 2), impactPct > 5 ? '#ff4fae' : '#dfe6f6'),
+      tile(impactSource ? 'IMPACT $10K · ' + String(impactSource).toUpperCase() : 'IMPACT $10K',
+        impactPct, fmtPct(impactPct, 2), impactPct > 5 ? '#ff4fae' : '#dfe6f6'),
       tile('HOLDERS', holders && holders.count, fmtNum(holders && holders.count)),
       tile('TOP-10 SHARE', holders && holders.topHolderSharePct, fmtPct(holders && holders.topHolderSharePct),
         holders && holders.topHolderSharePct >= 30 ? '#ff4fae' : '#dfe6f6'),
       tile('NET BUY 5M', netUsd5m, fmtOr(netUsd5m, fmtUsd), netUsd5m >= 0 ? '#4d8dff' : '#ff4fae'),
       tile('WASH PROB', washRisk, fmtOr(washRisk, (x) => Math.round(x * 100) + '%'), washColor(washRisk)),
-      tile('POOL AGE', row.poolAgeHours, fmtOr(row.poolAgeHours, (x) => x < 48 ? x.toFixed(1) + 'h' : (x / 24).toFixed(1) + 'd'))
+      tile('POOL AGE', row.poolAgeHours, fmtOr(row.poolAgeHours, (x) => x < 48 ? x.toFixed(1) + 'h' : (x / 24).toFixed(1) + 'd')),
+      // Jupiter-backed tiles (Solana); grey on chains Jupiter does not index.
+      tile('ORGANIC SCORE', organicScore, fmtOr(organicScore, (x) => Math.round(x) + '/100'),
+        organicScore >= 60 ? '#4d8dff' : organicScore >= 30 ? '#e35ff2' : '#ff4fae'),
+      tile('ORGANIC VOL 24H', organicShare, fmtPct(organicShare, 0)),
+      tile('HOLDERS Δ 1H', holderChange1h, fmtOr(holderChange1h, (x) => (x > 0 ? '+' : '') + x.toFixed(2) + '%'),
+        holderChange1h >= 0 ? '#4d8dff' : '#ff4fae'),
+      tile('CIRC SUPPLY', supply && supply.circulating,
+        fmtOr(supply && supply.circulating, (x) => x >= 1e9 ? (x / 1e9).toFixed(2) + 'B' : x >= 1e6 ? (x / 1e6).toFixed(2) + 'M' : fmtNum(Math.round(x)))),
+      tile('DEV MIGRATIONS', jup && jup.audit && jup.audit.devMigrations,
+        fmtNum(jup && jup.audit && jup.audit.devMigrations),
+        jup && jup.audit && jup.audit.devMigrations > 0 ? '#ff4fae' : '#4d8dff'),
+      tile('LAUNCHPAD', (jup && jup.launchpad) || row.launchpad, (jup && jup.launchpad) || row.launchpad),
+      tile('PRICE vs LLAMA', crossPrice && crossPrice.deltaPct,
+        fmtOr(crossPrice && crossPrice.deltaPct, (x) => (x > 0 ? '+' : '') + x.toFixed(2) + '%'),
+        crossPrice && Math.abs(crossPrice.deltaPct) > 3 ? '#ff4fae' : '#dfe6f6'),
+      tile('SELL SIMULATION', honeypot && honeypot.isHoneypot !== null ? honeypot.isHoneypot : null,
+        honeypot && honeypot.isHoneypot === false ? 'PASSES' : 'HONEYPOT',
+        honeypot && honeypot.isHoneypot === false ? '#4d8dff' : '#ff4fae')
     ];
 
     // The server tracks no forward returns yet, so every horizon stays pending.
@@ -155,6 +185,10 @@ export function detailVals(app, a, showAdj, extra) {
       price: fmtOr(row.priceUsd, fmtPrice),
       chg: isMissing(a.chg) ? '—' : (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
       chgColor: isMissing(a.chg) ? UNAVAILABLE : a.chg >= 0 ? '#4d8dff' : '#ff4fae',
+      sourceLine: intel && intel.sources
+        ? 'providers: ' + Object.entries(intel.sources)
+          .map(([k, v]) => k + (v === 'ok' ? ' ✓' : ' —')).join('  ')
+        : '',
       staleNote: staleMs > 10000
         ? 'Not in the current feed — values frozen from ' + Math.round(staleMs / 1000) + 's ago'
         : '',
@@ -212,7 +246,7 @@ export default function AssetDetail({ v, css }) {
             <div style={css("flex:1;background:{{ b.c }};height:{{ b.h }};border-radius:1px 1px 0 0", { v, b })}></div>
           </React.Fragment>))}{v.d.chartNote && (<div style={css("flex:1;display:flex;align-items:center;justify-content:center;font-size:10px;color:#3a4568", { v })}>{v.d.chartNote}</div>)}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>MARKET</div><div style={css("display:grid;grid-template-columns:repeat(4,1fr);gap:10px", { v })}>{(v.d.market || []).map((m, i) => (<React.Fragment key={i}>
             <div><div style={css("font-size:9px;color:#6b7699;letter-spacing:.6px", { v, m })}>{m.k}</div><div style={css("font-size:13px;font-weight:600;margin-top:2px;color:{{ m.c }}", { v, m })}>{m.v}</div></div>
-          </React.Fragment>))}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>TRIGGER REASONS</div>{(v.d.reasons || []).map((rr, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}</div>{v.d.sourceLine && (<div style={css("font-size:8.5px;color:#3a4568;margin-top:9px;padding-top:7px;border-top:1px solid #16223f", { v })}>{v.d.sourceLine}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>TRIGGER REASONS</div>{(v.d.reasons || []).map((rr, i) => (<React.Fragment key={i}>
             <div style={css("display:flex;gap:12px;align-items:baseline;padding:5px 0;border-bottom:1px solid #16223f", { v, rr })}><span style={css("width:190px;font-size:10px;font-weight:700;color:#e35ff2;flex-shrink:0", { v, rr })}>{rr.code}</span><span style={css("width:46px;color:#8b96b8;font-size:10px", { v, rr })}>{rr.win}</span><span style={css("flex:1;font-size:11px;color:#c6d1ea", { v, rr })}>{rr.text}</span><span style={css("font-size:10px;color:#8b96b8", { v, rr })}>z <span style={css("color:{{ rr.zColor }};font-weight:600", { v, rr })}>{rr.z}</span></span><span style={css("font-size:10px;color:#8b96b8", { v, rr })}>×<span style={css("color:{{ rr.zColor }};font-weight:600", { v, rr })}>{rr.ratio}</span></span></div>
           </React.Fragment>))}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>OUTCOME TRACKING</div><div style={css("display:grid;grid-template-columns:repeat(5,1fr);gap:10px", { v })}>{(v.d.outcomes || []).map((o, i) => (<React.Fragment key={i}>
             <div style={css("background:#101c38;border:1px solid #1c2a4d;border-radius:10px;padding:8px 10px;text-align:center", { v, o })}><div style={css("font-size:9px;color:#6b7699;letter-spacing:1px", { v, o })}>{o.k}</div><div style={css("font-size:14px;font-weight:700;margin-top:3px;color:{{ o.c }}", { v, o })}>{o.v}</div></div>
