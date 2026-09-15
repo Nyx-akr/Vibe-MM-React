@@ -24,7 +24,7 @@ const SOURCES = Object.freeze({
 });
 
 const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || "127.0.0.1";
+const HOST = "0.0.0.0";
 
 const GT_BASE = "https://api.geckoterminal.com/api/v2";
 const DS_BASE = "https://api.dexscreener.com";

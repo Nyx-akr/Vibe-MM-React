@@ -7,11 +7,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8787',
+        target: 'https://vibe-mm-server.onrender.com/',
         changeOrigin: true
       },
       '/health': {
-        target: 'http://127.0.0.1:8787',
+        target: 'https://vibe-mm-server.onrender.com/',
         changeOrigin: true
       }
     }

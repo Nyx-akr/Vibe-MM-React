@@ -257,7 +257,7 @@ class App extends React.Component {
                   $ npm run server
                 </div>
                 <div style={{ fontSize: '9.5px', color: '#6b7699' }}>
-                  Start the server at <span style={{ color: '#4fc3f7' }}>http://127.0.0.1:8787</span> to resume live streaming. Retrying automatically every 5s...
+                  Start the server at <span style={{ color: '#4fc3f7' }}>https://vibe-mm-server.onrender.com/</span> to resume live streaming. Retrying automatically every 5s...
                 </div>
               </div>
             </div>
