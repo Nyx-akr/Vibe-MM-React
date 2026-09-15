@@ -236,3 +236,34 @@ export async function fetchLiveOhlcv(chain, poolAddress, timeframe = 'minute', a
   }
   return { bars: [], reason: 'unreachable', retryAfterMs: null };
 }
+
+/**
+ * Admin telemetry: server process stats, Firestore latency and stored
+ * document metadata. `probe` runs a live write+read round trip.
+ */
+export async function fetchAdminStore({ collection, token, probe } = {}) {
+  try {
+    const params = new URLSearchParams();
+    if (collection) params.set('collection', collection);
+    if (token) params.set('token', token);
+    if (probe) params.set('probe', '1');
+    params.set('limit', '25');
+    const data = await fetchJson(`${BASE_URL}/api/admin/store?${params.toString()}`);
+    if (data && data.server === 'ok') return data;
+  } catch (e) {
+  }
+  return null;
+}
+
+/** The server's own catalogue of field sources and equations. */
+export async function fetchCatalog() {
+  try {
+    const data = await fetchJson(`${BASE_URL}/api/catalog`);
+    if (data && data.server === 'ok') return data;
+  } catch (e) {
+  }
+  return null;
+}
+
+/** Where the data is coming from, for status and admin display. */
+export const API_ORIGIN = BASE_URL;
