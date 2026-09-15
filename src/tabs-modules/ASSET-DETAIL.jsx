@@ -203,9 +203,11 @@ export function detailVals(app, a, showAdj, extra) {
           t: at ? hhmm(at) : '—', hasNext: i < 3, lineC: a.stage > idx ? '#e35ff2' : '#1c2a4d'
         };
       }),
+      // Server bands: WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85.
+      // Promotion is immediate; only demotion is buffered by the hysteresis.
       hysteresis: Number.isFinite(row.stageHysteresis)
-        ? 'Hysteresis band ±' + row.stageHysteresis + ' pts — server holds ' + si.n +
-          ' until the score clears the next band by ' + row.stageHysteresis + '. Stage never flips on 1–2 pt noise.'
+        ? 'Bands 55 / 70 / 85. Promotes as soon as the score clears a band; holds ' + si.n +
+          ' until the score drops ' + row.stageHysteresis + ' pts below it, so the stage never flips on 1–2 pt noise.'
         : 'Stage hysteresis not reported by the server.'
     };
   }
