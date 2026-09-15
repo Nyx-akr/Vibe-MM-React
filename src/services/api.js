@@ -229,8 +229,10 @@ export async function fetchLiveTokenIntel(chain, tokenAddress, poolAddress = '')
 export async function fetchLiveOhlcv(chain, poolAddress, timeframe = 'minute', aggregate = 1, limit = 60) {
   try {
     const data = await fetchJson(`${BASE_URL}/api/ohlcv?chain=${chain}&pool=${encodeURIComponent(poolAddress)}&timeframe=${timeframe}&aggregate=${aggregate}&limit=${limit}`);
-    if (data && data.server === 'ok' && Array.isArray(data.bars)) return data.bars;
+    if (data && Array.isArray(data.bars)) {
+      return { bars: data.bars, reason: data.reason || null, retryAfterMs: data.retryAfterMs || null };
+    }
   } catch (e) {
   }
-  return null;
+  return { bars: [], reason: 'unreachable', retryAfterMs: null };
 }

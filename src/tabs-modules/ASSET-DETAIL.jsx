@@ -60,10 +60,14 @@ export function detailVals(app, a, showAdj, extra) {
       h: Math.round(8 + (v - spMin) / (spMax - spMin || 1) * 92) + '%',
       c: i === closes.length - 1 ? '#e35ff2' : v >= (closes[i - 1] ?? v) ? '#2f66d0' : '#8a2f7c'
     })) : [];
-    const chartNote = closes.length > 1 ? ''
-      : barsState === 'loading' ? 'Loading price history…'
-      : barsState === 'error' ? 'Price history unavailable (upstream rate limit) — no data drawn'
-      : 'No price history for this pool yet';
+    const CHART_NOTES = {
+      loading: 'Loading price history…',
+      rate_limited: 'GeckoTerminal rate limit hit — retrying shortly, nothing drawn',
+      empty: 'GeckoTerminal has no bars for this pool yet',
+      unreachable: 'Chart service unreachable — nothing drawn',
+      upstream_error: 'Price history unavailable upstream — nothing drawn',
+    };
+    const chartNote = closes.length > 1 ? '' : (CHART_NOTES[barsState] || 'No price history for this pool');
 
     const holders = intel && intel.holders ? intel.holders : null;
     const impactPct = intel && intel.impact ? intel.impact.priceImpactPct : null;

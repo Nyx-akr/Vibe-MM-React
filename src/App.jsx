@@ -138,11 +138,20 @@ class App extends React.Component {
       fetchLiveOhlcv(row.chain, row.poolAddress, 'minute', 1, 60)
     ]);
     if (this.detailKey !== key) return;
-    const hasBars = Array.isArray(bars) && bars.length > 1;
+    const barList = (bars && bars.bars) || [];
+    const hasBars = barList.length > 1;
     this.setState({
       intel, intelState: intel ? 'ready' : 'error',
-      bars: hasBars ? bars : null, barsState: hasBars ? 'ready' : 'error'
+      bars: hasBars ? barList : null,
+      barsState: hasBars ? 'ready' : ((bars && bars.reason) || 'error')
     });
+    // A rate-limited chart is temporary - retry once the GT budget refills.
+    if (!hasBars && bars && bars.reason === 'rate_limited') {
+      const retryKey = this.detailKey;
+      setTimeout(() => {
+        if (this.detailKey === retryKey) { this.detailKey = null; this.componentDidUpdate(); }
+      }, bars.retryAfterMs || 20000);
+    }
   }
 
   toggleWatch(id) {
