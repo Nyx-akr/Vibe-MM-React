@@ -48,9 +48,10 @@ export function mapServerRowToAsset(row) {
     cls = 'MEME';
   }
 
-  const wash = row.flow && row.flow.washRisk != null
-    ? row.flow.washRisk / 100
-    : (row.riskPenalty ? Math.min(0.8, row.riskPenalty / 30) : 0.05);
+  // Null when the server ran no wash analysis. The old fallback derived a
+  // percentage from the risk penalty, which reported a wash probability
+  // nobody had measured.
+  const wash = row.flow && row.flow.washRisk != null ? row.flow.washRisk / 100 : null;
 
   const reasons = (row.scoreModel || [])
     .filter(m => !m.pending && m.value !== null)
@@ -72,13 +73,9 @@ export function mapServerRowToAsset(row) {
     text: f.detail || f.code
   }));
 
-  if (flags.length === 0) {
-    flags.push({ sev: 'LOW', text: 'Normal trading baselines active' });
-  }
-
-  const spark = Array.isArray(row.spark) && row.spark.length > 5
-    ? row.spark
-    : [40, 45, 48, 52, 55, 60, 62, 68, 72, 70, 75, 80, 84, 88];
+  // row.spark is the server's real 5m-volume history. Empty until it has
+  // collected samples — an empty trend beats a made-up rising line.
+  const spark = Array.isArray(row.spark) && row.spark.length > 1 ? row.spark : [];
 
   const oracle = (cls === 'STOCK' || cls === 'ETF') ? {
     feed: row.tokenAddress ? row.tokenAddress.slice(0, 6) + '…' + row.tokenAddress.slice(-4) : '0x8c2f…a41e',
@@ -105,11 +102,14 @@ export function mapServerRowToAsset(row) {
     chg: row.priceChangePct && row.priceChangePct.m5 != null
       ? row.priceChangePct.m5 / 100
       : (row.priceChangePct && row.priceChangePct.h1 != null ? row.priceChangePct.h1 / 100 : 0.02),
-    liq: row.liquidityUsd || 100000,
-    vol: row.volume24hUsd || 500000,
-    adj: row.volume5mUsd ? row.volume5mUsd * 12 : (row.volume24hUsd || 500000) * 0.9,
-    buyers: row.traders5m?.buyers || row.txns5m?.buys || 42,
-    nf: row.flow?.netUsd ?? ((row.txns5m?.buys || 10) - (row.txns5m?.sells || 5)) * 250,
+    liq: row.liquidityUsd ?? null,
+    vol: row.volume24hUsd ?? null,
+    // Real 5m volume. Previously this was volume5mUsd × 12 — an hourly
+    // extrapolation shown under a "5M" label.
+    adj: row.volume5mUsd ?? null,
+    buyers: row.traders5m?.buyers ?? row.txns5m?.buys ?? null,
+    // Only DexScreener's USD-split flow can give this; null when absent.
+    nf: row.flow?.netUsd ?? null,
     wash,
     canonical: Boolean(row.crossSource && row.crossSource.sourcesAgreeing > 1),
     reasons,

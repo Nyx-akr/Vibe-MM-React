@@ -8,3 +8,12 @@ export function chainColor(c) { return chainColors[c] || '#a3aed0'; }
 export function clsColor(c) { return { MEME: '#e35ff2', TOKEN: '#a3aed0', STOCK: '#4fc3f7', ETF: '#8fd3ff' }[c]; }
 export function scoreColor(s) { return s >= 90 ? '#f06ee2' : s >= 80 ? '#4d8dff' : s >= 68 ? '#6ea0ff' : '#a3aed0'; }
 export function washColor(wp) { return wp >= 0.3 ? '#ff4fae' : wp >= 0.15 ? '#e35ff2' : '#6b7699'; }
+
+/** Colour for values the server could not supply — greyed out, never invented. */
+export const UNAVAILABLE = '#3a4568';
+/** True when the server gave us nothing usable for a field. */
+export const isMissing = (v) => v === null || v === undefined || (typeof v === 'number' && !Number.isFinite(v));
+/** Formats a real number, or a grey em dash when the value is missing. */
+export function fmtOr(v, format) { return isMissing(v) ? '—' : format(v); }
+export function fmtPct(v, digits = 1) { return isMissing(v) ? '—' : v.toFixed(digits) + '%'; }
+export function fmtNum(v) { return isMissing(v) ? '—' : v.toLocaleString('en-US'); }

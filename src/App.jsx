@@ -27,12 +27,14 @@ import {
   fetchLiveWalletData,
   fetchLiveSocialData,
   fetchLiveEvalData,
-  fetchLiveSystemData
+  fetchLiveSystemData,
+  fetchLiveTokenIntel,
+  fetchLiveOhlcv
 } from './services/api';
 import AppHeader from './components/AppHeader';
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toast: null, serverError: false };
+    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toast: null, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
     try { const w = JSON.parse(localStorage.getItem('vs_watchlist') || 'null'); if (w) this.state.watch = w; } catch (e) { }
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
@@ -113,6 +115,45 @@ class App extends React.Component {
     this.apiTimer = setInterval(() => this.syncLiveData(), 5000);
     for (let i = 0; i < 7; i++) this.pushTape(false);
   }
+  componentDidUpdate() {
+    if (this.state.page !== 'detail') { this.detailKey = null; return; }
+    this.loadDetailData(this.assets.find(a => a.id === this.state.selectedId) || this.assets[0]);
+  }
+
+  /**
+   * Loads the per-token extras the feed does not carry: contract safety, holder
+   * counts and routed price impact (/api/intel) plus real minute bars
+   * (/api/ohlcv). Fetched once per token and re-fetched when the selection
+   * changes; a failure is recorded so the view can grey the fields out.
+   */
+  async loadDetailData(a) {
+    const row = a && a.rawServerRow;
+    if (!row || !row.tokenAddress) return;
+    const key = row.chain + ':' + row.tokenAddress + ':' + row.poolAddress;
+    if (this.detailKey === key) return;
+    this.detailKey = key;
+    this.setState({ intel: null, intelState: 'loading', bars: null, barsState: 'loading' });
+    const [intel, bars] = await Promise.all([
+      fetchLiveTokenIntel(row.chain, row.tokenAddress, row.poolAddress || ''),
+      fetchLiveOhlcv(row.chain, row.poolAddress, 'minute', 1, 60)
+    ]);
+    if (this.detailKey !== key) return;
+    const hasBars = Array.isArray(bars) && bars.length > 1;
+    this.setState({
+      intel, intelState: intel ? 'ready' : 'error',
+      bars: hasBars ? bars : null, barsState: hasBars ? 'ready' : 'error'
+    });
+  }
+
+  toggleWatch(id) {
+    this.setState(s => {
+      const watch = { ...s.watch };
+      if (watch[id]) delete watch[id]; else watch[id] = true;
+      try { localStorage.setItem('vs_watchlist', JSON.stringify(watch)); } catch (e) { }
+      return { watch };
+    });
+  }
+
   componentWillUnmount() {
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
@@ -123,10 +164,8 @@ class App extends React.Component {
   simTick() {
     if (this.props.liveFeed === false || this.state.serverError || !this.assets.length) return;
     const r = Math.random;
-    this.assets.forEach(a => {
-      a.score = Math.max(40, Math.min(97, a.score + (r() - 0.48) * 0.9)); a.vol *= 1 + (r() - 0.45) * 0.03; a.adj *= 1 + (r() - 0.45) * 0.03; a.buyers = Math.max(5, Math.round(a.buyers * (1 + (r() - 0.46) * 0.02))); a.chg += (r() - 0.5) * 0.004; a.nf *= 1 + (r() - 0.48) * 0.04; a.age += 2;
-      a.spark.push(Math.max(8, Math.min(100, a.spark[a.spark.length - 1] + (r() - 0.44) * 10))); if (a.spark.length > 44) a.spark.shift();
-    });
+    // Asset values are NOT touched here. They come from /api/market every 5s and
+    // drifting them locally would mean showing numbers no server ever reported.
     this.pushTape(true);
     const flash = r() < 0.3 ? this.assets[Math.floor(r() * this.assets.length)].id : null;
     this.setState(s => ({ tick: s.tick + 1, flashId: flash }));
@@ -151,7 +190,7 @@ class App extends React.Component {
     const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['STOCK', 'Stock tokens'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
     const chainFilters = ['ALL', 'SOL', 'BASE', 'RHC', 'BNB'].map(k => chip(k, st.chainF === k, () => this.setState({ chainF: k })));
     const classFilters = ['ALL', 'MEME', 'TOKEN', 'STOCK', 'ETF'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
-    const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], ['adj', showAdj ? 'VOL 5M ADJ' : 'VOL 5M RAW'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'TREND'], [null, 'TOP REASON']];
+    const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'TREND'], [null, 'TOP REASON']];
     const headers = cols.map(([k, label]) => ({
       label, arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
       sort: k ? () => this.setState(s => ({ sortKey: k, sortDir: s.sortKey === k ? -s.sortDir : -1 })) : () => { }
@@ -172,6 +211,10 @@ class App extends React.Component {
       const tr = a.spark.slice(-14); const tMax = Math.max(...tr), tMin = Math.min(...tr);
       const spMax = Math.max(...a.spark), spMin = Math.min(...a.spark);
       return {
+        // Clicking anywhere on the row opens this token in the Asset Detail tab.
+        open: () => this.setState({ page: 'detail', selectedId: a.id }),
+        goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
+        star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
         isBundle: !!a.bundle,
         expanded: st.expandedId === a.id,
@@ -183,13 +226,25 @@ class App extends React.Component {
         stage: si.n, stageBg: si.bg, stageFg: si.fg, score: Math.round(a.score), scoreColor: scoreColor(a.score), conf: a.conf.toFixed(2),
         sym: a.sym, name: a.name, chain: a.chain, chainColor: chainColor(a.chain), cls: a.cls, clsColor: clsColor(a.cls),
         age: fmtAge(a.age), price: fmtPrice(a.price), chg: (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%', chgColor: a.chg >= 0 ? '#4d8dff' : '#ff4fae',
-        liq: fmtUsd(a.liq), vol: fmtUsd(showAdj ? a.adj : a.vol), volTag: showAdj && a.adj < a.vol * 0.95 ? 'adj' : '', buyers: a.buyers,
-        netflow: fmtUsd(a.nf), nfColor: a.nf >= 0 ? '#4d8dff' : '#ff4fae', wash: Math.round(a.wash * 100) + '%', washColor: washColor(a.wash), reason: a.reason
+        liq: a.liq == null ? '—' : fmtUsd(a.liq),
+        vol: (showAdj ? a.adj : a.vol) == null ? '—' : fmtUsd(showAdj ? a.adj : a.vol), volTag: '',
+        buyers: a.buyers == null ? '—' : a.buyers,
+        netflow: a.nf == null ? '—' : fmtUsd(a.nf), nfColor: a.nf == null ? '#3a4568' : a.nf >= 0 ? '#4d8dff' : '#ff4fae',
+        wash: a.wash == null ? '—' : Math.round(a.wash * 100) + '%', washColor: a.wash == null ? '#3a4568' : washColor(a.wash), reason: a.reason
       };
     });
     const bundled = this.assets.filter(a => a.bundle);
-    const sel = this.assets.find(a => a.id === st.selectedId) || this.assets[0];
-    const d = detailVals(this, sel, showAdj);
+    // The feed reorders every 5s and a token can drop out of it. Keep showing
+    // the token the user opened (with a staleness note) instead of silently
+    // swapping the detail view to a different asset.
+    let sel = this.assets.find(a => a.id === st.selectedId);
+    if (sel) { this.lastSelected = sel; this.lastSelectedAt = Date.now(); }
+    else if (st.selectedId && this.lastSelected && this.lastSelected.id === st.selectedId) sel = this.lastSelected;
+    else sel = this.assets[0];
+    const staleMs = sel && this.lastSelected === sel && !this.assets.includes(sel) ? Date.now() - this.lastSelectedAt : 0;
+    const d = detailVals(this, sel, showAdj, {
+      intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs
+    });
     const counts = [0, 0, 0, 0, 0]; this.assets.forEach(a => counts[a.stage]++);
     const stats = [{ label: 'ACTIVE ALERTS', value: String(this.assets.length), color: '#ffffff' }, { label: 'CONFIRMED+', value: String(counts[3] + counts[4]), color: '#4d8dff' }, { label: 'EXCEPTIONAL', value: String(counts[4]), color: '#f06ee2' }, { label: 'AVG ORGANIC PROB', value: '0.81', color: '#dfe6f6' }, { label: 'PRECISION@20 · 24H', value: '0.62', color: '#e35ff2' }];
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
@@ -218,7 +273,7 @@ class App extends React.Component {
 
   chepePickVals() {
     const day = new Date().toISOString().slice(0, 10);
-    const cands = this.assets.filter(a => a.wash < 0.15 && a.stage >= 2);
+    const cands = this.assets.filter(a => (a.wash ?? 0) < 0.15 && a.stage >= 2);
     if (!cands.length) {
       return {
         chepePickSym: '—', chepePickChain: '—', chepePickChainColor: '#a3aed0',
