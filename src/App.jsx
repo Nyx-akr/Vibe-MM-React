@@ -143,7 +143,9 @@ class App extends React.Component {
     this.setState({
       intel, intelState: intel ? 'ready' : 'error',
       bars: hasBars ? barList : null,
-      barsState: hasBars ? 'ready' : ((bars && bars.reason) || 'error')
+      barsState: hasBars
+        ? (bars.reason === 'local_history' ? 'local_history' : 'ready')
+        : ((bars && bars.reason) || 'error')
     });
     // A rate-limited chart is temporary - retry once the GT budget refills.
     if (!hasBars && bars && bars.reason === 'rate_limited') {

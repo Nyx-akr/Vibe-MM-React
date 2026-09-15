@@ -67,7 +67,9 @@ export function detailVals(app, a, showAdj, extra) {
       unreachable: 'Chart service unreachable — nothing drawn',
       upstream_error: 'Price history unavailable upstream — nothing drawn',
     };
-    const chartNote = closes.length > 1 ? '' : (CHART_NOTES[barsState] || 'No price history for this pool');
+    const chartNote = closes.length > 1
+      ? (barsState === 'local_history' ? 'GeckoTerminal unavailable — drawn from our own 15s price samples' : '')
+      : (CHART_NOTES[barsState] || 'No price history for this pool');
 
     const holders = intel && intel.holders ? intel.holders : null;
     const impactPct = intel && intel.impact ? intel.impact.priceImpactPct : null;
