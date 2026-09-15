@@ -6,7 +6,12 @@
 
 import { assetSeeds } from '../data/assets';
 
-const BASE_URL = '';
+// Vercel serves this app as static files with no backend, and Vite strips the
+// dev-server proxy out of production builds, so API calls need an absolute URL
+// to the VibeScreener server on Render. Override at build time with
+// VITE_API_BASE (e.g. http://127.0.0.1:8787 to run against a local server).
+const BASE_URL = (import.meta.env.VITE_API_BASE || 'https://vibe-mm-server.onrender.com')
+  .replace(/\/+$/, '');
 
 async function fetchJson(url) {
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
