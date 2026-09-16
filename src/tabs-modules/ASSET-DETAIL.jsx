@@ -6,7 +6,7 @@ const EMPTY_DETAIL = {
   score: 0, scoreColor: '#a3aed0', conf: '0.00', raw: 0, penalty: 0,
   price: '$0.00', chg: '0.0%', chgColor: '#a3aed0',
   spark: [], market: [], outcomes: [], subs: [], isStock: false, oracle: [],
-  reasons: [], flags: [], stages: [], hysteresis: '',
+  reasons: [], flags: [], gauge: null, hysteresis: '',
   chartNote: '', scoreSource: '', safety: [], safetyNote: '', intelState: 'idle'
 };
 
@@ -15,6 +15,61 @@ const barColor = (v) => isMissing(v) ? UNAVAILABLE : v >= 75 ? '#4d8dff' : v >= 
 
 /** z-score metric backing each score component, for the trigger-reason table. */
 const Z_METRIC_FOR = { volumeAnomaly: 'volume5mUsd', tradeActivity: 'buys5m', buyerBreadth: 'buyers5m' };
+
+/**
+ * Stage gauge.
+ *
+ * The server's stage is nothing but the score bucketed at 55 / 70 / 85, so the
+ * gauge shows that relationship directly instead of the old three-timestamp
+ * timeline.
+ *
+ * Segments are drawn equal-width, not proportional to their band: WATCH covers
+ * 55 of the 100 points and the other three 15 each, which at true scale leaves
+ * no room to write EXCEPTIONAL. The marker is placed piecewise instead - one
+ * quarter of the bar per band, linear inside it - and the band edges are
+ * printed above the joins so the scale is still readable.
+ *
+ * The lit segment is the server's stage; the marker sits at the score. When
+ * the hysteresis is holding a demotion the two disagree, and the gap between
+ * them is exactly that hold.
+ */
+const GAUGE_BANDS = [
+  { n: 'WATCH', min: 0, max: 55 },
+  { n: 'EMERGING', min: 55, max: 70 },
+  { n: 'CONFIRMED', min: 70, max: 85 },
+  { n: 'EXCEPTIONAL', min: 85, max: 100 }
+];
+
+function buildGauge(score, stageIdx) {
+  const live = Number.isFinite(score);
+  const segs = GAUGE_BANDS.map((b, i) => {
+    const info = stageInfo(i + 1);
+    const on = stageIdx === i + 1;
+    return {
+      n: b.n,
+      // Opaque fills only. A translucent tint over this near-black card reads
+      // darker than its inactive neighbours, the opposite of lit.
+      bg: on ? info.bg : '#0c142c',
+      fg: on ? info.fg : '#3f4a68',
+      bd: on ? info.fg : 'transparent',
+      sep: i > 0 ? '#1c2a4d' : 'transparent',
+      edge: i < 3 ? String(b.max) : '',
+      at: ((i + 1) * 25) + '%'
+    };
+  });
+  const scoreIdx = live
+    ? Math.max(0, GAUGE_BANDS.findIndex((b, i) => score >= b.min && (i === 3 || score < b.max)))
+    : 0;
+  const band = GAUGE_BANDS[scoreIdx];
+  const within = Math.min(1, Math.max(0, (score - band.min) / (band.max - band.min)));
+  return {
+    segs, live,
+    // Held off the very ends so the triangle never hangs past the rounded edge.
+    left: Math.min(98.2, Math.max(1.8, (scoreIdx + within) * 25)).toFixed(2) + '%',
+    fg: stageInfo(scoreIdx + 1).fg,
+    value: live ? String(Math.round(score)) : '—'
+  };
+}
 
 /**
  * Builds the Asset Detail view model from real server data only.
@@ -163,11 +218,6 @@ export function detailVals(app, a, showAdj, extra) {
       : intelState === 'error' ? 'Contract checks unavailable from GoPlus / RugCheck'
       : 'No contract data for this chain';
 
-    // Real stage transitions, newest entry per stage, from the server's own history.
-    const stageEnteredAt = {};
-    (row.stageHistory || []).forEach((h) => { if (h && h.stage) stageEnteredAt[h.stage] = h.at; });
-    const hhmm = (ms) => { const d = new Date(ms); const p = (n) => String(n).padStart(2, '0'); return p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()); };
-
     const oracle = a.oracle ? [
       { k: 'Feed', v: a.oracle.feed, c: '#dfe6f6' },
       { k: 'Exec↔source dev', v: a.oracle.dev, c: '#4d8dff' },
@@ -203,14 +253,7 @@ export function detailVals(app, a, showAdj, extra) {
       spark, chartNote, market, outcomes, subs, safety, safetyNote,
       isStock: !!a.oracle, oracle, ...bubbleVals(app, a),
       reasons, flags,
-      stages: ['WATCH', 'EMERGING', 'CONFIRMED', 'EXCEPTIONAL'].map((n, i) => {
-        const idx = i + 1, s2 = stageInfo(idx), on = a.stage >= idx;
-        const at = stageEnteredAt[n];
-        return {
-          n, bg: on ? s2.bg : 'transparent', fg: on ? s2.fg : UNAVAILABLE, bd: on ? s2.fg : '#1c2a4d',
-          t: at ? hhmm(at) : '—', hasNext: i < 3, lineC: a.stage > idx ? '#e35ff2' : '#1c2a4d'
-        };
-      }),
+      gauge: buildGauge(finalScore, a.stage),
       // Server bands: WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85.
       // Promotion is immediate; only demotion is buffered by the hysteresis.
       hysteresis: Number.isFinite(row.stageHysteresis)
@@ -246,11 +289,13 @@ export function bubbleVals(app, a) {
 
 export default function AssetDetail({ v, css }) {
   return v.isDetail && <>
-          <div data-screen-label="Asset detail" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}><div style={css("display:flex;align-items:center;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px 16px;margin-bottom:12px", { v })}>{(v.d.stages || []).map((sg, i) => (<React.Fragment key={i}>
-            <div style={css("display:flex;align-items:center", { v, sg })}><div style={css("display:flex;flex-direction:column;align-items:center;gap:4px", { v, sg })}><span style={css("font-size:9px;font-weight:800;letter-spacing:.6px;padding:4px 12px;border-radius:999px;background:{{ sg.bg }};color:{{ sg.fg }};border:1px solid {{ sg.bd }}", { v, sg })}>{sg.n}</span><span style={css("font-size:9px;color:#6b7699", { v, sg })}>{sg.t}</span></div>{sg.hasNext && (<>
-              <div style={css("width:54px;height:2px;background:{{ sg.lineC }};margin:0 6px 16px", { v, sg })}></div>
-            </>)}</div>
-          </React.Fragment>))}<div style={css("flex:1", { v })}></div><div style={css("font-size:10px;color:#8b96b8;text-align:right;line-height:1.5;max-width:380px", { v })}>{v.d.hysteresis}</div></div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>EXECUTION PRICE — 1M BARS</span><span style={css("font-size:10px;color:#8b96b8", { v })}>{v.d.price} <span style={css("color:{{ d.chgColor }}", { v })}>{v.d.chg} 5M</span></span></div><div style={css("display:flex;align-items:flex-end;gap:2px;height:110px", { v })}>{(v.d.spark || []).map((b, i) => (<React.Fragment key={i}>
+          <div data-screen-label="Asset detail" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}><div style={css("display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:10px 16px 6px;margin-bottom:12px", { v })}><div style={css("flex:1 1 340px;min-width:288px;max-width:640px", { v })}><div style={css("position:relative;height:12px", { v })}>{((v.d.gauge && v.d.gauge.segs) || []).map((sg, i) => sg.edge ? (<React.Fragment key={i}>
+            <div style={css("position:absolute;bottom:0;left:{{ sg.at }};transform:translateX(-50%);font-size:8.5px;color:#39436a", { v, sg })}>{sg.edge}</div>
+          </React.Fragment>) : null)}</div><div style={css("display:flex;border:1px solid #1c2a4d;border-radius:7px;overflow:hidden", { v })}>{((v.d.gauge && v.d.gauge.segs) || []).map((sg, i) => (<React.Fragment key={i}>
+            <div style={css("flex:1 1 0;min-width:0;text-align:center;padding:6px 2px 4px;font-size:8.5px;font-weight:800;letter-spacing:.2px;background:{{ sg.bg }};color:{{ sg.fg }};border-left:1px solid {{ sg.sep }};border-bottom:2px solid {{ sg.bd }}", { v, sg })}>{sg.n}</div>
+          </React.Fragment>))}</div><div style={css("position:relative;height:20px", { v })}>{v.d.gauge && v.d.gauge.live ? (<>
+            <div style={css("position:absolute;top:-4px;left:{{ d.gauge.left }};transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;transition:left 420ms cubic-bezier(.4,0,.2,1)", { v, d: v.d })}><div style={css("width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:6px solid {{ d.gauge.fg }}", { v, d: v.d })}></div><div style={css("font-size:10px;font-weight:700;line-height:1.3;color:{{ d.gauge.fg }}", { v, d: v.d })}>{v.d.gauge.value}</div></div>
+          </>) : (<div style={css("padding-top:4px;font-size:9px;color:#3a4568", { v })}>score unavailable</div>)}</div></div><div style={css("flex:1 1 240px;font-size:10px;color:#8b96b8;line-height:1.5;max-width:420px", { v })}>{v.d.hysteresis}</div></div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>EXECUTION PRICE — 1M BARS</span><span style={css("font-size:10px;color:#8b96b8", { v })}>{v.d.price} <span style={css("color:{{ d.chgColor }}", { v, d: v.d })}>{v.d.chg} 5M</span></span></div><div style={css("display:flex;align-items:flex-end;gap:2px;height:110px", { v })}>{(v.d.spark || []).map((b, i) => (<React.Fragment key={i}>
             <div style={css("flex:1;background:{{ b.c }};height:{{ b.h }};border-radius:1px 1px 0 0", { v, b })}></div>
           </React.Fragment>))}{v.d.chartNote && (<div style={css("flex:1;display:flex;align-items:center;justify-content:center;font-size:10px;color:#3a4568", { v })}>{v.d.chartNote}</div>)}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>MARKET</div><div style={css("display:grid;grid-template-columns:repeat(4,1fr);gap:10px", { v })}>{(v.d.market || []).map((m, i) => (<React.Fragment key={i}>
             <div><div style={css("font-size:9px;color:#6b7699;letter-spacing:.6px", { v, m })}>{m.k}</div><div style={css("font-size:13px;font-weight:600;margin-top:2px;color:{{ m.c }}", { v, m })}>{m.v}</div></div>
@@ -260,7 +305,7 @@ export default function AssetDetail({ v, css }) {
             <div style={css("background:#101c38;border:1px solid #1c2a4d;border-radius:10px;padding:8px 10px;text-align:center", { v, o })}><div style={css("font-size:9px;color:#6b7699;letter-spacing:1px", { v, o })}>{o.k}</div><div style={css("font-size:14px;font-weight:700;margin-top:3px;color:{{ o.c }}", { v, o })}>{o.v}</div></div>
           </React.Fragment>))}</div></div></div><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>SCORE DECOMPOSITION</div>{(v.d.subs || []).map((s, i) => (<React.Fragment key={i}>
             <div title={s.evidence} style={css("display:flex;align-items:center;gap:8px;padding:2.5px 0", { v, s })}><span style={css("width:150px;font-size:10px;color:{{ s.keyColor }};flex-shrink:0", { v, s })}>{s.k}</span><span style={css("width:30px;font-size:9px;color:#6b7699", { v, s })}>{s.w}</span><div style={css("flex:1;height:7px;background:#16223f;border-radius:1px;overflow:hidden", { v, s })}><div style={css("height:100%;width:{{ s.pct }};background:{{ s.c }}", { v, s })}></div></div><span style={css("width:26px;text-align:right;font-size:10px;font-weight:600;color:{{ s.labelColor }}", { v, s })}>{s.label}</span></div>
-          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>RISK PENALTY <span style={css("color:#ff4fae;font-weight:700", { v })}>−{v.d.penalty}</span></span><span style={css("color:#8b96b8", { v })}>FINAL <span style={css("color:{{ d.scoreColor }};font-weight:700", { v })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs the server could not compute</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>RISK PENALTY <span style={css("color:#ff4fae;font-weight:700", { v })}>−{v.d.penalty}</span></span><span style={css("color:#8b96b8", { v })}>FINAL <span style={css("color:{{ d.scoreColor }};font-weight:700", { v, d: v.d })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs the server could not compute</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
             <div style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0", { v, f })}><span style={css("font-size:9px;font-weight:700;padding:2px 6px;border-radius:10px;background:{{ f.bg }};color:{{ f.fg }};flex-shrink:0", { v, f })}>{f.sev}</span><span style={css("font-size:11px;color:#c6d1ea", { v, f })}>{f.text}</span></div>
           </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised by the server</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
             <div title={sc.detail} style={css("display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #16223f", { v, sc })}><span style={css("font-size:11px;font-weight:700;color:{{ sc.c }};flex-shrink:0;width:12px", { v, sc })}>{sc.glyph}</span><span style={css("flex:1;font-size:10.5px;color:#c6d1ea", { v, sc })}>{sc.label}</span><span style={css("font-size:9.5px;color:#6b7699", { v, sc })}>{sc.detail}</span></div>

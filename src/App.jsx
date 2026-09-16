@@ -87,7 +87,7 @@ class App extends React.Component {
           const walletData = await fetchLiveWalletData(chain);
           if (walletData) this.setState({ apiWallets: walletData });
         } else if (this.state.page === 'social') {
-          const socialData = await fetchLiveSocialData(chain);
+          const socialData = await fetchLiveSocialData(chain, this.assets);
           if (socialData) this.setState({ apiSocial: socialData });
         } else if (this.state.page === 'eval') {
           const evalData = await fetchLiveEvalData(chain);
@@ -149,10 +149,32 @@ class App extends React.Component {
     this.detailKey = key;
     this.setState({ intel: null, intelState: 'loading', bars: null, barsState: 'loading' });
     const [intel, bars] = await Promise.all([
-      fetchLiveTokenIntel(row.chain, row.tokenAddress, row.poolAddress || ''),
+      fetchLiveTokenIntel(row.chain, row.tokenAddress, row.poolAddress || '', row),
       fetchLiveOhlcv(row.chain, row.poolAddress, 'minute', 1, 60)
     ]);
     if (this.detailKey !== key) return;
+
+    // One score per token. The app scores it; /api/intel is just the first
+    // place it appears with the full input set, because opening a token is
+    // what fetches that token's contract, holder and routed-impact data.
+    // Folding it straight back into the asset means the table, the stat tiles
+    // and the header never disagree while the next feed poll is pending.
+    const scored = intel && intel.scored;
+    if (scored && Number.isFinite(scored.score)) {
+      const stageNum = { WATCH: 1, EMERGING: 2, CONFIRMED: 3, EXCEPTIONAL: 4 };
+      a.score = scored.score;
+      a.scoreBasis = 'intel';
+      if (stageNum[scored.stage]) a.stage = stageNum[scored.stage];
+      if (Number.isFinite(scored.dataQuality)) a.conf = scored.dataQuality;
+      if (a.rawServerRow) {
+        Object.assign(a.rawServerRow, {
+          score: scored.score, stage: scored.stage, scoreBasis: 'intel',
+          dataQuality: scored.dataQuality, scoreModel: scored.scoreModel,
+          rawScore: scored.rawScore, riskPenalty: scored.riskPenalty,
+        });
+      }
+    }
+
     const barList = (bars && bars.bars) || [];
     const hasBars = barList.length > 1;
     this.setState({
@@ -288,6 +310,7 @@ class App extends React.Component {
         anim: st.flashId === a.id ? 'vsFlash 1.2s ease-out' : 'none',
         stage: si.n, stageBg: si.bg, stageFg: si.fg,
         score: a.score == null ? '—' : Math.round(a.score), scoreColor: a.score == null ? '#3a4568' : scoreColor(a.score),
+        partialScore: a.score != null && a.scoreBasis !== 'intel',
         conf: a.conf == null ? '—' : a.conf.toFixed(2),
         sym: a.sym, name: a.name, chain: a.chain, chainColor: chainColor(a.chain), cls: a.cls, clsColor: clsColor(a.cls),
         age: a.age == null ? '—' : fmtAge(a.age),
