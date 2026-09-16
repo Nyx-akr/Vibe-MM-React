@@ -1,4 +1,5 @@
 import React from 'react';
+import RegimeSelector from './RegimeSelector';
 
 export default function AppHeader({ v, css }) {
   return <>
@@ -9,7 +10,7 @@ export default function AppHeader({ v, css }) {
       </div>
       <div style={css("width:1px;height:24px;background:#1c2a4d", { v })}></div>
       <div style={css("flex:1", { v })}></div>
-      <div style={css("padding:3px 9px;border:1px solid #6f4fd8;color:#b48cff;font-size:10px;font-weight:600;letter-spacing:1px;border-radius:10px;white-space:nowrap;flex-shrink:0", { v })}>REGIME: SELECTIVE ROTATION</div>
+      <RegimeSelector />
       <div style={css("font-size:10px;color:#8b96b8;white-space:nowrap;flex-shrink:0", { v })}>ALERTS 24H <span style={css("color:#ffffff;font-weight:600", { v })}>47</span></div>
       <div style={css("font-size:11px;color:#b6c2de;white-space:nowrap;flex-shrink:0", { v })}>{v.clock} UTC</div>
       <div className="h3eb549cf" onClick={v.toggleSound} style={css("padding:3px 10px;border:1px solid #1c2a4d;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:1px;cursor:pointer;color:{{ soundFg }}", { v })}>{v.soundLabel}</div>

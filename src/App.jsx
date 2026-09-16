@@ -35,6 +35,15 @@ import AppHeader from './components/AppHeader';
 import SelectAssetPrompt from './components/SelectAssetPrompt';
 import SideNav from './components/SideNav';
 import AssetBar from './components/AssetBar';
+/** The one selected-state palette shared by every filter chip. */
+// Opaque, not translucent. A semi-transparent fill composites over the page's
+// near-black gradient and lands DARKER than the unselected #0a1226, which made
+// a selected chip look unselected. #0e2a5c is the blue-active fill already used
+// elsewhere in the app.
+const CHIP_ACTIVE_BG = '#0e2a5c';
+const CHIP_ACTIVE_BD = '#4d8dff';
+const CHIP_ACTIVE_FG = '#6ea0ff';
+
 /** Tabs that describe a single token, and cannot render without one. */
 const SELECTION_TABS = { detail: 'ASSET DETAIL', rotation: 'ROTATION', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
 
@@ -203,7 +212,15 @@ class App extends React.Component {
     const st = this.state, showAdj = this.props.showAdjusted !== false, live = this.props.liveFeed !== false;
     const nav = (p) => () => this.setState({ page: p });
     const tabs = [['live', 'LIVE OPPORTUNITIES'], ['detail', 'ASSET DETAIL'], ['rotation', 'ROTATION'], ['wallets', 'WALLETS'], ['social', 'SOCIAL SCANNER'], ['alerts', 'ALERT CARDS'], ['eval', 'EVALUATION'], ['health', 'SYSTEM HEALTH']].map(([k, label]) => ({ label, go: nav(k), fg: st.page === k ? '#e35ff2' : '#8b96b8', line: st.page === k ? '#e35ff2' : 'transparent' }));
-    const chip = (label, active, go) => ({ label, go, bg: active ? '#33124a' : '#0a1226', fg: active ? '#f06ee2' : '#8b96b8', bd: active ? '#f06ee2' : '#1c2a4d' });
+    // One selected look for every filter group. ALL used to go purple while
+    // the chain chips went to their own colour, so switching filters changed
+    // the shape of the control as well as the selection.
+    const chip = (label, active, go) => ({
+      label, go,
+      bg: active ? CHIP_ACTIVE_BG : '#0a1226',
+      fg: active ? CHIP_ACTIVE_FG : '#8b96b8',
+      bd: active ? CHIP_ACTIVE_BD : '#1c2a4d'
+    });
     const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
     // The table's chain chips are the only chain selector; the old navbar
     // pills duplicated this and carried invented latency figures.
@@ -216,10 +233,12 @@ class App extends React.Component {
     const chainChip = (name, active, go) => {
       if (name === 'ALL') return chip(name, active, go);
       const c = chainColor(name);
+      // Chain colour stays in the text; the selected background and border
+      // are the same blue every chip uses.
       return {
         label: name, go, fg: c,
-        bg: active ? tint(c, 0.18) : '#0a1226',
-        bd: active ? c : tint(c, 0.35)
+        bg: active ? CHIP_ACTIVE_BG : '#0a1226',
+        bd: active ? CHIP_ACTIVE_BD : tint(c, 0.35)
       };
     };
     const chainFilters = ['ALL'].concat(chainList.map((c) => c.name))
