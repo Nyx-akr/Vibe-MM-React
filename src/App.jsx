@@ -18,7 +18,7 @@ import { healthVals } from './tabs-modules/SYSTEM-HEALTH';
 import { assetSeeds } from './data/assets';
 import { css } from './utils/css';
 import { fmtUsd, fmtAge, fmtPrice, stageInfo, chainColor, clsColor, scoreColor, washColor } from './utils/formatters';
-import { chainMetadata } from './data/chains';
+import { chains as chainList, chainKeys, chainNameToKey } from './data/chains';
 import { defaultWalletRegistry } from './data/wallet-registry';
 import { nextTape } from './services/live-feed';
 import {
@@ -59,11 +59,11 @@ class App extends React.Component {
 
   async syncLiveData() {
     try {
-      const liveAssets = await fetchLiveMarketData(['solana', 'base', 'bsc', 'robinhood']);
+      const liveAssets = await fetchLiveMarketData(chainKeys);
       if (liveAssets && liveAssets.length > 0) {
         this.assets = liveAssets;
 
-        const chain = this.state.chainF !== 'ALL' ? this.state.chainF.toLowerCase() : 'solana';
+        const chain = this.state.chainF !== 'ALL' ? (chainNameToKey[this.state.chainF] || 'solana') : 'solana';
 
         if (this.state.page === 'rotation') {
           const rotationData = await fetchLiveRotationData(chain);
@@ -199,7 +199,10 @@ class App extends React.Component {
     const tabs = [['live', 'LIVE OPPORTUNITIES'], ['detail', 'ASSET DETAIL'], ['rotation', 'ROTATION'], ['wallets', 'WALLETS'], ['social', 'SOCIAL SCANNER'], ['alerts', 'ALERT CARDS'], ['eval', 'EVALUATION'], ['health', 'SYSTEM HEALTH']].map(([k, label]) => ({ label, go: nav(k), fg: st.page === k ? '#e35ff2' : '#8b96b8', line: st.page === k ? '#e35ff2' : 'transparent' }));
     const chip = (label, active, go) => ({ label, go, bg: active ? '#33124a' : '#0a1226', fg: active ? '#f06ee2' : '#8b96b8', bd: active ? '#f06ee2' : '#1c2a4d' });
     const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['STOCK', 'Stock tokens'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
-    const chainFilters = ['ALL', 'SOL', 'BASE', 'RHC', 'BNB'].map(k => chip(k, st.chainF === k, () => this.setState({ chainF: k })));
+    // The table's chain chips are the only chain selector; the old navbar
+    // pills duplicated this and carried invented latency figures.
+    const chainFilters = ['ALL'].concat(chainList.map((c) => c.name))
+      .map(k => chip(k, st.chainF === k, () => this.setState({ chainF: k })));
     const classFilters = ['ALL', 'MEME', 'TOKEN', 'STOCK', 'ETF'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
     const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'TREND'], [null, 'TOP REASON']];
     const headers = cols.map(([k, label]) => ({
@@ -260,7 +263,7 @@ class App extends React.Component {
     const stats = [{ label: 'ACTIVE ALERTS', value: String(this.assets.length), color: '#ffffff' }, { label: 'CONFIRMED+', value: String(counts[3] + counts[4]), color: '#4d8dff' }, { label: 'EXCEPTIONAL', value: String(counts[4]), color: '#f06ee2' }, { label: 'AVG ORGANIC PROB', value: '0.81', color: '#dfe6f6' }, { label: 'PRECISION@20 · 24H', value: '0.62', color: '#e35ff2' }];
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
-      clock: st.clock, chains: chainMetadata, tabs,
+      clock: st.clock, tabs,
       liveDotColor: st.serverError ? '#ff4fae' : (live ? '#4d8dff' : '#e35ff2'),
       liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),

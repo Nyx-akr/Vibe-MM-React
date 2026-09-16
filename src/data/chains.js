@@ -1,8 +1,36 @@
-export const chainMetadata = [
-  { name: 'SOL', dot: '#4d8dff', lat: '0.4s' },
-  { name: 'BASE', dot: '#4d8dff', lat: '0.6s' },
-  { name: 'RHC', dot: '#4d8dff', lat: '0.7s' },
-  { name: 'BNB', dot: '#e35ff2', lat: '1.8s' }
+/**
+ * The chains the dashboard fetches and can filter by.
+ *
+ * `key` is the server's chain id (/api/market?chain=...), `name` is the short
+ * label shown in the table's chain selector.
+ */
+export const chains = [
+  { key: 'solana', name: 'SOL', label: 'Solana' },
+  { key: 'ethereum', name: 'ETH', label: 'Ethereum' },
+  { key: 'base', name: 'BASE', label: 'Base' },
+  { key: 'bsc', name: 'BNB', label: 'BNB Chain' },
+  { key: 'arbitrum', name: 'ARB', label: 'Arbitrum' },
+  { key: 'polygon', name: 'POLY', label: 'Polygon' },
+  { key: 'avalanche', name: 'AVAX', label: 'Avalanche' },
+  { key: 'robinhood', name: 'RHC', label: 'Robinhood Chain' }
 ];
 
-export const chainColors = { SOL: '#8f7bff', BASE: '#3d7bfd', RHC: '#4fc3f7', BNB: '#e8b930' };
+export const chainKeys = chains.map((c) => c.key);
+export const chainNames = chains.map((c) => c.name);
+
+/** Server chain id -> table label. */
+export const chainKeyToName = chains.reduce((acc, c) => {
+  acc[c.key] = c.name;
+  return acc;
+}, {});
+
+export const chainColors = {
+  SOL: '#8f7bff', ETH: '#7b8cff', BASE: '#3d7bfd', BNB: '#e8b930',
+  ARB: '#4fa8ff', POLY: '#a86bff', AVAX: '#ff5f5f', RHC: '#4fc3f7'
+};
+
+/** Table label -> server chain id, for the chain selector. */
+export const chainNameToKey = chains.reduce((acc, c) => {
+  acc[c.name] = c.key;
+  return acc;
+}, {});

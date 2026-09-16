@@ -6,6 +6,7 @@
  */
 
 import { assetSeeds } from '../data/assets';
+import { chainKeys, chainKeyToName } from '../data/chains';
 
 // Vercel serves this app as static files with no backend, and Vite strips the
 // dev-server proxy out of production builds, so API calls need an absolute URL
@@ -27,16 +28,10 @@ export function mapServerRowToAsset(row) {
   const stageMap = { WATCH: 1, EMERGING: 2, CONFIRMED: 3, EXCEPTIONAL: 4 };
   const stage = typeof row.stage === 'number' ? row.stage : (stageMap[row.stage] || 1);
 
+  // One mapping, from data/chains.js. The old inline map folded arbitrum and
+  // polygon into BASE, so those tokens were mislabelled in the table.
   const chainRaw = String(row.chain || 'solana').toLowerCase();
-  const chainSymbolMap = {
-    solana: 'SOL', sol: 'SOL',
-    base: 'BASE',
-    bsc: 'BNB', bnb: 'BNB', 'binance-smart-chain': 'BNB',
-    robinhood: 'RHC', rhc: 'RHC',
-    ethereum: 'ETH', eth: 'ETH',
-    arbitrum: 'BASE', polygon: 'BASE', hyperevm: 'RHC'
-  };
-  const chain = chainSymbolMap[chainRaw] || chainRaw.toUpperCase().slice(0, 4);
+  const chain = chainKeyToName[chainRaw] || chainRaw.toUpperCase().slice(0, 4);
 
   let cls = 'TOKEN';
   const symUpper = String(row.symbol || '').toUpperCase();
@@ -126,10 +121,11 @@ export function mapServerRowToAsset(row) {
 /**
  * Fetches live market rows across active chains from backend.
  */
-export async function fetchLiveMarketData(chains = ['solana', 'base', 'bsc', 'robinhood']) {
+export async function fetchLiveMarketData(chains = chainKeys) {
   try {
     const results = await Promise.allSettled(
-      chains.map(chain => fetchJson(`${BASE_URL}/api/market?chain=${chain}&feed=trending&limit=15`))
+      // 20 is GeckoTerminal's page size, so this costs no extra upstream call.
+      chains.map(chain => fetchJson(`${BASE_URL}/api/market?chain=${chain}&feed=trending&limit=20`))
     );
 
     const allRows = [];
