@@ -168,6 +168,32 @@ export default class AdminPanel extends React.Component {
               </div>
             </Section>
 
+            {data.warm && (
+              <Section title="CHAIN REFRESH · WARM LOOP"
+                right={`${data.warm.chains.length} chains, one every ${Math.round(data.warm.intervalMs / 1000)}s · full cycle ${Math.round(data.warm.fullCycleMs / 1000)}s`}>
+                <Table
+                  head={['CHAIN', 'ROWS', 'TOOK', 'LIST', 'LAST REFRESH', 'ERROR']}
+                  rows={data.warm.chains.map((c) => {
+                    const w = data.warm.state[c];
+                    if (!w) return [<span style={{ color: C.dim }}>{c}</span>, '—', '—',
+                      <span style={{ color: C.grey }}>not warmed yet</span>, '—', '—'];
+                    return [
+                      <span style={{ color: C.white, fontWeight: 600 }}>{c}</span>,
+                      <span style={{ color: w.rows ? C.text : C.hot }}>{num(w.rows)}</span>,
+                      ms(w.ms),
+                      <span style={{ color: w.stale ? C.pink : C.blue }}>{w.stale ? 'stale' : 'fresh'}</span>,
+                      ago(w.at),
+                      <span style={{ color: w.error ? C.hot : C.grey, fontSize: 9.5 }}>{w.error || '—'}</span>
+                    ];
+                  })}
+                />
+                <div style={{ fontSize: 9.5, color: C.grey, marginTop: 9 }}>
+                  One chain at a time, so eight chains never hit GeckoTerminal at once. This also keeps
+                  samples accruing when nobody has the dashboard open.
+                </div>
+              </Section>
+            )}
+
             <Section title="UPSTREAM PROVIDERS" right={`${num(data.upstream.total)} calls over ${dur(data.upstream.windowSeconds * 1000)}`}>
               <Table
                 head={['PROVIDER', 'CALLS', 'PER MIN', 'MEDIAN', 'ERRORS', 'LAST ERROR']}
@@ -287,15 +313,29 @@ export default class AdminPanel extends React.Component {
           <>
             <Section title="DATA SOURCES" right={`${catalog.sources.length} providers, all keyless`}>
               <Table
-                head={['SOURCE', 'CHAINS', 'RATE LIMIT', 'PROVIDES']}
+                head={['SOURCE', 'CHAINS', 'RATE LIMIT', 'ROLE', 'PROVIDES']}
                 rows={catalog.sources.map((s) => [
                   <span style={{ color: C.white, fontWeight: 600 }}>{s.label}</span>,
                   <span style={{ color: s.chains ? C.pink : C.grey }}>{s.chains || 'all'}</span>,
                   <span style={{ color: C.dim, fontSize: 9.5 }}>{s.limit || '—'}</span>,
+                  <span style={{ color: s.role ? C.blue : C.grey, fontSize: 9.5 }}>{s.role || '—'}</span>,
                   <span style={{ color: C.dim, fontSize: 9.5 }}>{s.provides}</span>
                 ])}
               />
             </Section>
+
+            {catalog.pipeline && (
+              <Section title="PIPELINE" right={`${catalog.pipeline.length} stages`}>
+                <Table
+                  head={['STAGE', 'WHAT HAPPENS', 'CADENCE']}
+                  rows={catalog.pipeline.map((p) => [
+                    <span style={{ color: C.white, fontWeight: 600, whiteSpace: 'nowrap' }}>{p.stage}</span>,
+                    <span style={{ color: C.dim, fontSize: 9.5 }}>{p.detail}</span>,
+                    <span style={{ color: C.blue, fontSize: 9.5 }}>{p.cadence}</span>
+                  ])}
+                />
+              </Section>
+            )}
 
             {catalog.panels.map((panel) => (
               <Section key={panel.panel} title={panel.panel} right={`${panel.fields.length} fields`}>

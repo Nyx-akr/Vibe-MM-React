@@ -180,10 +180,12 @@ export function detailVals(app, a, showAdj, extra) {
       { k: 'Corp action', v: '—', c: UNAVAILABLE }
     ] : [];
 
-    const finalScore = Number.isFinite(scored.score) ? scored.score : Math.round(a.score);
+    const finalScore = Number.isFinite(scored.score) ? scored.score
+      : (a.score == null ? null : Math.round(a.score));
     return {
       sym: a.sym, name: a.name, stage: si.n, stageBg: si.bg, stageFg: si.fg, cls: a.cls, clsColor: clsColor(a.cls), canonical: a.canonical,
-      score: finalScore, scoreColor: scoreColor(finalScore),
+      score: finalScore == null ? '—' : finalScore,
+      scoreColor: finalScore == null ? UNAVAILABLE : scoreColor(finalScore),
       conf: isMissing(row.dataQuality) ? '—' : row.dataQuality.toFixed(2),
       raw: Number.isFinite(scored.rawScore) ? scored.rawScore : '—',
       penalty: Number.isFinite(scored.riskPenalty) ? scored.riskPenalty : '—',
@@ -244,9 +246,7 @@ export function bubbleVals(app, a) {
 
 export default function AssetDetail({ v, css }) {
   return v.isDetail && <>
-          <div data-screen-label="Asset detail" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}><div style={css("display:flex;align-items:center;gap:14px;margin-bottom:12px", { v })}><div className="h9e06f470" onClick={v.goLive} style={css("cursor:pointer;color:#8b96b8;font-size:11px", { v })}>← FEED</div><div style={css("font-size:20px;font-weight:700;color:#ffffff", { v })}>{v.d.sym}</div><div style={css("color:#8b96b8", { v })}>{v.d.name}</div><span style={css("font-size:9px;font-weight:700;letter-spacing:.6px;padding:3px 8px;border-radius:10px;background:{{ d.stageBg }};color:{{ d.stageFg }}", { v })}>{v.d.stage}</span><span style={css("font-size:9px;padding:2px 6px;border:1px solid {{ d.clsColor }};color:{{ d.clsColor }};border-radius:10px", { v })}>{v.d.cls}</span>{v.d.staleNote && (<span style={css("font-size:9px;padding:2px 8px;background:#1a2440;color:#8b96b8;border-radius:10px", { v })}>{v.d.staleNote}</span>)}{v.d.canonical && (<>
-            <span style={css("font-size:9px;padding:2px 6px;background:#0e2a5c;color:#4d8dff;border-radius:10px;font-weight:700", { v })}>✓ CANONICAL CONTRACT</span>
-          </>)}<div style={css("flex:1", { v })}></div><div style={css("text-align:right", { v })}><div style={css("font-size:9px;color:#8b96b8;letter-spacing:1px", { v })}>FINAL SCORE</div><div style={css("font-size:24px;font-weight:700;color:{{ d.scoreColor }}", { v })}>{v.d.score}</div></div><div style={css("text-align:right", { v })}><div style={css("font-size:9px;color:#8b96b8;letter-spacing:1px", { v })}>CONFIDENCE</div><div style={css("font-size:24px;font-weight:700;color:#dfe6f6", { v })}>{v.d.conf}</div></div></div><div style={css("display:flex;align-items:center;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px 16px;margin-bottom:12px", { v })}>{(v.d.stages || []).map((sg, i) => (<React.Fragment key={i}>
+          <div data-screen-label="Asset detail" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}><div style={css("display:flex;align-items:center;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px 16px;margin-bottom:12px", { v })}>{(v.d.stages || []).map((sg, i) => (<React.Fragment key={i}>
             <div style={css("display:flex;align-items:center", { v, sg })}><div style={css("display:flex;flex-direction:column;align-items:center;gap:4px", { v, sg })}><span style={css("font-size:9px;font-weight:800;letter-spacing:.6px;padding:4px 12px;border-radius:999px;background:{{ sg.bg }};color:{{ sg.fg }};border:1px solid {{ sg.bd }}", { v, sg })}>{sg.n}</span><span style={css("font-size:9px;color:#6b7699", { v, sg })}>{sg.t}</span></div>{sg.hasNext && (<>
               <div style={css("width:54px;height:2px;background:{{ sg.lineC }};margin:0 6px 16px", { v, sg })}></div>
             </>)}</div>

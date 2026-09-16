@@ -33,15 +33,20 @@ export function mapServerRowToAsset(row) {
   const chainRaw = String(row.chain || 'solana').toLowerCase();
   const chain = chainKeyToName[chainRaw] || chainRaw.toUpperCase().slice(0, 4);
 
-  let cls = 'TOKEN';
-  const symUpper = String(row.symbol || '').toUpperCase();
-  if (symUpper.includes('X') || chain === 'RHC' || (row.pairName && row.pairName.includes('USD'))) {
-    cls = 'STOCK';
-  } else if (symUpper.includes('QQQ') || symUpper.includes('ETF')) {
-    cls = 'ETF';
-  } else if ((row.poolAgeHours != null && row.poolAgeHours < 48) || symUpper.startsWith('$') || (row.flow && row.flow.washRisk > 25)) {
-    cls = 'MEME';
-  }
+  // CLASS comes only from signals a provider actually gives us.
+  //
+  // The old rule called anything STOCK whose symbol contained an "X" or whose
+  // pair was quoted in USD — which labelled WETH/USDC, WBTC/USDT and Wrapped
+  // AVAX as stocks, 91 of 160 rows in a live sample.
+  const MEME_LAUNCHPADS = ['pump.fun', 'pumpfun', 'moonshot', 'bags', 'believe', 'boop', 'four.meme', 'sunpump', 'launchlab'];
+  const launchpad = String(row.launchpad || (row.jupiter && row.jupiter.launchpad) || '').toLowerCase();
+  // MEME when a provider names a memecoin launchpad, TOKEN otherwise.
+  //
+  // STOCK and ETF are gone. STOCK was assigned to everything on Robinhood
+  // Chain, but its trending pools are WAIFU, CASHCAT, INU and HOOKR - not
+  // equities. ETF only ever matched a token in the old mock data. Neither
+  // had a provider behind it.
+  const cls = (launchpad && MEME_LAUNCHPADS.some(l => launchpad.includes(l))) ? 'MEME' : 'TOKEN';
 
   // Null when the server ran no wash analysis. The old fallback derived a
   // percentage from the risk penalty, which reported a wash probability
@@ -72,16 +77,9 @@ export function mapServerRowToAsset(row) {
   // collected samples — an empty trend beats a made-up rising line.
   const spark = Array.isArray(row.spark) && row.spark.length > 1 ? row.spark : [];
 
-  const oracle = (cls === 'STOCK' || cls === 'ETF') ? {
-    feed: row.tokenAddress ? row.tokenAddress.slice(0, 6) + '…' + row.tokenAddress.slice(-4) : '0x8c2f…a41e',
-    fresh: '4s',
-    dev: row.crossSource && row.crossSource.priceDeltaPct != null ? Math.abs(row.crossSource.priceDeltaPct).toFixed(2) + '%' : '0.42%',
-    seq: 'UP',
-    mult: '1.0000',
-    pend: '—',
-    session: 'OPEN',
-    corp: 'NONE'
-  } : null;
+  // No oracle panel: it only rendered for the STOCK/ETF classes, and every
+  // field in it was a constant ('4s', 'UP', '1.0000', 'OPEN', 'NONE').
+  const oracle = null;
 
   return {
     id: row.tokenAddress || row.poolAddress || (row.symbol ? row.symbol.toLowerCase() : String(Math.random())),
@@ -90,13 +88,14 @@ export function mapServerRowToAsset(row) {
     chain,
     cls,
     stage,
-    score: row.score || 60,
-    conf: row.dataQuality || 0.82,
-    age: Math.round((row.poolAgeHours || 12) * 3600),
-    price: row.priceUsd || 0.001,
-    chg: row.priceChangePct && row.priceChangePct.m5 != null
-      ? row.priceChangePct.m5 / 100
-      : (row.priceChangePct && row.priceChangePct.h1 != null ? row.priceChangePct.h1 / 100 : 0.02),
+    // ?? not ||, so a legitimate 0 survives; null renders as a dash rather
+    // than as 60 / 0.82 / 12h / $0.001 / +2.0%.
+    score: row.score ?? null,
+    conf: row.dataQuality ?? null,
+    age: row.poolAgeHours != null ? Math.round(row.poolAgeHours * 3600) : null,
+    price: row.priceUsd ?? null,
+    chg: row.priceChangePct?.m5 != null ? row.priceChangePct.m5 / 100
+      : (row.priceChangePct?.h1 != null ? row.priceChangePct.h1 / 100 : null),
     liq: row.liquidityUsd ?? null,
     vol: row.volume24hUsd ?? null,
     // Real 5m volume. Previously this was volume5mUsd × 12 — an hourly
@@ -110,7 +109,7 @@ export function mapServerRowToAsset(row) {
     reasons,
     flags,
     oracle,
-    reason: row.topReason || 'Active volume + buyer growth',
+    reason: row.topReason || '—',
     spark,
     poolAddress: row.poolAddress,
     tokenAddress: row.tokenAddress,

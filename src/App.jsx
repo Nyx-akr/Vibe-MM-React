@@ -32,6 +32,12 @@ import {
   fetchLiveOhlcv
 } from './services/api';
 import AppHeader from './components/AppHeader';
+import SelectAssetPrompt from './components/SelectAssetPrompt';
+import SideNav from './components/SideNav';
+import AssetBar from './components/AssetBar';
+/** Tabs that describe a single token, and cannot render without one. */
+const SELECTION_TABS = { detail: 'ASSET DETAIL', rotation: 'ROTATION', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
+
 class App extends React.Component {
   constructor(props) {
     super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toast: null, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
@@ -117,7 +123,7 @@ class App extends React.Component {
   }
   componentDidUpdate() {
     if (this.state.page !== 'detail') { this.detailKey = null; return; }
-    this.loadDetailData(this.assets.find(a => a.id === this.state.selectedId) || this.assets[0]);
+    this.loadDetailData(this.assets.find(a => a.id === this.state.selectedId));
   }
 
   /**
@@ -198,13 +204,28 @@ class App extends React.Component {
     const nav = (p) => () => this.setState({ page: p });
     const tabs = [['live', 'LIVE OPPORTUNITIES'], ['detail', 'ASSET DETAIL'], ['rotation', 'ROTATION'], ['wallets', 'WALLETS'], ['social', 'SOCIAL SCANNER'], ['alerts', 'ALERT CARDS'], ['eval', 'EVALUATION'], ['health', 'SYSTEM HEALTH']].map(([k, label]) => ({ label, go: nav(k), fg: st.page === k ? '#e35ff2' : '#8b96b8', line: st.page === k ? '#e35ff2' : 'transparent' }));
     const chip = (label, active, go) => ({ label, go, bg: active ? '#33124a' : '#0a1226', fg: active ? '#f06ee2' : '#8b96b8', bd: active ? '#f06ee2' : '#1c2a4d' });
-    const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['STOCK', 'Stock tokens'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
+    const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
     // The table's chain chips are the only chain selector; the old navbar
     // pills duplicated this and carried invented latency figures.
+    // Chain chips carry the same colour the chain has in the table's CHAIN
+    // column, so the filter and the rows read as one palette.
+    const tint = (hex, alpha) => {
+      const n = parseInt(hex.slice(1), 16);
+      return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+    };
+    const chainChip = (name, active, go) => {
+      if (name === 'ALL') return chip(name, active, go);
+      const c = chainColor(name);
+      return {
+        label: name, go, fg: c,
+        bg: active ? tint(c, 0.18) : '#0a1226',
+        bd: active ? c : tint(c, 0.35)
+      };
+    };
     const chainFilters = ['ALL'].concat(chainList.map((c) => c.name))
-      .map(k => chip(k, st.chainF === k, () => this.setState({ chainF: k })));
-    const classFilters = ['ALL', 'MEME', 'TOKEN', 'STOCK', 'ETF'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
-    const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'TREND'], [null, 'TOP REASON']];
+      .map(k => chainChip(k, st.chainF === k, () => this.setState({ chainF: k })));
+    const classFilters = ['ALL', 'MEME', 'TOKEN'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
+    const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'VOL TREND'], [null, 'TOP REASON']];
     const headers = cols.map(([k, label]) => ({
       label, arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
       sort: k ? () => this.setState(s => ({ sortKey: k, sortDir: s.sortKey === k ? -s.sortDir : -1 })) : () => { }
@@ -214,11 +235,17 @@ class App extends React.Component {
       if (st.classF !== 'ALL' && a.cls !== st.classF) return false;
       if (st.viewF === 'WATCHLIST' && !st.watch[a.id]) return false;
       if (st.viewF === 'CONFIRMED' && a.stage < 3) return false;
-      if (st.viewF === 'STOCK' && a.cls !== 'STOCK' && a.cls !== 'ETF') return false;
       if (st.viewF === 'EXPERIMENTAL' && a.liq >= 60000) return false;
       return true;
     });
-    const sorted = [...filtered].sort((a, b) => { const k = st.sortKey; const av = a[k], bv = b[k]; if (typeof av === 'string') return String(av).localeCompare(String(bv)) * st.sortDir; return (av - bv) * st.sortDir; });
+    const sorted = [...filtered].sort((a, b) => {
+      const k = st.sortKey; const av = a[k], bv = b[k];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;          // nulls always last, whichever way we sort
+      if (bv == null) return -1;
+      if (typeof av === 'string') return String(av).localeCompare(String(bv)) * st.sortDir;
+      return (av - bv) * st.sortDir;
+    });
     const sevMap = { HIGH: { bg: '#45103a', fg: '#ff4fae' }, MED: { bg: '#33124a', fg: '#e35ff2' }, LOW: { bg: '#1a2440', fg: '#a3aed0' } };
     const rows = sorted.map(a => {
       const si = stageInfo(a.stage);
@@ -229,6 +256,9 @@ class App extends React.Component {
         open: () => this.setState({ page: 'detail', selectedId: a.id }),
         goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
         star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
+        selected: st.selectedId === a.id,
+        selBg: st.selectedId === a.id ? 'rgba(227,95,242,0.12)' : 'transparent',
+        selBar: st.selectedId === a.id ? '#e35ff2' : 'transparent',
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
         isBundle: !!a.bundle,
         expanded: st.expandedId === a.id,
@@ -237,9 +267,14 @@ class App extends React.Component {
         peekReasons: a.reasons.slice(0, 3).map(x => ({ code: x.code, text: x.text, z: x.z })),
         peekFlags: a.flags.slice(0, 2).map(f => ({ sev: f.sev, bg: sevMap[f.sev].bg, fg: sevMap[f.sev].fg, text: f.text })),
         anim: st.flashId === a.id ? 'vsFlash 1.2s ease-out' : 'none',
-        stage: si.n, stageBg: si.bg, stageFg: si.fg, score: Math.round(a.score), scoreColor: scoreColor(a.score), conf: a.conf.toFixed(2),
+        stage: si.n, stageBg: si.bg, stageFg: si.fg,
+        score: a.score == null ? '—' : Math.round(a.score), scoreColor: a.score == null ? '#3a4568' : scoreColor(a.score),
+        conf: a.conf == null ? '—' : a.conf.toFixed(2),
         sym: a.sym, name: a.name, chain: a.chain, chainColor: chainColor(a.chain), cls: a.cls, clsColor: clsColor(a.cls),
-        age: fmtAge(a.age), price: fmtPrice(a.price), chg: (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%', chgColor: a.chg >= 0 ? '#4d8dff' : '#ff4fae',
+        age: a.age == null ? '—' : fmtAge(a.age),
+        price: a.price == null ? '—' : fmtPrice(a.price),
+        chg: a.chg == null ? '—' : (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
+        chgColor: a.chg == null ? '#3a4568' : a.chg >= 0 ? '#4d8dff' : '#ff4fae',
         liq: a.liq == null ? '—' : fmtUsd(a.liq),
         vol: (showAdj ? a.adj : a.vol) == null ? '—' : fmtUsd(showAdj ? a.adj : a.vol), volTag: '',
         buyers: a.buyers == null ? '—' : a.buyers,
@@ -254,13 +289,36 @@ class App extends React.Component {
     let sel = this.assets.find(a => a.id === st.selectedId);
     if (sel) { this.lastSelected = sel; this.lastSelectedAt = Date.now(); }
     else if (st.selectedId && this.lastSelected && this.lastSelected.id === st.selectedId) sel = this.lastSelected;
-    else sel = this.assets[0];
+    else sel = null;
     const staleMs = sel && this.lastSelected === sel && !this.assets.includes(sel) ? Date.now() - this.lastSelectedAt : 0;
     const d = detailVals(this, sel, showAdj, {
       intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs
     });
     const counts = [0, 0, 0, 0, 0]; this.assets.forEach(a => counts[a.stage]++);
-    const stats = [{ label: 'ACTIVE ALERTS', value: String(this.assets.length), color: '#ffffff' }, { label: 'CONFIRMED+', value: String(counts[3] + counts[4]), color: '#4d8dff' }, { label: 'EXCEPTIONAL', value: String(counts[4]), color: '#f06ee2' }, { label: 'AVG ORGANIC PROB', value: '0.81', color: '#dfe6f6' }, { label: 'PRECISION@20 · 24H', value: '0.62', color: '#e35ff2' }];
+    // Organic score comes from Jupiter (Solana) or a trade-sample analysis;
+    // tokens without one are excluded rather than counted as average.
+    const organicScores = this.assets
+      .map(a => {
+        const row = a.rawServerRow || {};
+        const jup = row.jupiter;
+        if (jup && Number.isFinite(jup.organicScore)) return jup.organicScore;
+        if (row.flow && Number.isFinite(row.flow.organicFlow)) return row.flow.organicFlow;
+        return null;
+      })
+      .filter(x => x !== null);
+    const avgOrganic = organicScores.length
+      ? (organicScores.reduce((sum, x) => sum + x, 0) / organicScores.length / 100).toFixed(2)
+      : '—';
+
+    const stats = [
+      { label: 'TOKENS TRACKED', value: String(this.assets.length), color: '#ffffff' },
+      { label: 'CONFIRMED+', value: String(counts[3] + counts[4]), color: '#4d8dff' },
+      { label: 'EXCEPTIONAL', value: String(counts[4]), color: '#f06ee2' },
+      { label: 'AVG ORGANIC SCORE', value: avgOrganic, color: avgOrganic === '—' ? '#3a4568' : '#dfe6f6',
+        sub: organicScores.length ? organicScores.length + ' of ' + this.assets.length + ' scored' : 'no source' },
+      // Precision@20 needs forward returns, which nothing records yet.
+      { label: 'PRECISION@20 · 24H', value: '—', color: '#3a4568', sub: 'needs outcome tracking' }
+    ];
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
       clock: st.clock, tabs,
@@ -268,6 +326,9 @@ class App extends React.Component {
       liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),
       serverError: st.serverError,
+      hasSelection: Boolean(sel),
+      needsSelection: !sel && Boolean(SELECTION_TABS[st.page]),
+      selectionTabLabel: SELECTION_TABS[st.page] || '',
       isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
       goLive: nav('live'), stats, headers, rows, tape, d, rowCount: rows.length,
       views, chainFilters, classFilters,
@@ -287,7 +348,7 @@ class App extends React.Component {
 
   chepePickVals() {
     const day = new Date().toISOString().slice(0, 10);
-    const cands = this.assets.filter(a => (a.wash ?? 0) < 0.15 && a.stage >= 2);
+    const cands = this.assets.filter(a => (a.wash ?? 0) < 0.15 && a.stage >= 2 && a.score != null);
     if (!cands.length) {
       return {
         chepePickSym: '—', chepePickChain: '—', chepePickChainColor: '#a3aed0',
@@ -298,7 +359,7 @@ class App extends React.Component {
     const quips = ['Clean wash score, real buyers. Chepe approves.', 'Breadth is growing and the LPs are staying. Good dog energy.', 'Oracle fresh, contract canonical. Chepe sniffed it thoroughly.', 'Liquidity keeps arriving and nobody is rugging. Rare.'];
     return {
       chepePickSym: a.sym, chepePickChain: a.chain, chepePickChainColor: chainColor(a.chain),
-      chepePickScore: String(Math.round(a.score)),
+      chepePickScore: a.score == null ? '—' : String(Math.round(a.score)),
       chepePickQuip: quips[this.h(a.id + day) % quips.length],
       openChepePick: () => this.setState({ page: 'detail', selectedId: a.id })
     };
@@ -331,16 +392,22 @@ class App extends React.Component {
               </div>
             </div>
           ) : (
-            <>
+            <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+              <SideNav v={v} />
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+              {!v.isLive && v.hasSelection && <AssetBar v={v} />}
               <LiveOpportunities v={v} css={css} />
               <AlertCards v={v} css={css} />
-              <AssetDetail v={v} css={css} />
-              <Rotation v={v} css={css} />
-              <Wallets v={v} css={css} />
-              <SocialScanner v={v} css={css} />
+              {v.needsSelection ? <SelectAssetPrompt v={v} css={css} /> : (<>
+                <AssetDetail v={v} css={css} />
+                <Rotation v={v} css={css} />
+                <Wallets v={v} css={css} />
+                <SocialScanner v={v} css={css} />
+              </>)}
               <Evaluation v={v} css={css} />
               <SystemHealth v={v} css={css} />
-            </>
+              </div>
+            </div>
           )}
           {v.toastVisible && (!v.serverError) && (<>
             <div style={css("position:fixed;right:18px;bottom:18px;z-index:60;width:340px;background:rgba(13,23,48,.97);border:1px solid #f06ee2;border-radius:14px;padding:12px 14px;box-shadow:0 12px 40px rgba(0,0,0,.55);animation:vsFlash 1s ease-out", { v })}><div style={css("display:flex;justify-content:space-between;align-items:center;margin-bottom:5px", { v })}><span style={css("font-size:9px;font-weight:800;letter-spacing:1px;color:#f06ee2", { v })}>{v.toastTitle}</span><span className="h3eb549cf" onClick={v.dismissToast} style={css("cursor:pointer;color:#6b7699;font-size:12px;padding:0 4px", { v })}>✕</span></div><div style={css("font-size:11px;color:#c6d1ea;line-height:1.5", { v })}>{v.toastBody}</div></div>
