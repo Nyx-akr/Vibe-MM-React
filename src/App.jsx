@@ -15,7 +15,6 @@ import { socialVals } from './tabs-modules/SOCIAL-SCANNER';
 import { alertsVals } from './tabs-modules/ALERT-CARDS';
 import { evalVals } from './tabs-modules/EVALUATION';
 import { healthVals } from './tabs-modules/SYSTEM-HEALTH';
-import { assetSeeds } from './data/assets';
 import { css } from './utils/css';
 import { fmtUsd, fmtAge, fmtPrice, stageInfo, chainColor, clsColor, scoreColor, washColor } from './utils/formatters';
 import { chains as chainList, chainKeys, chainNameToKey } from './data/chains';
@@ -58,19 +57,6 @@ class App extends React.Component {
   }
   h(str) { let h = 0; for (let i = 0; i < str.length; i++) { h = (h * 31 + str.charCodeAt(i)) >>> 0; } return h; }
   srand(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
-  seedAssets() {
-    const clone = (value) => value === null || typeof value !== 'object'
-      ? value
-      : Array.isArray(value)
-        ? value.map(clone)
-        : Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [key, clone(nestedValue)]));
-    const mk = (o) => {
-      const r = this.srand(this.h(o.id));
-      o.spark = []; let v = 50; for (let i = 0; i < 44; i++) { v = Math.max(8, Math.min(100, v + (r() - 0.44) * 14)); o.spark.push(v); }
-      return o;
-    };
-    return assetSeeds.map(seed => mk(clone(seed)));
-  }
 
   async syncLiveData() {
     try {
@@ -154,26 +140,10 @@ class App extends React.Component {
     ]);
     if (this.detailKey !== key) return;
 
-    // One score per token. The app scores it; /api/intel is just the first
-    // place it appears with the full input set, because opening a token is
-    // what fetches that token's contract, holder and routed-impact data.
-    // Folding it straight back into the asset means the table, the stat tiles
-    // and the header never disagree while the next feed poll is pending.
-    const scored = intel && intel.scored;
-    if (scored && Number.isFinite(scored.score)) {
-      const stageNum = { WATCH: 1, EMERGING: 2, CONFIRMED: 3, EXCEPTIONAL: 4 };
-      a.score = scored.score;
-      a.scoreBasis = 'intel';
-      if (stageNum[scored.stage]) a.stage = stageNum[scored.stage];
-      if (Number.isFinite(scored.dataQuality)) a.conf = scored.dataQuality;
-      if (a.rawServerRow) {
-        Object.assign(a.rawServerRow, {
-          score: scored.score, stage: scored.stage, scoreBasis: 'intel',
-          dataQuality: scored.dataQuality, scoreModel: scored.scoreModel,
-          rawScore: scored.rawScore, riskPenalty: scored.riskPenalty,
-        });
-      }
-    }
+    // No score is folded back here any more. Fetching intel caches it, and the
+    // next feed poll - at most 5s away - is what recomputes the one score both
+    // this page and the table read. Writing a second score in here is exactly
+    // what used to make the two disagree.
 
     const barList = (bars && bars.bars) || [];
     const hasBars = barList.length > 1;
@@ -218,9 +188,9 @@ class App extends React.Component {
     const flash = r() < 0.3 ? this.assets[Math.floor(r() * this.assets.length)].id : null;
     this.setState(s => ({ tick: s.tick + 1, flashId: flash }));
     if (!this.state.toast && r() < 0.05) {
-      const hot = this.assets.filter(x => x.score >= 84); if (hot.length) {
+      const hot = this.assets.filter(x => x.stage >= 3 && x.score != null); if (hot.length) {
         const a = hot[Math.floor(r() * hot.length)];
-        this.setState({ toast: { title: (a.score >= 90 ? 'EXCEPTIONAL' : 'CONFIRMED') + ' — ' + a.sym + ' / ' + a.chain, body: 'Score ' + Math.round(a.score) + ', conf ' + a.conf.toFixed(2) + '. ' + a.reason + '.' } });
+        this.setState({ toast: { title: stageInfo(a.stage).n + ' — ' + a.sym + ' / ' + a.chain, body: 'Score ' + Math.round(a.score) + ', conf ' + (a.conf == null ? '—' : a.conf.toFixed(2)) + '. ' + a.reason + '.' } });
         if (this.state.soundOn) this.beep();
         this.toastTimer = setTimeout(() => this.setState({ toast: null }), 7000);
       }
@@ -233,7 +203,6 @@ class App extends React.Component {
   renderVals() {
     const st = this.state, showAdj = this.props.showAdjusted !== false, live = this.props.liveFeed !== false;
     const nav = (p) => () => this.setState({ page: p });
-    const tabs = [['live', 'LIVE OPPORTUNITIES'], ['detail', 'ASSET DETAIL'], ['rotation', 'ROTATION'], ['wallets', 'WALLETS'], ['social', 'SOCIAL SCANNER'], ['alerts', 'ALERT CARDS'], ['eval', 'EVALUATION'], ['health', 'SYSTEM HEALTH']].map(([k, label]) => ({ label, go: nav(k), fg: st.page === k ? '#e35ff2' : '#8b96b8', line: st.page === k ? '#e35ff2' : 'transparent' }));
     // One selected look for every filter group. ALL used to go purple while
     // the chain chips went to their own colour, so switching filters changed
     // the shape of the control as well as the selection.
@@ -301,7 +270,6 @@ class App extends React.Component {
         selBg: st.selectedId === a.id ? 'rgba(227,95,242,0.12)' : 'transparent',
         selBar: st.selectedId === a.id ? '#e35ff2' : 'transparent',
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
-        isBundle: !!a.bundle,
         expanded: st.expandedId === a.id,
         trend: tr.map(v => ({ h: Math.round(15 + (v - tMin) / (tMax - tMin + 0.01) * 85) + '%', c: v >= tr[0] ? '#4d8dff' : '#ff4fae' })),
         peekSpark: a.spark.map((v, i) => ({ h: Math.round(8 + (v - spMin) / (spMax - spMin + 0.01) * 92) + '%', c: i === a.spark.length - 1 ? '#e35ff2' : v >= (a.spark[i - 1] ?? v) ? '#2f66d0' : '#8a2f7c' })),
@@ -324,7 +292,6 @@ class App extends React.Component {
         wash: a.wash == null ? '—' : Math.round(a.wash * 100) + '%', washColor: a.wash == null ? '#3a4568' : washColor(a.wash), reason: a.reason
       };
     });
-    const bundled = this.assets.filter(a => a.bundle);
     // The feed reorders every 5s and a token can drop out of it. Keep showing
     // the token the user opened (with a staleness note) instead of silently
     // swapping the detail view to a different asset.
@@ -333,6 +300,40 @@ class App extends React.Component {
     else if (st.selectedId && this.lastSelected && this.lastSelected.id === st.selectedId) sel = this.lastSelected;
     else sel = null;
     const staleMs = sel && this.lastSelected === sel && !this.assets.includes(sel) ? Date.now() - this.lastSelectedAt : 0;
+
+    // Nav mirrors SELECTION_TABS: everything asset-scoped hangs off ASSET DETAIL,
+    // everything else is app-wide. Deriving `child` from the same map keeps the
+    // sidebar honest if a tab later changes scope.
+    const navItem = (k, label) => {
+      const active = st.page === k;
+      const child = Boolean(SELECTION_TABS[k]) && k !== 'detail';
+      return {
+        label, child, go: nav(k),
+        indent: child ? 30 : 16,
+        fg: active ? '#e35ff2' : (child && !sel ? '#5c6684' : '#8b96b8'),
+        tickC: active ? '#e35ff2' : '#39445f',
+        line: active ? '#e35ff2' : 'transparent',
+        bg: active ? 'rgba(227,95,242,0.07)' : 'transparent'
+      };
+    };
+    const navGroups = [
+      {
+        title: 'MARKET', items: [
+          navItem('live', 'LIVE OPPORTUNITIES'),
+          navItem('detail', 'ASSET DETAIL'),
+          navItem('social', 'SOCIAL SCANNER'),
+          navItem('wallets', 'WALLETS'),
+          navItem('rotation', 'ROTATION')
+        ]
+      },
+      {
+        title: 'SYSTEM', items: [
+          navItem('alerts', 'ALERT CARDS'),
+          navItem('eval', 'EVALUATION'),
+          navItem('health', 'SYSTEM HEALTH')
+        ]
+      }
+    ];
     const d = detailVals(this, sel, showAdj, {
       intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs
     });
@@ -363,7 +364,7 @@ class App extends React.Component {
     ];
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
-      clock: st.clock, tabs,
+      clock: st.clock, navGroups,
       liveDotColor: st.serverError ? '#ff4fae' : (live ? '#4d8dff' : '#e35ff2'),
       liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),

@@ -159,9 +159,9 @@ export function clearJournal() {
 /* ------------------------------------------------------- stage memory --- */
 
 /**
- * The stage machine's memory rides in the same storage. Without it, every
- * reload would reset hysteresis and stages would flicker for the first few
- * minutes of each session.
+ * The stage machine's memory rides in the same storage. The stage itself is
+ * recomputed from the score every poll, so this is only about keeping "since
+ * when" and the recent transitions across a reload.
  */
 export function loadStageMemory() {
   return ACTIVE_BACKEND.load(STAGE_KEY) || null;

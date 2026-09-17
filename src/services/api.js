@@ -12,13 +12,13 @@
 import { chainKeys, chainKeyToName } from '../data/chains';
 import { payload as catalogPayload } from '../data/catalog';
 import {
-  normalizeRow, screenRows, zScoresFrom, bucketBaselines, tradeStatsFrom,
+  normalizeRow, screenRows, zScoresFrom, bucketBaselines,
   buildWalletSets, rotationFor, rotationGraph, walletRegistry,
   mentionsFor, mentionBaseline, evaluationFor, evaluationReport,
   providerHealth, summarize,
 } from '../calculations/core';
 import {
-  scoreAsset, deriveIntel, topReasonFor, usdReferenceMedian,
+  evaluateAsset, deriveIntel, usdReferenceMedian,
   SCORE_MODEL, hydrateStages, stageSnapshot,
 } from '../calculations/asset-detail';
 import {
@@ -81,6 +81,73 @@ async function rawInputsFor(chainKey) {
   return value;
 }
 
+/**
+ * Intel cache - the reason a token has ONE score.
+ *
+ * Intel (contract safety, holders, routed impact) is expensive: roughly seven
+ * upstream calls per token, so the board cannot fetch it for every row on
+ * every poll. Without a cache the board scored on ~9 of 12 inputs while the
+ * detail view scored on 12, and the two disagreed.
+ *
+ * So intel is cached per token and fed back into board scoring, and a slow
+ * background loop fills the gaps. A token's score improves once - when its
+ * intel first lands - and is identical everywhere after that.
+ *
+ * The RAW payload is cached rather than the derived facts, because deriving
+ * depends on the row (price cross-check, volume per holder) and the row moves.
+ */
+const INTEL_TTL_MS = 45 * 60 * 1000;
+const intelCache = new Map();
+
+function cachedIntelRaw(chainKey, tokenAddress) {
+  const hit = intelCache.get(chainKey + ':' + tokenAddress);
+  return hit && Date.now() - hit.at < INTEL_TTL_MS ? hit.raw : null;
+}
+
+function putIntelRaw(chainKey, tokenAddress, raw) {
+  if (raw) intelCache.set(chainKey + ':' + tokenAddress, { at: Date.now(), raw });
+}
+
+/** Intel for a row if we have it, derived against that row's current values. */
+function intelFor(chainKey, row) {
+  const raw = cachedIntelRaw(chainKey, row.tokenAddress);
+  return raw ? deriveIntel(raw, row) : null;
+}
+
+// Two tokens per 5s poll fills a 90-row board in about four minutes, then
+// costs nothing for the next 45 while the server serves it from its own cache.
+const ENRICH_PER_CYCLE = 2;
+const enrichInFlight = new Set();
+
+/**
+ * Fetches intel for the highest-scoring rows that do not have it yet. Runs in
+ * the background - the board never waits on it.
+ */
+function enrichInBackground(chainKey, rows) {
+  const pending = rows
+    .filter((r) => r.tokenAddress &&
+      !cachedIntelRaw(chainKey, r.tokenAddress) &&
+      !enrichInFlight.has(chainKey + ':' + r.tokenAddress))
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, ENRICH_PER_CYCLE);
+
+  pending.forEach((row) => {
+    const key = chainKey + ':' + row.tokenAddress;
+    enrichInFlight.add(key);
+    fetchJson(`${BASE_URL}/api/intel?chain=${chainKey}&token=${encodeURIComponent(row.tokenAddress)}`)
+      .then((raw) => { if (raw && raw.server === 'ok') putIntelRaw(chainKey, row.tokenAddress, raw); })
+      .catch(() => { /* try again on a later cycle */ })
+      .finally(() => { enrichInFlight.delete(key); });
+  });
+}
+
+/** How much of the board is scored on the full input set. */
+export function intelCoverage(assets) {
+  const rows = assets || [];
+  const withIntel = rows.filter((a) => a.scoreBasis === 'intel').length;
+  return { total: rows.length, withIntel, pct: rows.length ? Math.round((withIntel / rows.length) * 100) : 0 };
+}
+
 /** Reference prices, for the USD-reference component. Cheap and slow-moving. */
 const referenceCache = new Map();
 async function referenceFor(symbol) {
@@ -96,76 +163,13 @@ async function referenceFor(symbol) {
 
 /* ------------------------------------------------------------ the score -- */
 
-/**
- * Raw row in, scored row out.
+/*
+ * There is no scoring in this file.
  *
- * This is the single place the app decides what a token is worth. Everything
- * it needs beyond the row - baselines, trade stats, rotation, intel - is
- * passed in as `extras`, so the same function scores a board row and a detail
- * view identically.
+ * evaluateAsset() in calculations/asset-detail.js is the one place a token is
+ * evaluated. This module's job is to fetch raw numbers, hand them to it, and
+ * pass the results to the UI.
  */
-function scoreRow(row, { samples, walletSets, intel, reference }) {
-  const poolSamples = (samples && samples[row.poolAddress]) || [];
-  const fromSamples = zScoresFrom(poolSamples);
-
-  const own = walletSets && walletSets.get(row.poolAddress);
-  const tradeStats = own ? own.stats : null;
-
-  // Our own 15s samples are the better baseline; the trade tape is the
-  // fallback for pools too new to have accumulated any.
-  const zScores = Object.keys(fromSamples.metrics).length
-    ? fromSamples
-    : (own ? bucketBaselines(own.trades || []) : fromSamples);
-
-  const extras = {
-    zScores,
-    tradeStats,
-    rotation: walletSets ? rotationFor(walletSets, row.poolAddress) : null,
-    usdReference: reference || null,
-    intel: intel || null,
-    jupiter: row.jupiter || null,
-  };
-
-  const scored = scoreAsset(row, extras);
-  return { scored, extras, zScores };
-}
-
-/** Everything the board row needs that is derived from the score. */
-function decorate(row, scored, extras) {
-  const organic = (scored.scoreModifiers || []).find((m) => m.key === 'organicFlow');
-  const organicValue = organic && !organic.pending ? organic.value : null;
-  const stats = extras.tradeStats;
-  const jup5m = row.jupiter && row.jupiter.stats5m;
-
-  return {
-    ...row,
-    ...scored,
-    topReason: topReasonFor(row, extras),
-    zScores: extras.zScores,
-    tradeStats: stats,
-    rotation: extras.rotation,
-    scoreBasis: extras.intel ? 'intel' : 'market',
-    volumeBaselineMultiple: extras.zScores.metrics.volume5mUsd
-      ? extras.zScores.metrics.volume5mUsd.multiple : null,
-    // Wash probability is the inverse of organic flow - a proxy, not a
-    // wash-trading model, which is why it is named as a probability and not
-    // as a verdict.
-    flow: stats ? {
-      source: 'geckoterminal',
-      netUsd: stats.netUsd, buyUsd: stats.buyUsd, sellUsd: stats.sellUsd,
-      distinctWallets: stats.distinctWallets, windowMinutes: stats.windowMinutes,
-      organicFlow: organicValue,
-      washRisk: organicValue === null ? null : 100 - organicValue,
-    } : (jup5m ? {
-      source: 'jupiter',
-      netUsd: jup5m.netUsd, buyUsd: jup5m.buyUsd, sellUsd: jup5m.sellUsd,
-      distinctWallets: jup5m.numTraders, windowMinutes: 5,
-      organicSharePct: row.jupiter.stats24h ? row.jupiter.stats24h.organicSharePct : null,
-      organicFlow: organicValue,
-      washRisk: organicValue === null ? null : 100 - organicValue,
-    } : null),
-  };
-}
 
 /* ------------------------------------------------------- the asset model - */
 
@@ -262,14 +266,17 @@ export async function fetchLiveMarketData(chains = chainKeys) {
         references.set(sym, await referenceFor(sym));
       }));
 
-      return screened.rows.map((row) => {
-        const { scored, extras } = scoreRow(row, {
+      const scoredRows = screened.rows.map((row) => {
+        // One evaluation per token, owned by calculations/asset-detail.js.
+        // The board renders what comes back; it decides nothing itself.
+        const full = evaluateAsset(row, {
           samples: raw.samples,
           walletSets: raw.walletSets,
-          intel: null,
+          // Whatever intel we already hold for this token, so the table and the
+          // detail page are always looking at the same number.
+          intel: intelFor(chainKey, row),
           reference: references.get(row.quoteSymbol) || null,
         });
-        const full = decorate(row, scored, extras);
         // Remember what we scored it at, so Evaluation can grade it later.
         recordScore(chainKey, row.tokenAddress, {
           score: full.score, stage: full.stage,
@@ -280,6 +287,10 @@ export async function fetchLiveMarketData(chains = chainKeys) {
           .slice(-16).map((s) => s.volume5mUsd).filter((v) => Number.isFinite(v));
         return full;
       });
+
+      // Fill in the missing intel for next time. Deliberately not awaited.
+      enrichInBackground(chainKey, scoredRows);
+      return scoredRows;
     }));
 
     const allRows = [];
@@ -303,19 +314,24 @@ export function summarizeAssets(assets) {
 /* --------------------------------------------------------------- detail -- */
 
 /**
- * Asset Detail: fetch this token's raw provider data, derive the facts from
- * it, and rescore with those facts included.
+ * Asset Detail: fetch this token's raw provider data and derive the facts the
+ * detail panels show - safety checks, holders, routed impact, cross-price.
  *
- * The board scores without intel because fetching it for every row would be
- * far too many calls; the detail view has holder, safety and routed-impact
- * inputs the board lacks, so its score is the better one - same model, more
- * of it filled in.
+ * It deliberately does NOT score. There is exactly one scorer in this app -
+ * the pipeline in fetchLiveMarketData - and it runs every poll with whatever
+ * intel is cached. If this view scored as well, the two would be snapshots of
+ * a moving input taken seconds apart, and the same token would show two
+ * different numbers in two places.
+ *
+ * Instead the intel fetched here lands in the cache, and the next poll (within
+ * 5s) folds it into the one score that both views read.
  */
 export async function fetchLiveTokenIntel(chain, tokenAddress, poolAddress = '', row = null) {
   try {
-    const rawIntel = await fetchJson(
+    const rawIntel = cachedIntelRaw(chain, tokenAddress) || await fetchJson(
       `${BASE_URL}/api/intel?chain=${chain}&token=${encodeURIComponent(tokenAddress)}`);
     if (!rawIntel || rawIntel.server !== 'ok') return null;
+    putIntelRaw(chain, tokenAddress, rawIntel);
 
     // Opening a detail view is also the cue to sample this pool's trades, even
     // if the rotation cursor has not reached it.
@@ -328,22 +344,21 @@ export async function fetchLiveTokenIntel(chain, tokenAddress, poolAddress = '',
     const intel = deriveIntel(rawIntel, row);
     if (!row) return { ...intel, scored: null };
 
+    // Supporting evidence for the detail panels (the z column, rotation text).
+    // Not a score - see the note above.
     const raw = await rawInputsFor(chain);
-    const { scored, extras } = scoreRow(row, {
-      samples: raw.samples,
-      walletSets: raw.walletSets,
-      intel,
-      reference: await referenceFor(row.quoteSymbol),
-    });
+    const poolSamples = (raw.samples && raw.samples[row.poolAddress]) || [];
+    const own = raw.walletSets.get(row.poolAddress);
+    const fromSamples = zScoresFrom(poolSamples);
 
-    persistDerived();
     return {
       ...intel,
-      zScores: extras.zScores,
-      tradeStats: extras.tradeStats,
-      rotation: extras.rotation,
-      usdReference: extras.usdReference,
-      scored: { ...scored, scoreBasis: 'intel' },
+      zScores: Object.keys(fromSamples.metrics).length
+        ? fromSamples
+        : (own ? bucketBaselines(own.trades || []) : fromSamples),
+      tradeStats: own ? own.stats : null,
+      rotation: rotationFor(raw.walletSets, row.poolAddress),
+      scored: null,
     };
   } catch (e) {
     return null;

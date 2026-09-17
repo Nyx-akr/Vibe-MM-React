@@ -1,40 +1,369 @@
 import React from 'react';
+import { stageInfo, chainColor } from '../utils/formatters';
+import {
+  ALERT_CLASSES, EVIDENCE_FAMILIES, RESOLUTIONS,
+  strengthOf, combineConfidence, validateAlert,
+  constitutingRisk, valueFromPenalty
+} from '../calculations/alert-schema';
+import { journalFor } from '../services/score-journal';
+import { chainKeys } from '../data/chains';
+
+/**
+ * What the bot would actually have sent, grouped by the claim it makes.
+ *
+ * Three columns, three classes. OPPORTUNITY is the score model as before.
+ * RISK fires off the risk families directly, because a token that looks like
+ * a rug scores LOW - if risk only ever subtracted from the opportunity score
+ * the worst tokens would be the quietest ones. RESOLUTION closes prior alerts
+ * out of the score journal.
+ *
+ * Nothing here is composed. Every evidence line is what a family reported and
+ * every card carries the condition that would prove it wrong.
+ */
+
+const OPP_HORIZON_MS = 6 * 3600e3;
+const RISK_HORIZON_MS = 4 * 3600e3;
+
+/** Which risk family each existing risk-flag code belongs to. */
+const FLAG_FAMILY = {
+  CONTRACT_CHECKS: 'contract',
+  THIN_LIQUIDITY: 'liquidity',
+  EXTREME_TURNOVER: 'liquidity',
+  VOLUME_CONCENTRATED: 'holders',
+  LOW_ORGANIC_FLOW: 'integrity',
+  SINGLE_SOURCE: 'integrity',
+  NEW_POOL: 'integrity'
+};
+
+const familySpec = (key) => EVIDENCE_FAMILIES.find((f) => f.key === key);
+
+/**
+ * An opportunity family, averaged over the score components it owns.
+ * Confidence is how much of the family actually reported - a family speaking
+ * from one of its three inputs is not as sure as one speaking from all three.
+ */
+function opportunityFamily(row, key) {
+  const spec = familySpec(key);
+  const owned = (row.scoreModel || []).filter((c) => spec.components.indexOf(c.key) !== -1);
+  const live = owned.filter((c) => !c.pending && c.value != null);
+  if (!live.length) return { key, label: spec.label, value: null, confidence: 0, evidence: null };
+
+  const weight = live.reduce((t, c) => t + c.weight, 0);
+  const value = Math.round(live.reduce((t, c) => t + c.value * c.weight, 0) / (weight || 1));
+  const lead = live.slice().sort((x, y) => (y.value * y.weight) - (x.value * x.weight))[0];
+  return {
+    key, label: spec.label, value,
+    confidence: owned.length ? live.length / owned.length : 0,
+    evidence: lead && lead.evidence ? lead.evidence : lead.label + ' scored ' + lead.value
+  };
+}
+
+/** A risk family, built from the flags that fired inside it. */
+function riskFamilies(row) {
+  const byFamily = {};
+  for (const flag of row.riskFlags || []) {
+    const key = FLAG_FAMILY[flag.code];
+    if (!key) continue;
+    const value = valueFromPenalty(flag.penalty);
+    const current = byFamily[key];
+    if (!current || value > current.value) {
+      byFamily[key] = {
+        key, label: familySpec(key).label, value,
+        confidence: flag.severity === 'HIGH' ? 0.8 : 0.55,
+        evidence: flag.detail || flag.code
+      };
+    }
+  }
+  return Object.keys(byFamily).map((k) => byFamily[k]);
+}
 
 export function alertsVals(app) {
-    const acards = [
-      {
-        stage: 'EXCEPTIONAL', stageBg: '#3a1140', stageFg: '#f06ee2', sym: '$GLYPH', chain: 'SOLANA', chainColor: '#8f7bff',
-        title: 'EXCEPTIONAL — $GLYPH / SOLANA — Score 91, conf 0.91',
-        body: 'Adjusted 5-minute volume is 9.1× baseline (robust z 6.2). Unique buyers up 4.0× — 71% first-time asset buyers. Net liquidity +$118K across 3 pools with 14 new LPs. Stablecoin rotation-in from 96 wallets exiting the AI cohort.',
-        risks: 'Top-10 adjusted holders own 29%; token under 2h old (experimental baselines).',
-        buttons: ['Open dashboard', 'Solscan', 'Mute 1h'], ts: '14:32:08', id: 'alert a-7f21', slug: 'glyph',
-        fields: [{ k: 'SCORE', v: '91', c: '#f06ee2' }, { k: 'CONF', v: '0.91', c: '#ffffff' }, { k: 'VOL 5M ADJ', v: '$1.69M', c: '#4d8dff' }, { k: 'BUYERS 5M', v: '412', c: '#4d8dff' }, { k: 'LIQUIDITY', v: '$412K', c: '#ffffff' }, { k: 'WASH PROB', v: '6%', c: '#a3aed0' }]
-      },
-      {
-        stage: 'CONFIRMED', stageBg: '#0e2a5c', stageFg: '#4d8dff', sym: 'NVDAx', chain: 'ROBINHOOD CHAIN', chainColor: '#4fc3f7',
-        title: 'CONFIRMED ROTATION — NVDA STOCK TOKEN — Score 84, conf 0.87',
-        body: 'Executed RFQ volume is 5.1× its session-adjusted baseline; unique takers up 2.7×. Capital is rotating from the tech-token cohort into semiconductors. Executions within 0.42% of Chainlink; contract canonical, oracle fresh, no multiplier pending.',
-        risks: '61% of recent RFQ volume filled by one maker.',
-        buttons: ['Open dashboard', 'Explorer', 'Mute 1h'], ts: '14:29:41', id: 'alert a-7f1d', slug: 'nvdax',
-        fields: [{ k: 'SCORE', v: '84', c: '#4d8dff' }, { k: 'CONF', v: '0.87', c: '#ffffff' }, { k: 'RFQ VOL 15M', v: '$944K', c: '#4d8dff' }, { k: 'TAKERS', v: '151', c: '#4d8dff' }, { k: 'ORACLE DEV', v: '0.42%', c: '#4d8dff' }, { k: 'MAKER CONC', v: '61%', c: '#ff4fae' }]
-      }];
-    const pushBody = '$GLYPH / SOLANA hit EXCEPTIONAL (91). Vol 9.1×, buyers 4.0×, liq +$118K. Click to open the live feed.';
-    const jsonLines = ['{', '  "alert_id": "a-7f21",', '  "stage": "exceptional",', '  "chain": "solana",', '  "token_address": "GLyPh…9xQz",', '  "final_score": 91,', '  "confidence": 0.91,', '  "organic_activity_probability": 0.94,', '  "signal_families": ["volume", "breadth",', '    "liquidity", "rotation"],', '  "reasons": [{ "code": "VOL_ANOM_5M",', '    "robust_z": 6.2, "ratio": 9.1 }, …],', '  "risk": { "wash_probability": 0.06,', '    "hard_veto": false },', '  "links": { "dashboard": "…", "solscan": "…" }', '}'];
-    return { acards, pushBody, jsonLines };
+  const assets = app.assets || [];
+  const now = Date.now();
+
+  /* ---------------------------------------------------------- opportunity */
+
+  const opportunities = assets
+    .filter((a) => a.stage >= 3 && a.score != null)
+    .sort((x, y) => y.score - x.score)
+    .slice(0, 4)
+    .map((a) => {
+      const row = a.rawServerRow || {};
+      const si = stageInfo(a.stage);
+      const families = ['flow', 'breadth', 'liquidity', 'rotation', 'integrity']
+        .map((k) => opportunityFamily(row, k))
+        .filter((f) => f.value != null);
+
+      const floor = a.stage >= 4 ? 85 : 70;
+      return {
+        cls: 'OPPORTUNITY', accent: ALERT_CLASSES.OPPORTUNITY.accent,
+        stage: si.n, stageBg: si.bg, stageFg: si.fg,
+        sym: a.sym, chain: a.chain, chainColor: chainColor(a.chain),
+        claim: si.n + ' on ' + a.sym + ' — score ' + a.score + ' across ' +
+          families.length + ' independent famil' + (families.length === 1 ? 'y' : 'ies') + '.',
+        families,
+        conf: a.conf == null ? combineConfidence(families) : a.conf,
+        invalidations: [
+          'score falls below ' + floor + ' within ' + (OPP_HORIZON_MS / 3600e3) + 'h',
+          'liquidity drops under $50K before the horizon'
+        ],
+        horizon: (OPP_HORIZON_MS / 3600e3) + 'h',
+        ts: new Date(Number.isFinite(row.stageSince) ? row.stageSince : now)
+          .toISOString().slice(11, 19),
+        id: 'alert ' + String(row.tokenAddress || a.id).slice(0, 8),
+        slug: String(a.sym || '').replace(/^\$/, '').toLowerCase()
+      };
+    });
+
+  /* ----------------------------------------------------------------- risk */
+
+  const risks = assets
+    .map((a) => {
+      const row = a.rawServerRow || {};
+      const families = riskFamilies(row);
+      // Integrity is shown but never counts toward the trigger - see the
+      // schema. Coverage and immaturity move confidence, not the claim.
+      const firing = constitutingRisk(families);
+      return { a, row, families, firing };
+    })
+    // The schema's own rule: two independent risk families, not one.
+    .filter((r) => r.firing.length >= 2)
+    .sort((x, y) => y.firing.length - x.firing.length ||
+      (y.row.riskPenalty || 0) - (x.row.riskPenalty || 0))
+    .slice(0, 4)
+    .map(({ a, row, families, firing }) => {
+      const worst = firing.slice().sort((x, y) => y.value - x.value)[0];
+      return {
+        cls: 'RISK', accent: ALERT_CLASSES.RISK.accent,
+        stage: null, stageBg: '#45103a', stageFg: '#ff4fae',
+        sym: a.sym, chain: a.chain, chainColor: chainColor(a.chain),
+        claim: firing.length + ' independent risk families fired on ' + a.sym +
+          ' — led by ' + worst.label.toLowerCase() + '.',
+        families,
+        conf: combineConfidence(firing),
+        invalidations: firing.map((f) => f.label.toLowerCase() + ' clears within ' +
+          (RISK_HORIZON_MS / 3600e3) + 'h'),
+        horizon: (RISK_HORIZON_MS / 3600e3) + 'h',
+        ts: new Date(now).toISOString().slice(11, 19),
+        id: 'alert ' + String(row.tokenAddress || a.id).slice(0, 8),
+        slug: String(a.sym || '').replace(/^\$/, '').toLowerCase()
+      };
+    });
+
+  /* ----------------------------------------------------------- resolution */
+
+  // Symbols for tokens that may have left the live table since they alerted.
+  const symbolFor = {};
+  for (const a of assets) {
+    const addr = (a.rawServerRow || {}).tokenAddress;
+    if (addr) symbolFor[addr] = a.sym;
   }
 
+  const resolutions = [];
+  for (const chainKey of chainKeys) {
+    const journal = journalFor(chainKey);
+    for (const addr of Object.keys(journal)) {
+      const series = journal[addr] || [];
+      if (series.length < 2) continue;
+
+      const alerted = series.findIndex((m) => m.stage >= 3);
+      if (alerted === -1) continue;
+      const opened = series[alerted];
+      const latest = series[series.length - 1];
+      const elapsed = latest.t - opened.t;
+
+      let outcome = null;
+      if (latest.stage < 3) outcome = RESOLUTIONS.INVALIDATED;
+      else if (elapsed >= OPP_HORIZON_MS) outcome = RESOLUTIONS.CONFIRMED;
+      if (!outcome) continue;
+
+      const delta = latest.score - opened.score;
+      resolutions.push({
+        cls: 'RESOLUTION', accent: ALERT_CLASSES.RESOLUTION.accent,
+        stage: null, stageBg: '#1a2440',
+        stageFg: outcome === RESOLUTIONS.CONFIRMED ? '#4d8dff' : '#ff4fae',
+        outcome: outcome.toUpperCase(),
+        sym: symbolFor[addr] || ('$' + addr.slice(0, 4).toUpperCase()),
+        chain: chainKey.toUpperCase().slice(0, 4),
+        chainColor: chainColor(chainKey.toUpperCase().slice(0, 4)),
+        claim: outcome === RESOLUTIONS.CONFIRMED
+          ? 'Held ' + stageInfo(Math.max(3, latest.stage)).n + ' through the ' +
+            (OPP_HORIZON_MS / 3600e3) + 'h horizon.'
+          : 'Fell out of CONFIRMED after ' + (elapsed / 3600e3).toFixed(1) + 'h.',
+        families: [{
+          key: 'flow', label: 'Score path', value: Math.max(0, Math.min(100, latest.score)),
+          confidence: 0.9,
+          evidence: 'Opened at ' + opened.score + ', now ' + latest.score +
+            ' (' + (delta >= 0 ? '+' : '') + delta + ') over ' +
+            (elapsed / 3600e3).toFixed(1) + 'h'
+        }],
+        conf: 0.9,
+        invalidations: ['resolved — the journal is the record, nothing further to check'],
+        horizon: 'closed',
+        sortT: latest.t,
+        ts: new Date(latest.t).toISOString().slice(11, 19),
+        id: 'alert ' + addr.slice(0, 8),
+        slug: addr.slice(0, 8)
+      });
+    }
+  }
+  resolutions.sort((x, y) => y.sortT - x.sortT);
+
+  /* ----------------------------------------------------------- validation */
+
+  // The contract is enforced here, not assumed. A card that fails validation
+  // is a bug in this file, and the column footer says so rather than hiding it.
+  const invalid = [];
+  for (const card of [...opportunities, ...risks, ...resolutions]) {
+    const check = validateAlert({
+      id: card.id, class: card.cls, claim: card.claim,
+      families: card.families, invalidations: card.invalidations
+    });
+    if (!check.ok) invalid.push(card.id + ': ' + check.problems[0]);
+  }
+
+  const columns = [
+    {
+      key: 'OPPORTUNITY', label: 'OPPORTUNITY', accent: ALERT_CLASSES.OPPORTUNITY.accent,
+      cards: opportunities,
+      empty: 'Nothing is at CONFIRMED or above right now, so no opportunity alert would have been sent.'
+    },
+    {
+      key: 'RISK', label: 'RISK', accent: ALERT_CLASSES.RISK.accent,
+      cards: risks.slice(0, 4),
+      empty: 'No token has two independent risk families above 60. Only contract, liquidity and holders can constitute a risk claim today — deployer history is not wired, and integrity moves confidence rather than the claim.'
+    },
+    {
+      key: 'RESOLUTION', label: 'RESOLUTION', accent: ALERT_CLASSES.RESOLUTION.accent,
+      cards: resolutions.slice(0, 4),
+      empty: 'No prior alert has reached its horizon yet. Resolutions appear once a scored token has been tracked for ' + (OPP_HORIZON_MS / 3600e3) + 'h.'
+    }
+  ];
+
+  return { alertColumns: columns, alertInvalid: invalid };
+}
+
+/* ============================================================ the cards ==== */
+
+function Bars({ value, accent, css }) {
+  const s = strengthOf(value);
+  return <span style={css("display:inline-flex;gap:2px;align-items:center;flex-shrink:0", { s })}>
+    {[0, 1, 2, 3].map((i) => (
+      <span key={i} style={css(
+        "width:6px;height:9px;border-radius:1px;background:{{ bg }}",
+        { bg: i < s.bars ? accent : '#1c2a4d' }
+      )} />
+    ))}
+  </span>;
+}
+
+function AlertCard({ c, css }) {
+  return <div style={css("display:flex;background:#101c38;border-radius:8px;overflow:hidden", { c })}>
+    <div style={css("width:3px;background:{{ c.accent }};flex-shrink:0", { c })} />
+    <div style={css("padding:11px 13px;min-width:0;flex:1", { c })}>
+
+      <div style={css("display:flex;gap:7px;align-items:center;margin-bottom:7px;flex-wrap:wrap", { c })}>
+        <span style={css(
+          "font-size:8px;font-weight:800;letter-spacing:.7px;padding:3px 8px;border-radius:999px;background:{{ c.stageBg }};color:{{ c.stageFg }}",
+          { c }
+        )}>{c.outcome || c.stage || c.cls}</span>
+        <span style={css("font-weight:800;color:#ffffff;font-size:12.5px", { c })}>{c.sym}</span>
+        <span style={css("font-size:9px;font-weight:600;color:{{ c.chainColor }}", { c })}>{c.chain}</span>
+        <span style={css("margin-left:auto;font-size:9px;color:#6b7699;font-weight:700", { c })}>
+          conf {c.conf == null ? '—' : c.conf.toFixed(2)}
+        </span>
+      </div>
+
+      <div style={css("font-size:11.5px;color:#dfe6f6;line-height:1.5;font-weight:600;margin-bottom:9px", { c })}>
+        {c.claim}
+      </div>
+
+      {/* Label and strength share a row; the evidence sentence gets the full
+          width beneath it. Side-by-side crushes the sentence to one word per
+          line as soon as three columns have to fit. */}
+      <div style={css("display:flex;flex-direction:column;gap:7px", { c })}>
+        {(c.families || []).map((f, i) => (
+          <div key={i}>
+            <div style={css("display:flex;gap:6px;align-items:center", { f })}>
+              <span style={css("font-size:8px;letter-spacing:.6px;color:#6b7699;font-weight:700", { f })}>
+                {f.label.toUpperCase()}
+              </span>
+              <span style={css("font-size:8px;color:#4a5578;font-weight:700", { f })}>
+                {f.value == null ? '—' : f.value}
+              </span>
+              <span style={css("margin-left:auto;display:flex;align-items:center", { f })}>
+                <Bars value={f.value} accent={c.accent} css={css} />
+              </span>
+            </div>
+            <div style={css("font-size:10px;color:#a3aed0;line-height:1.45;margin-top:2px", { f })}>
+              {f.evidence}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={css("margin-top:9px;padding-top:8px;border-top:1px solid #1c2a4d", { c })}>
+        <span style={css("font-size:9px;color:{{ c.accent }};font-weight:700;letter-spacing:.5px", { c })}>
+          INVALIDATES IF
+        </span>
+        <div style={css("font-size:9.5px;color:#8b96b8;line-height:1.5;margin-top:3px", { c })}>
+          {(c.invalidations || []).join(' · ')}
+        </div>
+      </div>
+
+      <div style={css("font-size:8.5px;color:#6b7699;margin-top:7px", { c })}>
+        {c.ts} UTC · {c.id} · horizon {c.horizon}
+      </div>
+    </div>
+  </div>;
+}
+
 export default function AlertCards({ v, css }) {
+  const columns = v.alertColumns || [];
+  const total = columns.reduce((t, col) => t + col.cards.length, 0);
+
   return v.isAlerts && <>
-          <div data-screen-label="Alert cards" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}><div style={css("display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:hidden", { v })}><div style={css("padding:8px 14px;border-bottom:1px solid #1c2a4d;font-size:9px;letter-spacing:1.2px;font-weight:700;color:#8b96b8", { v })}>TELEGRAM — @vibescreener_bot</div><div style={css("padding:12px;display:flex;flex-direction:column;gap:12px", { v })}>{(v.acards || []).map((a, i) => (<React.Fragment key={i}>
-            <div style={css("background:#101c38;border-radius:14px 14px 14px 4px;padding:12px 14px", { v, a })}><div style={css("display:flex;gap:8px;align-items:center;margin-bottom:7px;flex-wrap:wrap", { v, a })}><span style={css("font-size:8.5px;font-weight:800;letter-spacing:.6px;padding:3px 9px;border-radius:999px;background:{{ a.stageBg }};color:{{ a.stageFg }}", { v, a })}>{a.stage}</span><span style={css("font-weight:800;color:#ffffff;font-size:13px", { v, a })}>{a.sym}</span><span style={css("font-size:9.5px;font-weight:600;color:{{ a.chainColor }}", { v, a })}>{a.chain}</span></div><div style={css("font-size:11px;color:#c6d1ea;line-height:1.6", { v, a })}>{a.body}</div><div style={css("margin-top:7px;font-size:11px;color:#c6d1ea;line-height:1.5", { v, a })}><span style={css("color:#f06ee2;font-weight:700", { v, a })}>Risks:</span> {a.risks}</div><div style={css("display:flex;gap:7px;margin-top:10px;flex-wrap:wrap", { v, a })}>{(a.buttons || []).map((b, i) => (<React.Fragment key={i}>
-              <div className="hf6f5791f" style={css("padding:4px 12px;border-radius:999px;border:1px solid #2b6bff;color:#6ea0ff;font-size:9.5px;font-weight:700;cursor:pointer", { v, a, b })}>{b}</div>
-            </React.Fragment>))}</div><div style={css("font-size:9px;color:#6b7699;margin-top:8px", { v, a })}>{a.ts} UTC · {a.id}</div></div>
-          </React.Fragment>))}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:hidden", { v })}><div style={css("padding:8px 14px;border-bottom:1px solid #1c2a4d;font-size:9px;letter-spacing:1.2px;font-weight:700;color:#8b96b8", { v })}>DISCORD — #screener-alerts</div><div style={css("padding:12px;display:flex;flex-direction:column;gap:12px", { v })}>{(v.acards || []).map((a, i) => (<React.Fragment key={i}>
-            <div style={css("display:flex;background:#101c38;border-radius:6px;overflow:hidden", { v, a })}><div style={css("width:4px;background:{{ a.stageFg }};flex-shrink:0", { v, a })}></div><div style={css("padding:11px 13px;min-width:0", { v, a })}><div style={css("font-size:9px;color:#8b96b8;margin-bottom:4px", { v, a })}>VibeScreener BOT · today at {a.ts}</div><div style={css("font-weight:800;color:#ffffff;font-size:12px;margin-bottom:5px", { v, a })}>{a.title}</div><div style={css("font-size:10.5px;color:#c6d1ea;line-height:1.55;margin-bottom:9px", { v, a })}>{a.body}</div><div style={css("display:grid;grid-template-columns:repeat(3,1fr);gap:7px 10px", { v, a })}>{(a.fields || []).map((f, i) => (<React.Fragment key={i}>
-              <div><div style={css("font-size:8.5px;letter-spacing:.6px;color:#6b7699;font-weight:700", { v, a, f })}>{f.k}</div><div style={css("font-size:11px;font-weight:700;color:{{ f.c }}", { v, a, f })}>{f.v}</div></div>
-            </React.Fragment>))}</div><div style={css("font-size:9px;color:#6b7699;margin-top:9px", { v, a })}>{a.id} · vibe.trading/screener/{a.slug}</div></div></div>
-          </React.Fragment>))}</div></div><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:hidden", { v })}><div style={css("padding:8px 14px;border-bottom:1px solid #1c2a4d;font-size:9px;letter-spacing:1.2px;font-weight:700;color:#8b96b8", { v })}>BROWSER PUSH</div><div style={css("margin:14px;background:rgba(16,28,56,.95);border:1px solid #223052;border-radius:14px;padding:12px 14px;display:flex;gap:10px;box-shadow:0 10px 30px rgba(0,0,0,.45)", { v })}><img src="/assets/vibe-logo.png" alt="Vibe" style={css("width:34px;height:34px;object-fit:cover;object-position:left;border-radius:8px;flex-shrink:0", { v })} /><div style={css("min-width:0;flex:1", { v })}><div style={css("display:flex;justify-content:space-between;gap:8px", { v })}><span style={css("font-size:11px;font-weight:800;color:#ffffff", { v })}>VibeScreener — EXCEPTIONAL</span><span style={css("font-size:9px;color:#6b7699", { v })}>now</span></div><div style={css("font-size:10.5px;color:#c6d1ea;line-height:1.45;margin-top:2px", { v })}>{v.pushBody}</div></div></div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:hidden", { v })}><div style={css("padding:8px 14px;border-bottom:1px solid #1c2a4d;font-size:9px;letter-spacing:1.2px;font-weight:700;color:#8b96b8", { v })}>WEBHOOK PAYLOAD — ABBREVIATED</div><div style={css("padding:10px 14px", { v })}>{(v.jsonLines || []).map((l, i) => (<React.Fragment key={i}>
-            <div style={css("font-size:9.5px;line-height:1.6;color:#a3aed0;white-space:pre;font-family:monospace", { v, l })}>{l}</div>
-          </React.Fragment>))}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px 14px;font-size:10px;color:#8b96b8;line-height:1.6", { v })}>Every channel renders from the same alert payload. Cards always state the metric, its baseline, and what could invalidate the signal — never a bare "volume up 300%".</div></div></div></div>
-        </>
+    <div data-screen-label="Alert cards" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}>
+
+      {/* auto-fit rather than a hard 3-up: below ~950px the columns would each
+          be too narrow to hold an evidence sentence, so they wrap instead. */}
+      <div style={css("display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px;align-items:start", { v })}>
+        {columns.map((col) => (
+          <div key={col.key} style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:hidden", { col })}>
+
+            <div style={css(
+              "padding:8px 14px;border-bottom:1px solid #1c2a4d;display:flex;align-items:center;gap:8px;border-top:2px solid {{ col.accent }}",
+              { col }
+            )}>
+              <span style={css("font-size:9px;letter-spacing:1.2px;font-weight:700;color:{{ col.accent }}", { col })}>
+                {col.label}
+              </span>
+              <span style={css("margin-left:auto;font-size:9px;font-weight:700;color:#6b7699", { col })}>
+                {col.cards.length}
+              </span>
+            </div>
+
+            <div style={css("padding:12px;display:flex;flex-direction:column;gap:10px", { col })}>
+              {col.cards.length
+                ? col.cards.map((c, i) => <AlertCard key={i} c={c} css={css} />)
+                : <div style={css("font-size:10px;color:#6b7699;line-height:1.6;padding:6px 2px", { col })}>
+                    {col.empty}
+                  </div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px 14px;font-size:10px;color:#8b96b8;line-height:1.6;margin-top:10px", { v })}>
+        {total} alert{total === 1 ? '' : 's'} on screen. Every card states which evidence families
+        fired, how strongly each one did, and the condition that would prove it wrong. Families that
+        share inputs are discounted against each other, so four readings of the same trade tape never
+        add up to four confirmations.
+        {(v.alertInvalid || []).length
+          ? <span style={css("color:#ff4fae", { v })}> {(v.alertInvalid || []).length} card(s) failed
+              schema validation: {(v.alertInvalid || [])[0]}</span>
+          : null}
+      </div>
+    </div>
+  </>;
 }

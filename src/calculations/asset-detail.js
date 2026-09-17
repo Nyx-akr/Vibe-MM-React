@@ -20,6 +20,7 @@
 
 import {
   toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
+  zScoresFrom, bucketBaselines, rotationFor,
 } from './core.js';
 
 /* =================================================== the model =========== */
@@ -59,9 +60,6 @@ export const STAGES = Object.freeze([
   { name: 'EMERGING', min: 55 },
   { name: 'WATCH', min: 0 },
 ]);
-
-/** Points the score must fall below the current band before demoting. */
-export const HYSTERESIS = 3;
 
 const IMPACT_TRADE_USD = 10000;
 const round = (v, dp) => (Number.isFinite(v) ? Math.round(v * 10 ** dp) / 10 ** dp : null);
@@ -556,16 +554,20 @@ export function assessRisk(row, modifiers, context) {
 /* ================================================== the stage machine ==== */
 
 /**
- * Stage memory, with hysteresis.
+ * Stage memory.
  *
- * This is the one calculation that needs to remember yesterday. A token
- * promotes the instant it clears a band, but will not demote until it falls
- * HYSTERESIS points BELOW that band - otherwise the badge flickers on one or
- * two points of noise.
+ * The stage IS the score, bucketed: 0 / 55 / 70 / 85. It follows the score
+ * immediately in both directions - if the score changes band, the stage
+ * changes with it. There is no smoothing, no hold, no lag. The final score is
+ * the thing that matters, and the badge must never say something the number
+ * does not.
  *
- * The memory used to live on the server. It lives in the browser now, because
- * the browser is what computes the score. Hydrate it at boot and snapshot it
- * back out to whatever storage the app is using.
+ * What is remembered here is only WHEN the stage last changed, and the recent
+ * transitions - the stage itself is recomputed from the score every time.
+ *
+ * The memory lives in the browser because the browser is what computes the
+ * score. Hydrate it at boot and snapshot it back out to whatever storage the
+ * app is using.
  */
 const stageStore = new Map();
 
@@ -582,25 +584,14 @@ export function stageSnapshot() {
 
 export function stageFor(chainKey, tokenAddress, score) {
   const key = chainKey + ':' + tokenAddress;
+  // The stage is a pure function of the score. Nothing here can override it.
+  const next = (STAGES.find((s) => score >= s.min) || STAGES[STAGES.length - 1]).name;
   const prior = stageStore.get(key);
-  const bare = STAGES.find((s) => score >= s.min) || STAGES[STAGES.length - 1];
 
   if (!prior) {
-    const entry = { stage: bare.name, since: Date.now(), history: [{ stage: bare.name, at: Date.now() }] };
+    const entry = { stage: next, since: Date.now(), history: [{ stage: next, at: Date.now() }] };
     stageStore.set(key, entry);
     return entry;
-  }
-
-  const currentIndex = STAGES.findIndex((s) => s.name === prior.stage);
-  const bareIndex = STAGES.findIndex((s) => s.name === bare.name);
-  let next = prior.stage;
-  if (bareIndex < currentIndex) {
-    // STAGES is ordered best-first, so a lower index is a promotion - taken
-    // immediately.
-    next = bare.name;
-  } else if (bareIndex > currentIndex) {
-    const holding = STAGES[currentIndex];
-    if (score < holding.min - HYSTERESIS) next = bare.name;
   }
 
   if (next !== prior.stage) {
@@ -656,7 +647,6 @@ export function scoreAsset(row, extras) {
     stage: stage.stage,
     stageSince: stage.since,
     stageHistory: stage.history,
-    stageHysteresis: HYSTERESIS,
     scoreModel: breakdown,
     scoreModifiers: SCORE_MODIFIERS.map((m) => ({
       key: m.key, label: m.label,
@@ -667,6 +657,83 @@ export function scoreAsset(row, extras) {
     weightCovered: weightUsed,
     componentsPresent: breakdown.filter((b) => !b.pending).length,
     dataQuality: round(weightUsed / 100, 2),
+  };
+}
+
+/* ================================================ the entry point ======== */
+
+/**
+ * THE single evaluation of a token. Everything the dashboard shows about an
+ * asset comes out of this function.
+ *
+ * Live Opportunities does not calculate anything - it calls this for each row
+ * and renders the result. The Asset Detail page calls nothing at all; it
+ * renders the same object for the one token you opened. That is why the score
+ * in the table and the score on the detail page are always the same number:
+ * there is only ever one of them.
+ *
+ * Inputs are all raw, straight from the server:
+ *   samples    - this pool's rolling 15s metric series (for the baselines)
+ *   walletSets - sampled trades per pool, for flow and rotation
+ *   intel      - this token's derived contract/holder/impact facts, if we have
+ *                them yet; the score is computed on fewer inputs when we do not
+ *   reference  - the quote token's price across CEX venues
+ */
+export function evaluateAsset(row, { samples, walletSets, intel, reference } = {}) {
+  const poolSamples = (samples && samples[row.poolAddress]) || [];
+  const fromSamples = zScoresFrom(poolSamples);
+  const own = walletSets && walletSets.get(row.poolAddress);
+
+  // Our own 15s samples are the better baseline; the trade tape is the
+  // fallback for pools too new to have accumulated any.
+  const zScores = Object.keys(fromSamples.metrics).length
+    ? fromSamples
+    : (own ? bucketBaselines(own.trades || []) : fromSamples);
+
+  const extras = {
+    zScores,
+    tradeStats: own ? own.stats : null,
+    rotation: walletSets ? rotationFor(walletSets, row.poolAddress) : null,
+    usdReference: reference || null,
+    intel: intel || null,
+    jupiter: row.jupiter || null,
+  };
+
+  const scored = scoreAsset(row, extras);
+  const organic = (scored.scoreModifiers || []).find((m) => m.key === 'organicFlow');
+  const organicValue = organic && !organic.pending ? organic.value : null;
+  const stats = extras.tradeStats;
+  const jup5m = row.jupiter && row.jupiter.stats5m;
+
+  return {
+    ...row,
+    ...scored,
+    topReason: topReasonFor(row, extras),
+    zScores,
+    tradeStats: stats,
+    rotation: extras.rotation,
+    usdReference: extras.usdReference,
+    // Which input set produced this score, so the UI can say how complete it is.
+    scoreBasis: extras.intel ? 'intel' : 'market',
+    volumeBaselineMultiple: zScores.metrics.volume5mUsd
+      ? zScores.metrics.volume5mUsd.multiple : null,
+    // Wash probability is the inverse of organic flow - a proxy, not a
+    // wash-trading model, which is why it is named as a probability and not
+    // as a verdict.
+    flow: stats ? {
+      source: 'geckoterminal',
+      netUsd: stats.netUsd, buyUsd: stats.buyUsd, sellUsd: stats.sellUsd,
+      distinctWallets: stats.distinctWallets, windowMinutes: stats.windowMinutes,
+      organicFlow: organicValue,
+      washRisk: organicValue === null ? null : 100 - organicValue,
+    } : (jup5m ? {
+      source: 'jupiter',
+      netUsd: jup5m.netUsd, buyUsd: jup5m.buyUsd, sellUsd: jup5m.sellUsd,
+      distinctWallets: jup5m.numTraders, windowMinutes: 5,
+      organicSharePct: row.jupiter.stats24h ? row.jupiter.stats24h.organicSharePct : null,
+      organicFlow: organicValue,
+      washRisk: organicValue === null ? null : 100 - organicValue,
+    } : null),
   };
 }
 

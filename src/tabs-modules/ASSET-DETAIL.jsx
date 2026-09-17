@@ -6,7 +6,7 @@ const EMPTY_DETAIL = {
   score: 0, scoreColor: '#a3aed0', conf: '0.00', raw: 0, penalty: 0,
   price: '$0.00', chg: '0.0%', chgColor: '#a3aed0',
   spark: [], market: [], outcomes: [], subs: [], isStock: false, oracle: [],
-  reasons: [], flags: [], gauge: null, hysteresis: '',
+  reasons: [], flags: [], gauge: null, bandNote: '',
   chartNote: '', scoreSource: '', safety: [], safetyNote: '', intelState: 'idle'
 };
 
@@ -29,9 +29,8 @@ const Z_METRIC_FOR = { volumeAnomaly: 'volume5mUsd', tradeActivity: 'buys5m', bu
  * quarter of the bar per band, linear inside it - and the band edges are
  * printed above the joins so the scale is still readable.
  *
- * The lit segment is the current stage; the marker sits at the score. When
- * the hysteresis is holding a demotion the two disagree, and the gap between
- * them is exactly that hold.
+ * The lit segment is the current stage and the marker sits at the score, so
+ * the two can never disagree - the stage is the score, bucketed.
  */
 const GAUGE_BANDS = [
   { n: 'WATCH', min: 0, max: 55 },
@@ -85,13 +84,13 @@ export function detailVals(app, a, showAdj, extra) {
     const row = a.rawServerRow || {};
     const si = stageInfo(a.stage);
 
-    // /api/intel rescores with holder, safety and routed-impact inputs the feed
-    // lacks, so prefer it when loaded; otherwise fall back to the feed's own.
-    const scored = (intel && intel.scored) || row;
-    const usingIntel = Boolean(intel && intel.scored);
-    const scoreSource = usingIntel
-      ? `intel · ${scored.componentsPresent ?? '?'} of ${(scored.scoreModel || []).length} inputs`
-      : `feed · ${row.componentsPresent ?? '?'} of ${(row.scoreModel || []).length} inputs`;
+    // ONE score per token. The pipeline computes it once per poll, with
+    // whatever intel is cached for this token, and this view renders that
+    // result - it never rescores. If it did, the board and this page would be
+    // two snapshots of a moving input and would disagree by a few points.
+    const scored = row;
+    const scoreSource = `${row.scoreBasis === 'intel' ? 'intel' : 'feed'} · ` +
+      `${row.componentsPresent ?? '?'} of ${(row.scoreModel || []).length} inputs`;
 
     const modifiers = scored.scoreModifiers || [];
     const subs = [
@@ -190,7 +189,8 @@ export function detailVals(app, a, showAdj, extra) {
     const outcomes = ['15M', '1H', '4H', '12H', '24H'].map((k) => ({ k, v: '—', c: UNAVAILABLE }));
 
     const sev = { HIGH: { bg: '#45103a', fg: '#ff4fae' }, MED: { bg: '#33124a', fg: '#e35ff2' }, LOW: { bg: '#1a2440', fg: '#a3aed0' } };
-    const zMetrics = (intel && intel.zScores && intel.zScores.metrics) || {};
+    const zMetrics = (intel && intel.zScores && intel.zScores.metrics) ||
+      (row.zScores && row.zScores.metrics) || {};
     const reasons = (scored.scoreModel || [])
       .filter((c) => !c.pending && c.evidence)
       .map((c) => {
@@ -253,41 +253,19 @@ export function detailVals(app, a, showAdj, extra) {
         ? 'Not in the current feed — values frozen from ' + Math.round(staleMs / 1000) + 's ago'
         : '',
       spark, chartNote, market, outcomes, subs, safety, safetyNote,
-      isStock: !!a.oracle, oracle, ...bubbleVals(app, a),
+      isStock: !!a.oracle, oracle,
       reasons, flags,
       gauge: buildGauge(finalScore, a.stage),
-      // Server bands: WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85.
-      // Promotion is immediate; only demotion is buffered by the hysteresis.
-      hysteresis: Number.isFinite(row.stageHysteresis)
-        ? 'Bands 55 / 70 / 85. Promotes as soon as the score clears a band; holds ' + si.n +
-          ' until the score drops ' + row.stageHysteresis + ' pts below it, so the stage never flips on 1–2 pt noise.'
-        : 'Stage hysteresis unavailable.'
+      // WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85. The stage
+      // follows the score immediately, both ways - the badge can never
+      // disagree with the number next to it.
+      bandNote: finalScore == null
+        ? 'Bands 55 / 70 / 85.'
+        : 'Bands 55 / 70 / 85. The stage is the final score bucketed, so it moves the moment the ' +
+          'score crosses a band in either direction. At ' + finalScore + ' this is ' + si.n + '.'
     };
   }
 
-export function bubbleVals(app, a) {
-    if (!a.bundle) return { hasBubbles: false, bubbles: [], bundleStats: [], bubbleLinks: [] };
-    const r = app.srand(app.h(a.id + 'bub'));
-    const bubbles = []; const cx = 50, cy = 50;
-    // cluster of bundled wallets around funder + independent holders
-    bubbles.push({ x: '30%', y: '42%', s: '26px', c: '#ff4fae', op: '1', label: 'FUNDER' });
-    for (let i = 0; i < a.bundle.sameBlock; i++) {
-      const ang = r() * 6.28, d = 12 + r() * 14;
-      bubbles.push({ x: (30 + Math.cos(ang) * d) + '%', y: (42 + Math.sin(ang) * d * 0.8) + '%', s: (8 + r() * 8) + 'px', c: '#ff4fae', op: '0.75', label: '' });
-    }
-    for (let i = 0; i < 16; i++) { bubbles.push({ x: (58 + r() * 36) + '%', y: (12 + r() * 76) + '%', s: (6 + r() * 13) + 'px', c: '#4d8dff', op: '0.65', label: '' }); }
-    bubbles.push({ x: '72%', y: '30%', s: '22px', c: '#8fd3ff', op: '0.9', label: 'POOL' });
-    const b = a.bundle;
-    return {
-      hasBubbles: true, bubbles,
-      bundleStats: [
-        { k: 'Bundle probability', v: b.prob.toFixed(2), c: b.prob >= 0.5 ? '#ff4fae' : '#e35ff2' },
-        { k: 'Same-block launch buyers', v: b.sameBlock + ' of ' + b.launchBuyers, c: '#ff4fae' },
-        { k: 'Common funding source', v: b.funder, c: '#ffffff' },
-        { k: 'Cluster supply share', v: b.supplyPct + '%', c: b.supplyPct >= 30 ? '#ff4fae' : '#e35ff2' },
-        { k: 'Liquidity wash cycles', v: b.liqCycles + '× (' + fmtUsd(b.liqCycleUsd) + ' each)', c: '#ff4fae' }]
-    };
-  }
 
 export default function AssetDetail({ v, css }) {
   return v.isDetail && <>
@@ -297,7 +275,7 @@ export default function AssetDetail({ v, css }) {
             <div style={css("flex:1 1 0;min-width:0;text-align:center;padding:6px 2px 4px;font-size:8.5px;font-weight:800;letter-spacing:.2px;background:{{ sg.bg }};color:{{ sg.fg }};border-left:1px solid {{ sg.sep }};border-bottom:2px solid {{ sg.bd }}", { v, sg })}>{sg.n}</div>
           </React.Fragment>))}</div><div style={css("position:relative;height:20px", { v })}>{v.d.gauge && v.d.gauge.live ? (<>
             <div style={css("position:absolute;top:-4px;left:{{ d.gauge.left }};transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;transition:left 420ms cubic-bezier(.4,0,.2,1)", { v, d: v.d })}><div style={css("width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:6px solid {{ d.gauge.fg }}", { v, d: v.d })}></div><div style={css("font-size:10px;font-weight:700;line-height:1.3;color:{{ d.gauge.fg }}", { v, d: v.d })}>{v.d.gauge.value}</div></div>
-          </>) : (<div style={css("padding-top:4px;font-size:9px;color:#3a4568", { v })}>score unavailable</div>)}</div></div><div style={css("flex:1 1 240px;font-size:10px;color:#8b96b8;line-height:1.5;max-width:420px", { v })}>{v.d.hysteresis}</div></div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>EXECUTION PRICE — 1M BARS</span><span style={css("font-size:10px;color:#8b96b8", { v })}>{v.d.price} <span style={css("color:{{ d.chgColor }}", { v, d: v.d })}>{v.d.chg} 5M</span></span></div><div style={css("display:flex;align-items:flex-end;gap:2px;height:110px", { v })}>{(v.d.spark || []).map((b, i) => (<React.Fragment key={i}>
+          </>) : (<div style={css("padding-top:4px;font-size:9px;color:#3a4568", { v })}>score unavailable</div>)}</div></div><div style={css("flex:1 1 240px;font-size:10px;color:#8b96b8;line-height:1.5;max-width:420px", { v })}>{v.d.bandNote}</div></div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>EXECUTION PRICE — 1M BARS</span><span style={css("font-size:10px;color:#8b96b8", { v })}>{v.d.price} <span style={css("color:{{ d.chgColor }}", { v, d: v.d })}>{v.d.chg} 5M</span></span></div><div style={css("display:flex;align-items:flex-end;gap:2px;height:110px", { v })}>{(v.d.spark || []).map((b, i) => (<React.Fragment key={i}>
             <div style={css("flex:1;background:{{ b.c }};height:{{ b.h }};border-radius:1px 1px 0 0", { v, b })}></div>
           </React.Fragment>))}{v.d.chartNote && (<div style={css("flex:1;display:flex;align-items:center;justify-content:center;font-size:10px;color:#3a4568", { v })}>{v.d.chartNote}</div>)}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>MARKET</div><div style={css("display:grid;grid-template-columns:repeat(4,1fr);gap:10px", { v })}>{(v.d.market || []).map((m, i) => (<React.Fragment key={i}>
             <div><div style={css("font-size:9px;color:#6b7699;letter-spacing:.6px", { v, m })}>{m.k}</div><div style={css("font-size:13px;font-weight:600;margin-top:2px;color:{{ m.c }}", { v, m })}>{m.v}</div></div>
@@ -311,13 +289,7 @@ export default function AssetDetail({ v, css }) {
             <div style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0", { v, f })}><span style={css("font-size:9px;font-weight:700;padding:2px 6px;border-radius:10px;background:{{ f.bg }};color:{{ f.fg }};flex-shrink:0", { v, f })}>{f.sev}</span><span style={css("font-size:11px;color:#c6d1ea", { v, f })}>{f.text}</span></div>
           </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
             <div title={sc.detail} style={css("display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #16223f", { v, sc })}><span style={css("font-size:11px;font-weight:700;color:{{ sc.c }};flex-shrink:0;width:12px", { v, sc })}>{sc.glyph}</span><span style={css("flex:1;font-size:10.5px;color:#c6d1ea", { v, sc })}>{sc.label}</span><span style={css("font-size:9.5px;color:#6b7699", { v, sc })}>{sc.detail}</span></div>
-          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div>{v.d.hasBubbles && (<>
-            <div style={css("background:#0a1226;border:1px solid #45103a;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;align-items:center;margin-bottom:8px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#ff4fae;font-weight:700", { v })}>BUNDLE MAP — WALLET CLUSTERS · via Bubblemaps</div><a href="https://bubblemaps.io" target="_blank" style={css("font-size:9px;color:#6b7699", { v })}>open in Bubblemaps ↗</a></div><div style={css("position:relative;height:190px;background:#0d1730;border:1px solid #16223f;border-radius:10px;overflow:hidden", { v })}>{(v.d.bubbles || []).map((b, i) => (<React.Fragment key={i}>
-              <div style={css("position:absolute;left:{{ b.x }};top:{{ b.y }};width:{{ b.s }};height:{{ b.s }};border-radius:50%;background:{{ b.c }};opacity:{{ b.op }};transform:translate(-50%,-50%)", { v, b })}></div>
-            </React.Fragment>))}<div style={css("position:absolute;left:30%;top:16%;transform:translateX(-50%);font-size:8px;font-weight:800;letter-spacing:.6px;color:#ff4fae", { v })}>BUNDLED CLUSTER</div><div style={css("position:absolute;left:76%;top:78%;transform:translateX(-50%);font-size:8px;font-weight:800;letter-spacing:.6px;color:#4d8dff", { v })}>INDEPENDENT HOLDERS</div></div><div style={css("margin-top:9px", { v })}>{(v.d.bundleStats || []).map((bs, i) => (<React.Fragment key={i}>
-              <div style={css("display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px solid #16223f;font-size:10.5px", { v, bs })}><span style={css("color:#8b96b8", { v, bs })}>{bs.k}</span><span style={css("font-weight:700;color:{{ bs.c }};flex-shrink:0", { v, bs })}>{bs.v}</span></div>
-            </React.Fragment>))}</div><div style={css("font-size:9.5px;color:#6b7699;margin-top:8px;line-height:1.55", { v })}>Red bubbles share a funding source and bought within the launch block window. Cluster supply share and liquidity in/out cycling both feed the wash-probability penalty above.</div></div>
-          </>)}{v.d.isStock && (<>
+          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div>{v.d.isStock && (<>
             <div style={css("background:#0a1226;border:1px solid #16406e;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#4fc3f7;font-weight:600;margin-bottom:8px", { v })}>STOCK TOKEN / ORACLE</div><div style={css("display:grid;grid-template-columns:1fr 1fr;gap:8px 14px", { v })}>{(v.d.oracle || []).map((o, i) => (<React.Fragment key={i}>
               <div style={css("display:flex;justify-content:space-between;font-size:10.5px;border-bottom:1px solid #16223f;padding:3px 0", { v, o })}><span style={css("color:#6b7699", { v, o })}>{o.k}</span><span style={css("font-weight:600;color:{{ o.c }}", { v, o })}>{o.v}</span></div>
             </React.Fragment>))}</div></div>

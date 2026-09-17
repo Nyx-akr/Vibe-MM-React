@@ -149,7 +149,7 @@ export const PANELS = [
     panel: "STAGE TIMELINE",
     fields: [
       { field: "Stage badge", source: "computed", freshness: "live",
-        formula: "bands WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85; promotes immediately, demotes only once the score falls 3 points below the band" },
+        formula: "bands WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85; the stage is the final score bucketed and follows it immediately in both directions" },
       { field: "Stage times", source: "app stage memory", freshness: "on change", formula: "transition timestamps kept by the app's stage machine, persisted per browser" },
     ],
   },
