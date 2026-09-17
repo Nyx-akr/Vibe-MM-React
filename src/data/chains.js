@@ -29,6 +29,28 @@ export const chainColors = {
   ARB: '#4fa8ff', POLY: '#a86bff', AVAX: '#ff5f5f', RHC: '#4fc3f7'
 };
 
+/**
+ * Where to go to read an address for yourself.
+ *
+ * A wallet row is a claim about somebody's behaviour, so it should always be
+ * one click from the chain's own record of it. Keyed by the server's chain id.
+ */
+const explorers = {
+  solana: 'https://solscan.io/account/',
+  ethereum: 'https://etherscan.io/address/',
+  base: 'https://basescan.org/address/',
+  bsc: 'https://bscscan.com/address/',
+  arbitrum: 'https://arbiscan.io/address/',
+  polygon: 'https://polygonscan.com/address/',
+  avalanche: 'https://snowtrace.io/address/',
+};
+
+/** Explorer URL for a wallet, or null where we have no explorer for the chain. */
+export function explorerAddressUrl(chainKey, address) {
+  const base = explorers[String(chainKey || '').toLowerCase()];
+  return base && address ? base + address : null;
+}
+
 /** Table label -> server chain id, for the chain selector. */
 export const chainNameToKey = chains.reduce((acc, c) => {
   acc[c.name] = c.key;

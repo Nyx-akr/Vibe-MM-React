@@ -529,70 +529,434 @@ export function rotationGraph(walletSets) {
 
 /* ======================================================== 7. wallets ===== */
 
-/** Every wallet seen across the sampled pools, ranked by how many it touched. */
-export function walletRegistry(walletSets, filterAddress) {
-  const wallets = new Map();
-  walletSets.forEach((entry, pool) => {
+/**
+ * Who is trading ONE token, and what they are actually doing.
+ *
+ * Everything here is derived from a real sample of that pool's trades - the
+ * wallet that signed, whether it bought or sold, how much in USD, and when.
+ * That sample is a WINDOW, not history: sometimes ten minutes, sometimes a
+ * day, depending on how busy the pool is. Every number below describes that
+ * window and nothing outside it, which is why `window` is returned first and
+ * the tab prints it above everything else.
+ *
+ * The tags are deliberately conservative. An earlier version of this tab
+ * called any wallet that touched three pools a BUNDLER, which on a sample of
+ * six pools meant "traded a bit" - it labelled almost every active wallet.
+ * A tag here has to be earned by a pattern unlikely to happen by accident;
+ * where the sample cannot support a claim, no tag is applied.
+ */
+
+/** Wallets whose first trade lands within this window may be one entry. */
+const COENTRY_WINDOW_MS = 2000;
+/** Co-entry sizes must be this alike (coefficient of variation) to count. */
+const COENTRY_MAX_CV = 0.25;
+/** Below this many wallets a co-entry burst is not worth reporting. */
+const COENTRY_MIN_WALLETS = 4;
+/**
+ * Entries smaller than this are not reported at all.
+ *
+ * An audit against live trades found a "cluster" of four $3 buys spread over
+ * three seconds. At dust sizes the size test means nothing - a handful of
+ * near-equal tiny trades is what a busy pool looks like anyway - and nobody
+ * funds a wallet set to move twelve dollars. Ignoring dust removes that whole
+ * class of false positive without touching real clusters.
+ */
+const COENTRY_MIN_ENTRY_USD = 25;
+/** Sizes this alike are a machine: the same number, to the cent. */
+const COENTRY_HIGH_CV = 0.02;
+const COENTRY_MEDIUM_CV = 0.10;
+/** A group leaving inside this window has exited together, not coincidentally. */
+const COEXIT_WINDOW_MS = 15000;
+/** A round trip this balanced, over this many trades, reads as churn. */
+const WASH_MAX_NET_SHARE = 0.15;
+const WASH_MIN_TRADES = 4;
+
+/** Mean and coefficient of variation - how alike a set of trade sizes is. */
+function dispersion(values) {
+  if (!values.length) return { mean: null, cv: null };
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  if (!mean) return { mean: 0, cv: null };
+  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
+  return { mean, cv: Math.sqrt(variance) / Math.abs(mean) };
+}
+
+/**
+ * Bursts of wallets making their FIRST trade at the same moment, for the same
+ * amount. Two tests have to pass together, because either alone is noise:
+ *
+ *   1. more wallets arrive in the window than the pool's own arrival rate
+ *      explains (Poisson mean + 3 sigma), so a busy pool is held to a higher
+ *      bar than a quiet one;
+ *   2. their entry sizes are near-identical, which is the part that random
+ *      retail arrivals do not do.
+ *
+ * On a live sample this cut 13 "clusters" covering 135 of 170 wallets down to
+ * one of seven, and reports nothing at all on established pairs.
+ */
+function coEntryClusters(wallets, spanMs, allTrades) {
+  if (wallets.length < COENTRY_MIN_WALLETS || spanMs <= 0) return [];
+  const expected = (wallets.length / spanMs) * COENTRY_WINDOW_MS;
+  const threshold = Math.max(
+    COENTRY_MIN_WALLETS,
+    Math.ceil(expected + 3 * Math.sqrt(expected)),
+  );
+
+  const byFirst = [...wallets].sort((a, b) => a.firstAt - b.firstAt);
+  const clusters = [];
+  for (let i = 0; i < byFirst.length; i++) {
+    const group = [byFirst[i]];
+    for (let j = i + 1; j < byFirst.length &&
+      byFirst[j].firstAt - byFirst[i].firstAt <= COENTRY_WINDOW_MS; j++) {
+      group.push(byFirst[j]);
+    }
+    if (group.length < threshold) continue;
+    const spread = dispersion(group.map((w) => w.firstUsd));
+    if (spread.cv === null || spread.cv > COENTRY_MAX_CV) continue;
+    if (spread.mean < COENTRY_MIN_ENTRY_USD) continue;
+
+    // Did the same group also leave together? An entry burst is suggestive;
+    // a matched exit burst is the part that is hard to explain as coincidence,
+    // and on live data it is what separates a funded wallet set from a crowd
+    // reacting to the same signal.
+    const members = new Set(group.map((w) => w.address));
+    const exits = allTrades
+      .filter((t) => t.kind === 'sell' && members.has(t.wallet))
+      .sort((a, b) => a.at - b.at);
+    let exit = null;
+    for (let k = 0; k + 1 < exits.length; k++) {
+      const burst = exits.filter((t) => t.at - exits[k].at <= COEXIT_WINDOW_MS);
+      const distinct = new Set(burst.map((t) => t.wallet)).size;
+      if (distinct >= Math.max(3, Math.ceil(group.length * 0.6)) &&
+        (!exit || distinct > exit.wallets)) {
+        exit = {
+          wallets: distinct,
+          at: burst[0].at,
+          spanMs: burst[burst.length - 1].at - burst[0].at,
+          afterMs: burst[0].at - group[0].firstAt,
+          usd: Math.round(burst.reduce((s, t) => s + t.usd, 0)),
+        };
+      }
+    }
+
+    clusters.push({
+      wallets: group.length,
+      at: group[0].firstAt,
+      spanMs: group[group.length - 1].firstAt - group[0].firstAt,
+      avgEntryUsd: Math.round(spread.mean),
+      sizeSpreadPct: round(spread.cv * 100, 1),
+      grossUsd: Math.round(group.reduce((s, w) => s + w.grossUsd, 0)),
+      // Graded rather than asserted. Identical-to-the-cent sizes are a machine;
+      // "roughly similar" is a hint, and the panel should not present the two
+      // as if they carried the same weight.
+      confidence: spread.cv <= COENTRY_HIGH_CV && exit ? 'high'
+        : spread.cv <= COENTRY_HIGH_CV || (spread.cv <= COENTRY_MEDIUM_CV && exit) ? 'medium'
+          : 'low',
+      exit,
+      members: group.map((w) => w.address),
+    });
+    i += group.length - 1;
+  }
+  return clusters;
+}
+
+/**
+ * One token's wallet picture.
+ *
+ * @param trades      raw trades for THIS pool: { wallet, kind, usd, at }
+ * @param poolAddress the pool they came from
+ * @param walletSets  every sampled pool on the chain, for cross-pool overlap
+ * @param topHolders  GoPlus's top-holder list, if the provider answered
+ * @param tracked     addresses the user is following
+ */
+export function tokenWalletIntel({
+  trades = [], poolAddress = null, walletSets = new Map(),
+  topHolders = [], tracked = [],
+} = {}) {
+  const clean = (trades || []).filter((t) => t && t.wallet && Number.isFinite(t.usd));
+  const trackedSet = new Set((tracked || []).map((a) => String(a).toLowerCase()));
+
+  // Addresses that are infrastructure, not participants. The pool itself shows
+  // up in GoPlus's holder list on every token; counting it as a whale would
+  // overstate concentration on literally every row.
+  const infrastructure = new Set(
+    [poolAddress, ...walletSets.keys()].filter(Boolean).map((a) => String(a).toLowerCase()),
+  );
+
+  const byWallet = new Map();
+  clean.forEach((t) => {
+    const w = byWallet.get(t.wallet) || {
+      address: t.wallet, trades: 0, buys: 0, sells: 0,
+      buyUsd: 0, sellUsd: 0, firstAt: t.at, lastAt: t.at, firstUsd: t.usd, sizes: [],
+    };
+    w.trades += 1;
+    if (t.kind === 'sell') { w.sells += 1; w.sellUsd += t.usd; }
+    else { w.buys += 1; w.buyUsd += t.usd; }
+    if (t.at && t.at < w.firstAt) { w.firstAt = t.at; w.firstUsd = t.usd; }
+    if (t.at && t.at > w.lastAt) w.lastAt = t.at;
+    w.sizes.push(t.usd);
+    byWallet.set(t.wallet, w);
+  });
+
+  const times = clean.map((t) => t.at).filter(Boolean);
+  const from = times.length ? Math.min(...times) : null;
+  const to = times.length ? Math.max(...times) : null;
+  const spanMs = from && to ? to - from : 0;
+
+  const base = [...byWallet.values()].map((w) => ({
+    ...w,
+    grossUsd: w.buyUsd + w.sellUsd,
+    netUsd: w.buyUsd - w.sellUsd,
+  }));
+
+  const clusters = coEntryClusters(base, spanMs, clean);
+  const clustered = new Map();
+  clusters.forEach((c, i) => c.members.forEach((a) => clustered.set(a, i)));
+
+  // Supply share, by owner address.
+  const holderPct = new Map();
+  (topHolders || []).forEach((h) => {
+    const address = h && (h.account || h.address);
+    if (!address) return;
+    const pct = toNumber(h.percent);
+    holderPct.set(String(address).toLowerCase(),
+      Number.isFinite(pct) ? round(pct * 100, 4) : null);
+  });
+
+  // Which other sampled pools each wallet also trades.
+  const alsoIn = new Map();
+  walletSets.forEach((entry, key) => {
+    if (key === poolAddress) return;
     entry.wallets.forEach((usd, address) => {
-      const w = wallets.get(address) ||
-        { address, usd: 0, pools: new Set(), symbols: new Set() };
-      w.usd += usd;
-      w.pools.add(pool);
-      if (entry.symbol) w.symbols.add(entry.symbol);
-      wallets.set(address, w);
+      if (!byWallet.has(address)) return;
+      const list = alsoIn.get(address) || [];
+      list.push({ symbol: entry.symbol || String(key).slice(0, 6), usd: Math.round(usd) });
+      alsoIn.set(address, list);
     });
   });
 
-  let list = [...wallets.values()].map((w) => ({
-    address: w.address,
-    volumeUsd: Math.round(w.usd),
-    poolsTouched: w.pools.size,
-    symbols: [...w.symbols],
-    label: w.pools.size >= 3 ? 'MULTI-POOL' : w.pools.size === 2 ? 'CROSS-POOL' : 'SINGLE-POOL',
-  }));
+  const rows = base.map((w) => {
+    const key = w.address.toLowerCase();
+    const netShare = w.grossUsd ? w.netUsd / w.grossUsd : 0;
+    const roundTrip = w.buys > 0 && w.sells > 0;
+    const peers = (alsoIn.get(w.address) || []).sort((a, b) => b.usd - a.usd);
+    const supplyPct = holderPct.has(key) ? holderPct.get(key) : null;
+    const clusterIndex = clustered.has(w.address) ? clustered.get(w.address) : null;
+    const isPool = infrastructure.has(key);
 
-  if (filterAddress) {
-    const needle = String(filterAddress).toLowerCase();
-    list = list.filter((w) => w.address.toLowerCase() === needle);
-  }
-  list.sort((a, b) => b.poolsTouched - a.poolsTouched || b.volumeUsd - a.volumeUsd);
+    const tags = [];
+    if (isPool) tags.push('POOL');
+    if (trackedSet.has(key)) tags.push('TRACKED');
+    if (supplyPct !== null && !isPool) tags.push('HOLDER');
+    if (clusterIndex !== null) tags.push('CO-ENTRY');
+    if (roundTrip && w.trades >= WASH_MIN_TRADES &&
+      Math.abs(netShare) < WASH_MAX_NET_SHARE) tags.push('CHURN');
+    else if (roundTrip) tags.push('ROUND-TRIP');
+    else if (w.sells && !w.buys) tags.push('EXITING');
+    else if (w.buys && !w.sells) tags.push(w.trades > 1 ? 'ACCUMULATING' : 'FIRST BUY');
+    if (peers.length) tags.push('ROTATING');
+
+    const spread = dispersion(w.sizes);
+
+    return {
+      address: w.address,
+      trades: w.trades,
+      buys: w.buys,
+      sells: w.sells,
+      buyUsd: Math.round(w.buyUsd),
+      sellUsd: Math.round(w.sellUsd),
+      grossUsd: Math.round(w.grossUsd),
+      netUsd: Math.round(w.netUsd),
+      netSharePct: w.grossUsd ? round(netShare * 100, 1) : null,
+      firstAt: w.firstAt,
+      lastAt: w.lastAt,
+      activeMs: w.lastAt - w.firstAt,
+      avgTradeUsd: Math.round(w.grossUsd / w.trades),
+      sizeSpreadPct: spread.cv === null ? null : round(spread.cv * 100, 1),
+      supplyPct,
+      isPool,
+      isTracked: trackedSet.has(key),
+      clusterIndex,
+      alsoIn: peers.slice(0, 4),
+      poolsTouched: peers.length + 1,
+      tags,
+    };
+  }).sort((a, b) => Math.abs(b.netUsd) - Math.abs(a.netUsd) || b.grossUsd - a.grossUsd);
+
+  // The top-holder list in its own right: who holds, and are they active here.
+  const active = new Map(rows.map((r) => [r.address.toLowerCase(), r]));
+  const holders = (topHolders || []).map((h) => {
+    const address = h && (h.account || h.address);
+    if (!address) return null;
+    const key = String(address).toLowerCase();
+    const pct = toNumber(h.percent);
+    const hit = active.get(key) || null;
+    return {
+      address,
+      supplyPct: Number.isFinite(pct) ? round(pct * 100, 4) : null,
+      locked: Boolean(h.is_locked),
+      tag: h.tag || null,
+      isPool: infrastructure.has(key),
+      isTracked: trackedSet.has(key),
+      tradingNow: Boolean(hit),
+      netUsd: hit ? hit.netUsd : null,
+      trades: hit ? hit.trades : null,
+    };
+  }).filter(Boolean).sort((a, b) => (b.supplyPct || 0) - (a.supplyPct || 0));
+
+  const real = rows.filter((r) => !r.isPool);
+  const buyers = new Set();
+  const sellers = new Set();
+  clean.forEach((t) => (t.kind === 'sell' ? sellers : buyers).add(t.wallet));
+  const buyUsd = real.reduce((s, r) => s + r.buyUsd, 0);
+  const sellUsd = real.reduce((s, r) => s + r.sellUsd, 0);
+  const grossUsd = buyUsd + sellUsd;
 
   return {
-    poolsSampled: walletSets.size,
-    walletsSeen: wallets.size,
-    multiPool: list.filter((w) => w.poolsTouched > 1).length,
-    rows: list.slice(0, 60),
+    poolAddress,
+    window: {
+      trades: clean.length,
+      wallets: real.length,
+      from,
+      to,
+      spanMinutes: spanMs ? round(spanMs / 60000, 1) : null,
+    },
+    flow: {
+      buyUsd: Math.round(buyUsd),
+      sellUsd: Math.round(sellUsd),
+      netUsd: Math.round(buyUsd - sellUsd),
+      grossUsd: Math.round(grossUsd),
+      buyerWallets: buyers.size,
+      sellerWallets: sellers.size,
+      buySharePct: grossUsd ? round((buyUsd / grossUsd) * 100, 1) : null,
+      topWalletSharePct: grossUsd && real.length
+        ? round((real[0].grossUsd / grossUsd) * 100, 1) : null,
+      onceOnlyPct: real.length
+        ? round((real.filter((r) => r.trades === 1).length / real.length) * 100, 1) : null,
+    },
+    counts: {
+      accumulating: real.filter((r) => r.tags.includes('ACCUMULATING')).length,
+      exiting: real.filter((r) => r.tags.includes('EXITING')).length,
+      churn: real.filter((r) => r.tags.includes('CHURN')).length,
+      coEntry: real.filter((r) => r.clusterIndex !== null).length,
+      rotating: real.filter((r) => r.alsoIn.length).length,
+      holders: real.filter((r) => r.supplyPct !== null).length,
+      tracked: real.filter((r) => r.isTracked).length,
+    },
+    clusters,
+    holders,
+    rows,
+    poolsCompared: Math.max(0, walletSets.size - 1),
   };
 }
 
 /* ========================================================= 8. social ===== */
 
+/**
+ * Tickers that are also ordinary words, market slang or major assets. A bare
+ * match on these says nothing, so they are never counted from bare text.
+ */
 const SOCIAL_STOPWORDS = new Set([
   'THE', 'AND', 'FOR', 'ALL', 'NEW', 'TOP', 'BUY', 'SELL', 'USD', 'USDC', 'USDT',
   'SOL', 'ETH', 'BTC', 'WIF', 'CAT', 'DOG', 'PUMP', 'MOON', 'BULL', 'BEAR',
 ]);
 
 /**
- * Counts board mentions of one symbol.
+ * Words that make a bare ticker match credible.
  *
- * Short or generic tickers are refused rather than counted: matching "CAT"
- * against a message board produces a number, just not a meaningful one.
+ * Matching a board symbol as a plain word is how the scanner used to count
+ * "PAID" every time somebody said they got paid, and "USELESS" every time
+ * somebody called a coin useless. A bare hit is therefore only counted when
+ * the same post also reads like it is talking about a traded asset. Cashtag
+ * hits ($SYM) need no such test - nobody writes $PAID by accident.
  */
-export function mentionsFor(threads, symbol) {
+const CRYPTO_CONTEXT = new RegExp([
+  'coin', 'token', 'ticker', 'mcap', 'market\\s?cap', 'liquidity', 'holder',
+  'airdrop', 'presale', 'listing', 'dex', 'swap', 'wallet', 'contract',
+  'solana', 'ethereum', 'bnb', 'memecoin', 'shitcoin', 'degen', 'moonshot',
+  'bagholder', 'rug\\s?pull', 'pump', 'dump', 'ath\\b', 'chart',
+].join('|'), 'i');
+
+/**
+ * Counts how often one symbol is named across every social feed.
+ *
+ * Two tiers, kept apart on purpose:
+ *   cashtag    - "$SYM", unambiguous
+ *   contextual - bare "SYM" in a post that also talks about trading
+ * and a third, `loose`, which is every other bare hit. Loose hits are
+ * reported but never counted, because that is the number that used to make an
+ * English word look like a trending ticker.
+ *
+ * Unique authors is a real count of distinct accounts, not a guess: 4chan is
+ * anonymous and contributes none, which is why anonPosts is reported beside it.
+ */
+export function mentionsFor(posts, symbol) {
   const clean = String(symbol || '').replace(/[^A-Za-z0-9]/g, '');
+  const empty = {
+    countable: false, mentions: 0, cashtag: 0, contextual: 0, loose: 0,
+    authors: 0, anonPosts: 0, concentration: null, replies: 0, reactions: 0,
+    bySource: {}, matched: [], newestMs: null, excerpt: null,
+  };
   if (clean.length < 3 || SOCIAL_STOPWORDS.has(clean.toUpperCase())) {
-    return { countable: false, mentions: 0, threads: 0, replies: 0, reason: 'symbol too generic to match safely' };
+    return Object.assign({}, empty, { reason: 'symbol too generic to match safely' });
   }
-  const re = new RegExp('(\\$' + clean + '\\b)|(\\b' + clean + '\\b)', 'i');
-  const hits = (threads || []).filter((t) => re.test(t.text));
-  const newest = hits.slice().sort((x, y) => y.time - x.time)[0];
+
+  const cashRe = new RegExp('\\$' + clean + '\\b', 'i');
+  // Bare hits are matched case-SENSITIVELY against the upper-case ticker.
+  // "PAID" is a ticker; "paid" is a person describing their salary. Case is
+  // the cheapest discriminator there is, and it removes most of the English-
+  // word false positives on its own; CRYPTO_CONTEXT then has to agree too.
+  const bareRe = new RegExp('(?:^|[^A-Za-z0-9$])' + clean.toUpperCase() + '(?![A-Za-z0-9])');
+
+  const matched = [];
+  let cashtag = 0; let contextual = 0; let loose = 0;
+
+  for (const p of posts || []) {
+    const text = p.text || '';
+    const isCash = cashRe.test(text);
+    const isBare = !isCash && bareRe.test(text);
+    if (!isCash && !isBare) continue;
+
+    if (isCash) { cashtag += 1; }
+    else if (CRYPTO_CONTEXT.test(text)) { contextual += 1; }
+    else { loose += 1; continue; }
+
+    matched.push({
+      source: p.source, id: p.id, author: p.author || null,
+      time: p.time || null, replies: p.replies || 0, reactions: p.reactions || 0,
+      cashtag: isCash, text: text.slice(0, 400),
+    });
+  }
+
+  matched.sort((a, b) => (b.time || 0) - (a.time || 0));
+
+  const bySource = {};
+  for (const m of matched) bySource[m.source] = (bySource[m.source] || 0) + 1;
+
+  const authorKeys = new Set(matched.filter((m) => m.author).map((m) => m.source + ':' + m.author));
+  const anonPosts = matched.filter((m) => !m.author).length;
+  const mentions = cashtag + contextual;
+
   return {
     countable: true,
-    excerpt: newest ? newest.text.replace(/\s+/g, ' ').trim().slice(0, 120) : null,
-    mentions: hits.length,
-    threads: hits.length,
-    replies: hits.reduce((s, t) => s + t.replies, 0),
-    newestMs: hits.length ? Math.max(...hits.map((t) => t.time)) : null,
+    mentions: mentions,
+    cashtag: cashtag,
+    contextual: contextual,
+    loose: loose,
+    authors: authorKeys.size,
+    anonPosts: anonPosts,
+    // How many mentions each identifiable account is responsible for. High
+    // concentration is the social twin of volume from few wallets. Anonymous
+    // posts cannot be attributed, so they are excluded from the ratio.
+    concentration: authorKeys.size > 0
+      ? round((mentions - anonPosts) / authorKeys.size, 2)
+      : null,
+    replies: matched.reduce((sum, m) => sum + m.replies, 0),
+    reactions: matched.reduce((sum, m) => sum + m.reactions, 0),
+    bySource: bySource,
+    matched: matched,
+    newestMs: matched.length ? matched[0].time : null,
+    excerpt: matched.length ? matched[0].text.slice(0, 160) : null,
+    reason: null,
   };
 }
 

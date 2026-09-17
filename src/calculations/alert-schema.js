@@ -42,7 +42,7 @@ export const ALERT_CLASSES = Object.freeze({
     label: 'Resolution',
     // Closes a prior alert. The only class that can reference another alert.
     trigger: 'a prior alert met an invalidation condition or its horizon',
-    accent: '#8b96b8'
+    accent: '#e8eefc'
   }
 });
 

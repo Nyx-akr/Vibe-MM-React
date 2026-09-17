@@ -257,8 +257,17 @@ function Bars({ value, accent, css }) {
   </span>;
 }
 
-function AlertCard({ c, css }) {
-  return <div style={css("display:flex;background:#101c38;border-radius:8px;overflow:hidden", { c })}>
+function AlertCard({ c, css, ping }) {
+  const ref = React.useRef(null);
+  // Blinking is no help if the card is below the fold.
+  React.useEffect(() => {
+    if (ping && ref.current) ref.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [ping]);
+
+  return <div ref={ref} style={css(
+    "display:flex;background:#101c38;border-radius:8px;overflow:hidden;animation:{{ anim }}",
+    { c, anim: ping ? 'vsAlertPing .6s ease-in-out 3' : 'none' }
+  )}>
     <div style={css("width:3px;background:{{ c.accent }};flex-shrink:0", { c })} />
     <div style={css("padding:11px 13px;min-width:0;flex:1", { c })}>
 
@@ -345,7 +354,9 @@ export default function AlertCards({ v, css }) {
 
             <div style={css("padding:12px;display:flex;flex-direction:column;gap:10px", { col })}>
               {col.cards.length
-                ? col.cards.map((c, i) => <AlertCard key={i} c={c} css={css} />)
+                ? col.cards.map((c, i) => (
+                    <AlertCard key={i} c={c} css={css} ping={v.alertPing === c.cls + ':' + c.id} />
+                  ))
                 : <div style={css("font-size:10px;color:#6b7699;line-height:1.6;padding:6px 2px", { col })}>
                     {col.empty}
                   </div>}

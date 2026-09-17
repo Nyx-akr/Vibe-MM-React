@@ -159,6 +159,13 @@ a:hover {
   50% { opacity: 0.25; }
 }
 
+/* The card you just opened from a toast, announcing itself. White rather than
+ * the class accent so it reads as "here" and never as a change of severity. */
+@keyframes vsAlertPing {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+  50%      { box-shadow: 0 0 0 2px rgba(255, 255, 255, .95); }
+}
+
 @keyframes vsFlash {
   0% { background: rgba(227,95,242,.20); }
   100% { background: transparent; }

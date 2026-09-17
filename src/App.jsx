@@ -18,7 +18,7 @@ import { healthVals } from './tabs-modules/SYSTEM-HEALTH';
 import { css } from './utils/css';
 import { fmtUsd, fmtAge, fmtPrice, stageInfo, chainColor, clsColor, scoreColor, washColor } from './utils/formatters';
 import { chains as chainList, chainKeys, chainNameToKey } from './data/chains';
-import { defaultWalletRegistry } from './data/wallet-registry';
+import { defaultWalletRegistry, normalizeRegistry } from './data/wallet-registry';
 import { nextTape } from './services/live-feed';
 import {
   fetchLiveMarketData,
@@ -28,11 +28,16 @@ import {
   fetchLiveEvalData,
   fetchLiveSystemData,
   fetchLiveTokenIntel,
-  fetchLiveOhlcv
+  fetchLiveOhlcv,
+  API_ORIGIN
 } from './services/api';
+import {
+  startWalletIntel, stopWalletIntel, onWalletIntel, walletIntelStatus,
+} from './services/wallet-intel';
 import AppHeader from './components/AppHeader';
 import SelectAssetPrompt from './components/SelectAssetPrompt';
 import SideNav from './components/SideNav';
+import AlertToasts from './components/AlertToasts';
 import AssetBar from './components/AssetBar';
 /** The one selected-state palette shared by every filter chip. */
 // Opaque, not translucent. A semi-transparent fill composites over the page's
@@ -44,16 +49,42 @@ const CHIP_ACTIVE_BD = '#4d8dff';
 const CHIP_ACTIVE_FG = '#6ea0ff';
 
 /** Tabs that describe a single token, and cannot render without one. */
+/** Alerts on screen at once, and how many wait behind them to backfill. */
+const TOAST_VISIBLE = 3;
+const TOAST_BACKLOG = 12;
+/** How long the opened card keeps blinking before it settles. */
+const ALERT_PING_MS = 1800;
+
 const SELECTION_TABS = { detail: 'ASSET DETAIL', rotation: 'ROTATION', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
 
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toast: null, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
+    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toasts: [], alertPing: null, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
     try { const w = JSON.parse(localStorage.getItem('vs_watchlist') || 'null'); if (w) this.state.watch = w; } catch (e) { }
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
+    this.state.walletFilter = 'ALL';
     let saved = null; try { saved = JSON.parse(localStorage.getItem('vs_wallet_registry') || 'null'); } catch (e) { }
-    this.state.registry = saved || defaultWalletRegistry;
+    this.state.registry = normalizeRegistry(saved || defaultWalletRegistry);
+  }
+
+  /** Full addresses the user is tracking, for the wallet join. */
+  trackedAddresses() { return (this.state.registry || []).map((w) => w.address).filter(Boolean); }
+
+  /**
+   * The token the user has open, including one that has since dropped out of
+   * the trending feed.
+   *
+   * renderVals keeps showing such a token from `lastSelected` rather than
+   * swapping the view to something else. The fetch side has to agree with it:
+   * reading only `this.assets` left the asset-scoped tabs captioned with a
+   * token they would then never fetch data for.
+   */
+  selectedAsset() {
+    const found = this.assets.find((a) => a.id === this.state.selectedId);
+    if (found) return found;
+    return this.state.selectedId && this.lastSelected &&
+      this.lastSelected.id === this.state.selectedId ? this.lastSelected : null;
   }
   h(str) { let h = 0; for (let i = 0; i < str.length; i++) { h = (h * 31 + str.charCodeAt(i)) >>> 0; } return h; }
   srand(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
@@ -70,10 +101,21 @@ class App extends React.Component {
           const rotationData = await fetchLiveRotationData(chain);
           if (rotationData) this.setState({ apiRotation: rotationData });
         } else if (this.state.page === 'wallets') {
-          const walletData = await fetchLiveWalletData(chain);
-          if (walletData) this.setState({ apiWallets: walletData });
+          // Wallets reads ONE pool's trades, so it follows the selection, not
+          // the chain filter - and it follows the selected token's own chain,
+          // which is not necessarily the one the filter is pointing at.
+          const selected = this.selectedAsset();
+          const walletChain = (selected && selected.rawServerRow && selected.rawServerRow.chain) ||
+            chain;
+          const walletData = selected
+            ? await fetchLiveWalletData(walletChain, selected, this.trackedAddresses())
+            : null;
+          this.setState({ apiWallets: walletData });
         } else if (this.state.page === 'social') {
-          const socialData = await fetchLiveSocialData(chain, this.assets);
+          // The scanner reads one token at a time, so only the selected one
+          // is measured. Without a selection the page shows the picker.
+          const selected = this.assets.find((x) => x.id === this.state.selectedId) || null;
+          const socialData = await fetchLiveSocialData(chain, selected);
           if (socialData) this.setState({ apiSocial: socialData });
         } else if (this.state.page === 'eval') {
           const evalData = await fetchLiveEvalData(chain);
@@ -84,6 +126,7 @@ class App extends React.Component {
         }
 
         this.setState({ serverError: false });
+        this.syncAlertToasts();
       } else {
         this.assets = [];
         this.setState({
@@ -114,6 +157,20 @@ class App extends React.Component {
     this.simTimer = setInterval(() => this.simTick(), 2400 / Math.max(1, this.props.simSpeed ?? 2));
     this.syncLiveData();
     this.apiTimer = setInterval(() => this.syncLiveData(), 5000);
+
+    // Wallet intelligence runs whether or not the WALLETS tab is open, so
+    // every module can ask about a wallet at any time and the memory keeps
+    // building across tokens instead of restarting on each visit.
+    startWalletIntel({
+      baseUrl: API_ORIGIN,
+      chains: chainKeys,
+      getTracked: () => this.trackedAddresses(),
+    });
+    // Re-render on new wallet findings; the tick is throttled, not per-trade.
+    this.offWalletIntel = onWalletIntel(() => {
+      if (this.state.page === 'wallets') this.setState({ walletIntelAt: Date.now() });
+    });
+
     for (let i = 0; i < 7; i++) this.pushTape(false);
   }
   componentDidUpdate() {
@@ -176,7 +233,9 @@ class App extends React.Component {
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
     clearInterval(this.apiTimer);
-    clearTimeout(this.toastTimer);
+    clearTimeout(this.pingTimer);
+    if (this.offWalletIntel) this.offWalletIntel();
+    stopWalletIntel();
   }
   beep() { try { const ctx = this.audioCtx || (this.audioCtx = new (window.AudioContext || window.webkitAudioContext)()); const o = ctx.createOscillator(), g = ctx.createGain(); o.connect(g); g.connect(ctx.destination); o.frequency.value = 880; g.gain.setValueAtTime(0.08, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35); o.start(); o.stop(ctx.currentTime + 0.36); } catch (e) { } }
   simTick() {
@@ -187,15 +246,76 @@ class App extends React.Component {
     this.pushTape(true);
     const flash = r() < 0.3 ? this.assets[Math.floor(r() * this.assets.length)].id : null;
     this.setState(s => ({ tick: s.tick + 1, flashId: flash }));
-    if (!this.state.toast && r() < 0.05) {
-      const hot = this.assets.filter(x => x.stage >= 3 && x.score != null); if (hot.length) {
-        const a = hot[Math.floor(r() * hot.length)];
-        this.setState({ toast: { title: stageInfo(a.stage).n + ' — ' + a.sym + ' / ' + a.chain, body: 'Score ' + Math.round(a.score) + ', conf ' + (a.conf == null ? '—' : a.conf.toFixed(2)) + '. ' + a.reason + '.' } });
-        if (this.state.soundOn) this.beep();
-        this.toastTimer = setTimeout(() => this.setState({ toast: null }), 7000);
-      }
-    }
   }
+
+  /**
+   * Mirrors the ALERT CARDS page into the toast stack.
+   *
+   * Runs on every data sync rather than on a timer or a dice roll: a card that
+   * appears on the page has to appear here too, or the popup is lying about
+   * what the bot would have sent. Each alert is raised exactly once - `seen`
+   * is keyed by class and alert id, so a card still standing on the next sync
+   * does not re-announce itself.
+   *
+   * The backlog runs deeper than the three on screen so that dismissing one
+   * promotes the next-newest instead of leaving a gap.
+   *
+   * The first sync only primes `seen`. Whatever was already standing when the
+   * page loaded is history, not news - popping a stack of it on every refresh
+   * would train you to dismiss the stack without reading it, which is exactly
+   * how a real alert gets missed. Notifications start at the first CHANGE.
+   */
+  syncAlertToasts() {
+    const columns = alertsVals(this).alertColumns || [];
+    const cards = columns.reduce((all, col) => all.concat(col.cards || []), []);
+    const seen = this.alertSeen || (this.alertSeen = {});
+    const priming = !this.alertPrimed;
+    this.alertPrimed = true;
+
+    const fresh = [];
+    for (const c of cards) {
+      const key = c.cls + ':' + c.id;
+      if (seen[key]) continue;
+      seen[key] = true;
+      fresh.push({
+        key, accent: c.accent,
+        label: c.outcome || c.cls,
+        title: c.sym + ' / ' + c.chain,
+        body: c.claim,
+        meta: 'conf ' + (c.conf == null ? '—' : c.conf.toFixed(2)) +
+          ' · horizon ' + c.horizon + ' · ' + c.id
+      });
+    }
+    if (priming || !fresh.length) return;
+
+    if (this.state.soundOn) this.beep();
+    this.setState((st) => ({ toasts: fresh.concat(st.toasts).slice(0, TOAST_BACKLOG) }));
+  }
+
+  dismissToast(key) {
+    this.setState((st) => ({ toasts: st.toasts.filter((t) => t.key !== key) }));
+  }
+
+  /**
+   * Follows a toast to its card: the toast has done its job so it closes, and
+   * the card blinks on arrival. Landing on a wall of alert cards with no idea
+   * which one you just clicked is the whole problem this solves.
+   */
+  openAlertCard(key) {
+    clearTimeout(this.pingTimer);
+    this.setState((st) => ({
+      page: 'alerts',
+      toasts: st.toasts.filter((t) => t.key !== key),
+      alertPing: key
+    }));
+    this.pingTimer = setTimeout(() => this.setState({ alertPing: null }), ALERT_PING_MS);
+  }
+
+  /** Clears the backlog too, not just the three on screen. */
+  dismissAllToasts() {
+    this.setState({ toasts: [] });
+  }
+
   pushTape(update) {
     const tape = nextTape(this.state.tape, this.tapeSeq++, update, (nextState) => this.setState(nextState));
     if (!update) this.state.tape = tape;
@@ -266,9 +386,13 @@ class App extends React.Component {
         open: () => this.setState({ page: 'detail', selectedId: a.id }),
         goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
         star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
+        // A tint alone reads as "slightly different row" at a glance. The white
+        // ring is the thing that actually locates the selection - drawn inset so
+        // it costs no layout and the grid columns stay aligned down the table.
         selected: st.selectedId === a.id,
-        selBg: st.selectedId === a.id ? 'rgba(227,95,242,0.12)' : 'transparent',
-        selBar: st.selectedId === a.id ? '#e35ff2' : 'transparent',
+        selBg: st.selectedId === a.id ? 'rgba(227,95,242,0.14)' : 'transparent',
+        selBar: st.selectedId === a.id ? '#ffffff' : 'transparent',
+        selRing: st.selectedId === a.id ? 'inset 0 0 0 1px #ffffff' : 'none',
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
         expanded: st.expandedId === a.id,
         trend: tr.map(v => ({ h: Math.round(15 + (v - tMin) / (tMax - tMin + 0.01) * 85) + '%', c: v >= tr[0] ? '#4d8dff' : '#ff4fae' })),
@@ -370,6 +494,11 @@ class App extends React.Component {
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),
       serverError: st.serverError,
       hasSelection: Boolean(sel),
+      // The identity bar belongs to the asset-scoped tabs only - the same set
+      // the sidebar nests under ASSET DETAIL. ALERT CARDS, EVALUATION and
+      // SYSTEM HEALTH describe the screener, not a token, so a symbol and a
+      // score pinned above them would be captioning the wrong thing.
+      showAssetBar: Boolean(sel) && Boolean(SELECTION_TABS[st.page]),
       needsSelection: !sel && Boolean(SELECTION_TABS[st.page]),
       selectionTabLabel: SELECTION_TABS[st.page] || '',
       isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
@@ -378,12 +507,19 @@ class App extends React.Component {
       isAlerts: st.page === 'alerts', isSocial: st.page === 'social', isWallets: st.page === 'wallets',
       toggleSound: () => this.setState(s => ({ soundOn: !s.soundOn })),
       soundLabel: st.soundOn ? 'SOUND ON' : 'SOUND OFF', soundFg: st.soundOn ? '#f06ee2' : '#6b7699',
-      toastVisible: !!st.toast, toastTitle: st.toast ? st.toast.title : '', toastBody: st.toast ? st.toast.body : '',
-      dismissToast: () => this.setState({ toast: null }),
+      // Only the newest three reach the screen; the rest wait in the backlog.
+      toasts: st.toasts.slice(0, TOAST_VISIBLE).map((t, i) => ({
+        ...t, fresh: i === 0,
+        dismiss: () => this.dismissToast(t.key),
+        open: () => this.openAlertCard(t.key)
+      })),
+      toastBacklog: Math.max(0, st.toasts.length - TOAST_VISIBLE),
+      closeAllToasts: () => this.dismissAllToasts(),
+      alertPing: st.alertPing,
       chepeStats: [{ k: 'Hard vetoes today', v: '14' }, { k: 'Honeypots blocked', v: '6' }, { k: 'Fake stock tokens', v: '2' }, { k: 'Wash clusters flagged', v: '5' }],
       chepeLast: 'Last veto — $SAFEGEM2 (BNB): honeypot, sell path reverts. Chepe says no.',
       ...this.chepePickVals(),
-      ...walletsVals(this), ...socialVals(this), ...alertsVals(this), ...rotationVals(this), ...evalVals(this), ...healthVals(this)
+      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this), ...evalVals(this), ...healthVals(this)
     };
   }
 
@@ -438,7 +574,7 @@ class App extends React.Component {
             <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
               <SideNav v={v} />
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-              {!v.isLive && v.hasSelection && <AssetBar v={v} />}
+              {v.showAssetBar && <AssetBar v={v} />}
               <LiveOpportunities v={v} css={css} />
               <AlertCards v={v} css={css} />
               {v.needsSelection ? <SelectAssetPrompt v={v} css={css} /> : (<>
@@ -452,9 +588,7 @@ class App extends React.Component {
               </div>
             </div>
           )}
-          {v.toastVisible && (!v.serverError) && (<>
-            <div style={css("position:fixed;right:18px;bottom:18px;z-index:60;width:340px;background:rgba(13,23,48,.97);border:1px solid #f06ee2;border-radius:14px;padding:12px 14px;box-shadow:0 12px 40px rgba(0,0,0,.55);animation:vsFlash 1s ease-out", { v })}><div style={css("display:flex;justify-content:space-between;align-items:center;margin-bottom:5px", { v })}><span style={css("font-size:9px;font-weight:800;letter-spacing:1px;color:#f06ee2", { v })}>{v.toastTitle}</span><span className="h3eb549cf" onClick={v.dismissToast} style={css("cursor:pointer;color:#6b7699;font-size:12px;padding:0 4px", { v })}>✕</span></div><div style={css("font-size:11px;color:#c6d1ea;line-height:1.5", { v })}>{v.toastBody}</div></div>
-          </>)}
+          {!v.serverError && <AlertToasts v={v} css={css} />}
         </div>
       </>
     );

@@ -1,7 +1,42 @@
-export const defaultWalletRegistry = [
-  { addr: '5xQm…c2Kd', chain: 'SOL', label: 'Kitsune bundle funder', tag: 'BUNDLER', auto: true, first: 'auto-flagged 2h ago', hits: 3, note: 'Funded 11 fresh wallets that bought $KITSUNE same block. Also seen on 2 prior launches.' },
-  { addr: '0x8f3a…91a1', chain: 'BNB', label: 'Moonveil deployer cluster', tag: 'LIQ WASHER', auto: true, first: 'auto-flagged 5h ago', hits: 4, note: '4 liquidity in/out cycles on $MOONVEIL; controls 46% of supply via 7 wallets.' },
-  { addr: '7pWr…m9Ts', chain: 'SOL', label: 'Serial launch sniper ring', tag: 'BUNDLER', auto: true, first: 'auto-flagged 1d ago', hits: 9, note: 'Same-block entries on 9 launches in 30d; median exit 22m after entry.' },
-  { addr: '0x2c11…4be0', chain: 'BASE', label: 'Wash loop pair A/B', tag: 'WASH TRADER', auto: true, first: 'auto-flagged 3d ago', hits: 6, note: 'Back-and-forth trading with 0x9d…77 — uniform sizes, minimal balance change.' },
-  { addr: '9hLm…x2Fa', chain: 'SOL', label: 'My smart wallet #1', tag: 'TRACKED', auto: false, first: 'added manually', hits: 0, note: 'Historically profitable — entered $GLYPH 14m before alert.' }
-];
+/**
+ * The wallets the user is tracking.
+ *
+ * Empty by default, and deliberately so. This file used to ship five invented
+ * rows - a "Kitsune bundle funder", a "Moonveil deployer cluster" - which were
+ * indistinguishable on screen from measured ones and were shown whenever the
+ * live sample was unavailable. A registry that invents its own bad actors is
+ * worse than an empty one.
+ *
+ * An entry stores the FULL address. The old format kept only a truncated
+ * "5xQm…c2Kd" display string, which meant a tracked wallet could never be
+ * matched against a real trade; `normalizeRegistry` drops those on load.
+ */
+export const defaultWalletRegistry = [];
+
+/** Shortens an address for display without losing the stored original. */
+export const shortAddress = (address) => {
+  const a = String(address || '');
+  return a.length > 12 ? a.slice(0, 4) + '…' + a.slice(-4) : a;
+};
+
+/**
+ * Upgrades whatever is in localStorage to the current shape.
+ *
+ * Anything without a full address cannot be matched against trade data, so it
+ * is dropped rather than carried forward as a row that can never light up.
+ */
+export function normalizeRegistry(saved) {
+  if (!Array.isArray(saved)) return [];
+  return saved
+    .map((w) => {
+      if (!w || typeof w !== 'object') return null;
+      const address = String(w.address || '').trim();
+      if (!address || address.includes('…') || address.includes('...')) return null;
+      return {
+        address,
+        label: String(w.label || '').trim() || 'Tracked wallet',
+        addedAt: Number(w.addedAt) || Date.now(),
+      };
+    })
+    .filter(Boolean);
+}

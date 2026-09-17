@@ -13,7 +13,7 @@ import { chainKeys, chainKeyToName } from '../data/chains';
 import { payload as catalogPayload } from '../data/catalog';
 import {
   normalizeRow, screenRows, zScoresFrom, bucketBaselines,
-  buildWalletSets, rotationFor, rotationGraph, walletRegistry,
+  buildWalletSets, rotationFor, rotationGraph, tokenWalletIntel,
   mentionsFor, mentionBaseline, evaluationFor, evaluationReport,
   providerHealth, summarize,
 } from '../calculations/core';
@@ -76,6 +76,11 @@ async function rawInputsFor(chainKey) {
   const value = {
     samples: history.samples || {},
     walletSets: buildWalletSets(trades.pools || []),
+    // The raw trades are kept alongside the aggregate, because buildWalletSets
+    // reduces each pool to wallet -> usd and drops the buy/sell flag and the
+    // timestamps. WALLETS needs those, and this is the one response that
+    // already carries every sampled pool.
+    tradePools: trades.pools || [],
   };
   rawCache.set(chainKey, { at: Date.now(), value });
   return value;
@@ -387,11 +392,84 @@ export async function fetchLiveRotationData(chain = 'solana') {
   } catch (e) { return null; }
 }
 
-export async function fetchLiveWalletData(chain = 'solana', address = '') {
+/**
+ * The wallet read on ONE token.
+ *
+ * This tab used to fetch `/api/trades?chain=...` with no pool and aggregate
+ * every wallet across whichever pools the server's warm loop had happened to
+ * sample - so it answered "who is trading on Solana", not "who is trading the
+ * token on screen". It ignored the selection entirely.
+ *
+ * Now the selected pool is sampled explicitly (which also pushes it into the
+ * server's trade memory, so the chain-wide set picks it up on the next poll),
+ * and three sources are joined:
+ *
+ *   trades for this pool  -> who is buying and selling it right now
+ *   chain-wide trade sets -> which of them also trade other pools
+ *   intel (GoPlus)        -> which of them are top holders of it
+ */
+export async function fetchLiveWalletData(chain = 'solana', asset = null, tracked = []) {
   try {
-    const raw = await rawInputsFor(chain);
-    if (!raw.walletSets.size) return null;
-    return { server: 'ok', chain, ...walletRegistry(raw.walletSets, address) };
+    const row = (asset && asset.rawServerRow) || null;
+    const poolAddress = (asset && asset.poolAddress) || (row && row.poolAddress) || null;
+    const tokenAddress = (asset && asset.tokenAddress) || (row && row.tokenAddress) || null;
+    if (!poolAddress) return null;
+
+    const symbol = String(
+      (row && row.symbol) || (asset && asset.sym) || '',
+    ).replace(/^\$/, '');
+
+    // Ask the server to sample THIS pool. GeckoTerminal rate-limits that call
+    // often enough that it cannot be the only path to a reading: if it fails,
+    // the chain-wide response below may still carry a sample the warm loop
+    // took earlier. A slightly old window is worth far more than an empty tab,
+    // so the failure is tolerated here and reported as `stale` instead.
+    const sampled = await quiet(fetchJson(
+      `${BASE_URL}/api/trades?chain=${chain}&pool=${encodeURIComponent(poolAddress)}` +
+      (symbol ? `&symbol=${encodeURIComponent(symbol)}` : '')), null);
+
+    // The pool may now be in the server's memory, so the chain-wide set that
+    // the cross-pool columns read from should be refetched to include it.
+    if (sampled && sampled.server === 'ok') rawCache.delete(chain);
+    const raw = await quiet(rawInputsFor(chain), { walletSets: new Map(), tradePools: [] });
+
+    const direct = sampled && sampled.server === 'ok'
+      ? (sampled.pools || []).find((p) => p.poolAddress === poolAddress) || null
+      : null;
+    const remembered = (raw.tradePools || []).find((p) => p.poolAddress === poolAddress) || null;
+    const pool = direct || remembered;
+    const trades = (pool && pool.trades) || [];
+    if (!trades.length) return null;
+
+    // Top holders come from intel, which is already cached per token for the
+    // score. Only fetch it if nothing has yet.
+    let topHolders = [];
+    if (tokenAddress) {
+      let rawIntel = cachedIntelRaw(chain, tokenAddress);
+      if (!rawIntel) {
+        rawIntel = await quiet(fetchJson(
+          `${BASE_URL}/api/intel?chain=${chain}&token=${encodeURIComponent(tokenAddress)}`), null);
+        if (rawIntel && rawIntel.server === 'ok') putIntelRaw(chain, tokenAddress, rawIntel);
+      }
+      topHolders = (rawIntel && rawIntel.goplus && rawIntel.goplus.holders) || [];
+    }
+
+    return {
+      server: 'ok',
+      chain,
+      symbol: symbol || null,
+      tokenAddress,
+      sampledAt: (pool && pool.at) || Date.now(),
+      stale: !direct,
+      holdersAvailable: Boolean(topHolders.length),
+      ...tokenWalletIntel({
+        trades,
+        poolAddress,
+        walletSets: raw.walletSets || new Map(),
+        topHolders,
+        tracked,
+      }),
+    };
   } catch (e) { return null; }
 }
 
@@ -399,59 +477,69 @@ export async function fetchLiveWalletData(chain = 'solana', address = '') {
 // session. Short-lived by design: the board itself is the long-term record.
 const mentionHistory = new Map();
 
-export async function fetchLiveSocialData(chain = 'solana', assets = []) {
+export async function fetchLiveSocialData(chain = 'solana', asset = null) {
   try {
     const data = await fetchJson(`${BASE_URL}/api/social?chain=${chain}`);
     if (!data || data.server !== 'ok') return null;
 
-    const threads = (data.threads && data.threads.rows) || [];
+    const posts = data.posts || [];
     const promotion = (data.promotion && data.promotion.rows) || [];
-    const boosted = new Set(promotion.map((p) => String(p.tokenAddress || '').toLowerCase()));
+    const row = (asset && asset.rawServerRow) || {};
+    // The board model carries the ticker as `sym`, with a leading $; only the
+    // raw server row calls it `symbol`. Reading `asset.symbol` found neither,
+    // so any asset without a rawServerRow measured nothing at all.
+    const symbol = row.symbol ||
+      (asset && asset.sym ? String(asset.sym).replace(/^\$/, '') : null) ||
+      null;
 
-    const rows = (assets || []).map((a) => {
-      const row = a.rawServerRow || {};
-      const m = mentionsFor(threads, row.symbol);
+    const sources = (data.sources || []).map((x) => ({
+      source: x.source,
+      label: x.label,
+      url: x.url || null,
+      ok: x.ok,
+      error: x.error,
+      posts: x.posts,
+    }));
 
-      const key = chain + ':' + row.symbol;
-      const series = mentionHistory.get(key) || [];
-      const last = series[series.length - 1];
-      if (m.countable && (!last || Date.now() - last.t > 60000)) {
-        series.push({ t: Date.now(), n: m.mentions });
-        if (series.length > 120) series.shift();
-        mentionHistory.set(key, series);
-      }
-      const base = mentionBaseline(series, m.mentions);
-
-      return {
-        symbol: row.symbol, tokenAddress: row.tokenAddress,
-        score: row.score, stage: row.stage,
-        countable: m.countable, reason: m.reason || null,
-        mentions: m.mentions, replies: m.replies,
-        newestMs: m.newestMs || null, excerpt: m.excerpt || null,
-        boosted: boosted.has(String(row.tokenAddress || '').toLowerCase()),
-        baseline: base.baseline, vsBase: base.vsBase, z: base.z, baselineSamples: base.samples,
-      };
-    }).sort((x, y) => y.mentions - x.mentions || y.replies - x.replies);
-
-    return {
+    const base = {
       server: 'ok',
       chain,
+      symbol,
+      scanned: posts.length,
+      sources,
+      absent: data.absent,
       counts: {
         boosts: promotion.filter((p) => p.kind === 'BOOST').length,
         profiles: promotion.filter((p) => p.kind === 'PROFILE').length,
-        matchedOnBoard: rows.filter((r) => r.boosted).length,
-      },
-      rows: promotion,
-      social: {
-        source: (data.threads && data.threads.source) || '4chan /biz/ public catalog',
-        threadsScanned: threads.length,
-        error: (data.threads && data.threads.error) || null,
-        countable: rows.filter((r) => r.countable).length,
-        withMentions: rows.filter((r) => r.mentions > 0).length,
-        rows,
-        absent: data.absent,
       },
     };
+
+    if (!symbol) return Object.assign(base, { mention: null, promo: null, baseline: null });
+
+    const mention = mentionsFor(posts, symbol);
+
+    // The baseline is this browser's own record of how often the token was
+    // named on previous refreshes. The server keeps no such history, so a
+    // freshly opened tab legitimately has no baseline yet and says so.
+    const key = chain + ':' + symbol;
+    const series = mentionHistory.get(key) || [];
+    const last = series[series.length - 1];
+    if (mention.countable && (!last || Date.now() - last.t > 60000)) {
+      series.push({ t: Date.now(), n: mention.mentions });
+      if (series.length > 120) series.shift();
+      mentionHistory.set(key, series);
+    }
+
+    const address = String(row.tokenAddress || '').toLowerCase();
+    const promo = promotion.find((p) => String(p.tokenAddress || '').toLowerCase() === address) || null;
+
+    return Object.assign(base, {
+      tokenAddress: row.tokenAddress || null,
+      mention,
+      promo,
+      boosted: Boolean(promo),
+      baseline: mentionBaseline(series, mention.mentions),
+    });
   } catch (e) { return null; }
 }
 
