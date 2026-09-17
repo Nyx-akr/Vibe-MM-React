@@ -10,7 +10,7 @@ const EMPTY_DETAIL = {
   chartNote: '', scoreSource: '', safety: [], safetyNote: '', intelState: 'idle'
 };
 
-/** Bar colour for a live component score; grey when the server reported it pending. */
+/** Bar colour for a live component score; grey when the input is pending. */
 const barColor = (v) => isMissing(v) ? UNAVAILABLE : v >= 75 ? '#4d8dff' : v >= 50 ? '#e35ff2' : v > 0 ? '#ff4fae' : '#223052';
 
 /** z-score metric backing each score component, for the trigger-reason table. */
@@ -19,7 +19,7 @@ const Z_METRIC_FOR = { volumeAnomaly: 'volume5mUsd', tradeActivity: 'buys5m', bu
 /**
  * Stage gauge.
  *
- * The server's stage is nothing but the score bucketed at 55 / 70 / 85, so the
+ * The stage is nothing but the score bucketed at 55 / 70 / 85, so the
  * gauge shows that relationship directly instead of the old three-timestamp
  * timeline.
  *
@@ -29,7 +29,7 @@ const Z_METRIC_FOR = { volumeAnomaly: 'volume5mUsd', tradeActivity: 'buys5m', bu
  * quarter of the bar per band, linear inside it - and the band edges are
  * printed above the joins so the scale is still readable.
  *
- * The lit segment is the server's stage; the marker sits at the score. When
+ * The lit segment is the current stage; the marker sits at the score. When
  * the hysteresis is holding a demotion the two disagree, and the gap between
  * them is exactly that hold.
  */
@@ -72,11 +72,12 @@ function buildGauge(score, stageIdx) {
 }
 
 /**
- * Builds the Asset Detail view model from real server data only.
+ * Builds the Asset Detail view model.
  *
- * Every field traces to /api/market, /api/intel or /api/ohlcv. Anything the
- * server reports as pending, null or unavailable is rendered grey as '—' —
- * this view never fabricates a number to fill a gap.
+ * Every field traces to raw provider data from /api/market, /api/intel or
+ * /api/ohlcv, run through src/calculations in this browser. Anything that
+ * could not be computed is rendered grey as '—' — this view never fabricates
+ * a number to fill a gap.
  */
 export function detailVals(app, a, showAdj, extra) {
     if (!a) return EMPTY_DETAIL;
@@ -184,7 +185,8 @@ export function detailVals(app, a, showAdj, extra) {
         honeypot && honeypot.isHoneypot === false ? '#4d8dff' : '#ff4fae')
     ];
 
-    // The server tracks no forward returns yet, so every horizon stays pending.
+    // Forward returns are not wired into this panel yet, so every horizon
+    // stays pending. The Evaluation tab measures them from the score journal.
     const outcomes = ['15M', '1H', '4H', '12H', '24H'].map((k) => ({ k, v: '—', c: UNAVAILABLE }));
 
     const sev = { HIGH: { bg: '#45103a', fg: '#ff4fae' }, MED: { bg: '#33124a', fg: '#e35ff2' }, LOW: { bg: '#1a2440', fg: '#a3aed0' } };
@@ -259,7 +261,7 @@ export function detailVals(app, a, showAdj, extra) {
       hysteresis: Number.isFinite(row.stageHysteresis)
         ? 'Bands 55 / 70 / 85. Promotes as soon as the score clears a band; holds ' + si.n +
           ' until the score drops ' + row.stageHysteresis + ' pts below it, so the stage never flips on 1–2 pt noise.'
-        : 'Stage hysteresis not reported by the server.'
+        : 'Stage hysteresis unavailable.'
     };
   }
 
@@ -305,9 +307,9 @@ export default function AssetDetail({ v, css }) {
             <div style={css("background:#101c38;border:1px solid #1c2a4d;border-radius:10px;padding:8px 10px;text-align:center", { v, o })}><div style={css("font-size:9px;color:#6b7699;letter-spacing:1px", { v, o })}>{o.k}</div><div style={css("font-size:14px;font-weight:700;margin-top:3px;color:{{ o.c }}", { v, o })}>{o.v}</div></div>
           </React.Fragment>))}</div></div></div><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>SCORE DECOMPOSITION</div>{(v.d.subs || []).map((s, i) => (<React.Fragment key={i}>
             <div title={s.evidence} style={css("display:flex;align-items:center;gap:8px;padding:2.5px 0", { v, s })}><span style={css("width:150px;font-size:10px;color:{{ s.keyColor }};flex-shrink:0", { v, s })}>{s.k}</span><span style={css("width:30px;font-size:9px;color:#6b7699", { v, s })}>{s.w}</span><div style={css("flex:1;height:7px;background:#16223f;border-radius:1px;overflow:hidden", { v, s })}><div style={css("height:100%;width:{{ s.pct }};background:{{ s.c }}", { v, s })}></div></div><span style={css("width:26px;text-align:right;font-size:10px;font-weight:600;color:{{ s.labelColor }}", { v, s })}>{s.label}</span></div>
-          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>RISK PENALTY <span style={css("color:#ff4fae;font-weight:700", { v })}>−{v.d.penalty}</span></span><span style={css("color:#8b96b8", { v })}>FINAL <span style={css("color:{{ d.scoreColor }};font-weight:700", { v, d: v.d })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs the server could not compute</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>RISK PENALTY <span style={css("color:#ff4fae;font-weight:700", { v })}>−{v.d.penalty}</span></span><span style={css("color:#8b96b8", { v })}>FINAL <span style={css("color:{{ d.scoreColor }};font-weight:700", { v, d: v.d })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs that could not be computed yet</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
             <div style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0", { v, f })}><span style={css("font-size:9px;font-weight:700;padding:2px 6px;border-radius:10px;background:{{ f.bg }};color:{{ f.fg }};flex-shrink:0", { v, f })}>{f.sev}</span><span style={css("font-size:11px;color:#c6d1ea", { v, f })}>{f.text}</span></div>
-          </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised by the server</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
             <div title={sc.detail} style={css("display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #16223f", { v, sc })}><span style={css("font-size:11px;font-weight:700;color:{{ sc.c }};flex-shrink:0;width:12px", { v, sc })}>{sc.glyph}</span><span style={css("flex:1;font-size:10.5px;color:#c6d1ea", { v, sc })}>{sc.label}</span><span style={css("font-size:9.5px;color:#6b7699", { v, sc })}>{sc.detail}</span></div>
           </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div>{v.d.hasBubbles && (<>
             <div style={css("background:#0a1226;border:1px solid #45103a;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;align-items:center;margin-bottom:8px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#ff4fae;font-weight:700", { v })}>BUNDLE MAP — WALLET CLUSTERS · via Bubblemaps</div><a href="https://bubblemaps.io" target="_blank" style={css("font-size:9px;color:#6b7699", { v })}>open in Bubblemaps ↗</a></div><div style={css("position:relative;height:190px;background:#0d1730;border:1px solid #16223f;border-radius:10px;overflow:hidden", { v })}>{(v.d.bubbles || []).map((b, i) => (<React.Fragment key={i}>

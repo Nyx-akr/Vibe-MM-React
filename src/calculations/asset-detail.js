@@ -18,7 +18,9 @@
  * it costs to look dangerous).
  */
 
-import { toNumber, clamp01, to100, multipleScore, logScore, statsFor } from './core';
+import {
+  toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
+} from './core.js';
 
 /* =================================================== the model =========== */
 
@@ -151,7 +153,9 @@ export function deriveIntel(raw, row) {
   const gp = raw.goplus;
   const rug = raw.rugcheck;
   const hp = raw.honeypot;
-  const jup = raw.jupiterToken;
+  // The server forwards Jupiter raw, so the window splits (net, ratio,
+  // organic share) have to be derived before anything reads them.
+  const jup = normalizeJupiterToken(raw.jupiterToken);
 
   const checks = goPlusChecks(chainKey, gp);
 
@@ -320,11 +324,14 @@ export function computeComponents(row, extras) {
   const set = (key, value, note) => { parts[key] = value; evidence[key] = note; };
 
   // --- flow anomaly: is this busier than its own normal? ---
-  if (z.volume5mUsd) {
+  // A metric can exist with a null multiple when its baseline mean was zero -
+  // that is no baseline at all, so it stays pending rather than reporting
+  // 'nullx baseline'.
+  if (z.volume5mUsd && Number.isFinite(z.volume5mUsd.multiple)) {
     set('volumeAnomaly', multipleScore(z.volume5mUsd.multiple),
       z.volume5mUsd.multiple + 'x baseline, z ' + z.volume5mUsd.z);
   }
-  if (z.buys5m) {
+  if (z.buys5m && Number.isFinite(z.buys5m.multiple)) {
     set('tradeActivity', multipleScore(z.buys5m.multiple),
       z.buys5m.multiple + 'x baseline, z ' + z.buys5m.z);
   }
@@ -332,14 +339,15 @@ export function computeComponents(row, extras) {
   // Breadth blends the anomaly with the absolute count, so a quiet token with
   // a 3x spike does not outrank a busy one with thousands of real buyers.
   {
-    const anomaly = z.buyers5m ? multipleScore(z.buyers5m.multiple) : null;
+    const hasBaseline = z.buyers5m && Number.isFinite(z.buyers5m.multiple);
+    const anomaly = hasBaseline ? multipleScore(z.buyers5m.multiple) : null;
     const absolute = logScore(row.traders24h && row.traders24h.buyers, 10, 3000);
     if (anomaly !== null || absolute !== null) {
       const blended = anomaly !== null && absolute !== null
         ? Math.round(anomaly * 0.5 + absolute * 0.5) : (anomaly !== null ? anomaly : absolute);
       set('buyerBreadth', blended,
         (row.traders24h && row.traders24h.buyers != null ? row.traders24h.buyers + ' buyers 24h' : '') +
-        (z.buyers5m ? ', ' + z.buyers5m.multiple + 'x 5m baseline' : ''));
+        (hasBaseline ? ', ' + z.buyers5m.multiple + 'x 5m baseline' : ''));
     }
   }
 

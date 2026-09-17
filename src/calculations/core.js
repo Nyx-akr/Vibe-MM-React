@@ -96,7 +96,7 @@ function jupiterWindow(win) {
   };
 }
 
-function normalizeJupiter(jup) {
+export function normalizeJupiterToken(jup) {
   if (!jup) return null;
   return {
     ...jup,
@@ -119,7 +119,7 @@ function normalizeJupiter(jup) {
 export function normalizeRow(raw, fetchedAt = Date.now()) {
   const gt = (raw.sources && raw.sources.geckoterminal) || {};
   const ds = (raw.sources && raw.sources.dexscreener) || null;
-  const jup = normalizeJupiter((raw.sources && raw.sources.jupiter) || null);
+  const jup = normalizeJupiterToken((raw.sources && raw.sources.jupiter) || null);
 
   const pick = (a, b) => (a === null || a === undefined ? (b === undefined ? null : b) : a);
   const dsVol = (ds && ds.volumeUsd) || {};
