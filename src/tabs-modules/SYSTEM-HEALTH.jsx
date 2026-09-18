@@ -1,8 +1,20 @@
 import React from 'react';
 import { chainColor } from '../utils/formatters';
+import { rotationIntelStatus } from '../services/rotation-intel';
 
 export function healthVals(app) {
     const apiSystem = app.state.apiSystem;
+
+    // The rotation graph is built in the browser by an always-on service, so
+    // its health belongs here next to the server's: if it stalls, every panel
+    // reading rotationForPool() goes quietly stale and nothing else would say
+    // so. It issues no requests of its own - it rides the wallet sample.
+    const rot = rotationIntelStatus();
+    const rotRow = {
+      k: 'Rotation graphs held',
+      v: rot.running ? String(rot.chainsHeld) + ' chains / ' + rot.poolsConnected + ' pools' : 'stopped',
+      c: rot.running && !rot.lastError ? '#4fd6c1' : '#e35ff2',
+    };
     if (apiSystem && Array.isArray(apiSystem.providers) && apiSystem.providers.length > 0) {
       const providers = apiSystem.providers.map(p => ({
         name: p.provider,
@@ -34,7 +46,8 @@ export function healthVals(app) {
         { k: 'Wallet sets sampled', v: String(apiSystem.cache?.walletSetsSampled || 0), c: '#dfe6f6' },
         { k: 'Holder series tracked', v: String(apiSystem.cache?.holderSeries || 0), c: '#dfe6f6' },
         { k: 'Stages tracked', v: String(apiSystem.cache?.stagesTracked || 0), c: '#4d8dff' },
-        { k: 'Upstream calls window', v: `${apiSystem.windowSeconds || 60}s`, c: '#4d8dff' }
+        { k: 'Upstream calls window', v: `${apiSystem.windowSeconds || 60}s`, c: '#4d8dff' },
+        rotRow
       ];
 
       return { healthStats, providers, chainSync, pipeline };
@@ -66,7 +79,9 @@ export function healthVals(app) {
     const pipeline = [
       { k: 'Queue lag (bus)', v: '0.3s', c: '#4d8dff' }, { k: 'Duplicate events deduped', v: '12', c: '#dfe6f6' }, { k: 'Out-of-order reordered', v: '184', c: '#dfe6f6' },
       { k: 'Dead-letter queue', v: '0', c: '#4d8dff' }, { k: 'Oracle staleness alerts', v: '0', c: '#4d8dff' }, { k: 'Provider disagreement >1%', v: '1 pair', c: '#e35ff2' },
-      { k: 'Gap backfills running', v: '1 (BNB)', c: '#e35ff2' }, { k: 'ClickHouse / PG / Redis', v: 'OK / OK / OK', c: '#4d8dff' }];
+      { k: 'Gap backfills running', v: '1 (BNB)', c: '#e35ff2' }, { k: 'ClickHouse / PG / Redis', v: 'OK / OK / OK', c: '#4d8dff' },
+      rotRow
+    ];
     return { healthStats, providers: providers.map(([name, chain, status, dot, lat, note]) => ({ name, chain, chainColor: chainColor(chain), status, dot, lat, note })), chainSync, pipeline };
   }
 

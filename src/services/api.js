@@ -25,6 +25,7 @@ import {
   recordScore, journalFor, flushJournal, pruneJournal,
   loadStageMemory, saveStageMemory,
 } from './score-journal';
+import { walletIntelForPool } from './wallet-intel';
 
 // Vercel serves this app as static files with no backend, so API calls need an
 // absolute URL to the data server. Override with VITE_API_BASE (e.g.
@@ -244,6 +245,10 @@ export function mapServerRowToAsset(row) {
     spark,
     poolAddress: row.poolAddress,
     tokenAddress: row.tokenAddress,
+    // The wallets module's verdict, carried through as computed. The WALLETS
+    // tab renders this rather than recomputing, which is what guarantees the
+    // number it shows is the number the score used.
+    walletQuality: row.walletQuality || null,
     rawServerRow: row,
   };
 }
@@ -281,6 +286,13 @@ export async function fetchLiveMarketData(chains = chainKeys) {
           // detail page are always looking at the same number.
           intel: intelFor(chainKey, row),
           reference: references.get(row.quoteSymbol) || null,
+          // The behavioural wallet read, from the background service that is
+          // already analysing every sampled pool. Taken from its store rather
+          // than recomputed here: the work is done once per tick, and the score
+          // and the WALLETS tab are then guaranteed to be describing the same
+          // sample. Null for a pool the rotation has not reached yet, which the
+          // model handles by simply not counting that weight.
+          walletIntel: walletIntelForPool(row.poolAddress),
         });
         // Remember what we scored it at, so Evaluation can grade it later.
         recordScore(chainKey, row.tokenAddress, {
@@ -476,72 +488,6 @@ export async function fetchLiveWalletData(chain = 'solana', asset = null, tracke
 // Mention counts per symbol, kept in memory so a baseline can build up over a
 // session. Short-lived by design: the board itself is the long-term record.
 const mentionHistory = new Map();
-
-export async function fetchLiveSocialData(chain = 'solana', asset = null) {
-  try {
-    const data = await fetchJson(`${BASE_URL}/api/social?chain=${chain}`);
-    if (!data || data.server !== 'ok') return null;
-
-    const posts = data.posts || [];
-    const promotion = (data.promotion && data.promotion.rows) || [];
-    const row = (asset && asset.rawServerRow) || {};
-    // The board model carries the ticker as `sym`, with a leading $; only the
-    // raw server row calls it `symbol`. Reading `asset.symbol` found neither,
-    // so any asset without a rawServerRow measured nothing at all.
-    const symbol = row.symbol ||
-      (asset && asset.sym ? String(asset.sym).replace(/^\$/, '') : null) ||
-      null;
-
-    const sources = (data.sources || []).map((x) => ({
-      source: x.source,
-      label: x.label,
-      url: x.url || null,
-      ok: x.ok,
-      error: x.error,
-      posts: x.posts,
-    }));
-
-    const base = {
-      server: 'ok',
-      chain,
-      symbol,
-      scanned: posts.length,
-      sources,
-      absent: data.absent,
-      counts: {
-        boosts: promotion.filter((p) => p.kind === 'BOOST').length,
-        profiles: promotion.filter((p) => p.kind === 'PROFILE').length,
-      },
-    };
-
-    if (!symbol) return Object.assign(base, { mention: null, promo: null, baseline: null });
-
-    const mention = mentionsFor(posts, symbol);
-
-    // The baseline is this browser's own record of how often the token was
-    // named on previous refreshes. The server keeps no such history, so a
-    // freshly opened tab legitimately has no baseline yet and says so.
-    const key = chain + ':' + symbol;
-    const series = mentionHistory.get(key) || [];
-    const last = series[series.length - 1];
-    if (mention.countable && (!last || Date.now() - last.t > 60000)) {
-      series.push({ t: Date.now(), n: mention.mentions });
-      if (series.length > 120) series.shift();
-      mentionHistory.set(key, series);
-    }
-
-    const address = String(row.tokenAddress || '').toLowerCase();
-    const promo = promotion.find((p) => String(p.tokenAddress || '').toLowerCase() === address) || null;
-
-    return Object.assign(base, {
-      tokenAddress: row.tokenAddress || null,
-      mention,
-      promo,
-      boosted: Boolean(promo),
-      baseline: mentionBaseline(series, mention.mentions),
-    });
-  } catch (e) { return null; }
-}
 
 /**
  * Evaluation joins two series: the server's raw prices, and this browser's

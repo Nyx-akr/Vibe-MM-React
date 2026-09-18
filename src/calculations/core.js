@@ -426,18 +426,40 @@ export function tradeStatsFrom(trades) {
   };
 }
 
-/** pool address -> Map(wallet -> usd), from the server's trade samples. */
+/**
+ * pool address -> the wallets in that pool's trade sample.
+ *
+ * Two maps per pool, because rotation needs both:
+ *
+ *   wallets - gross USD the wallet pushed through the pool, buys and sells
+ *             added together. This answers "how big is this wallet here".
+ *   net     - buys minus sells. The SIGN is the whole point: a wallet that is
+ *             net negative in one pool and net positive in another has moved
+ *             capital between the two, which is what rotation actually means.
+ *             Overlap on its own cannot tell you that.
+ *
+ * The buy/sell test matches tradeStatsFrom() above deliberately - a trade the
+ * provider did not label is treated as a sell in both places, so the two never
+ * disagree about the same sample.
+ */
 export function buildWalletSets(tradePools) {
   const sets = new Map();
   (tradePools || []).forEach((entry) => {
     const perWallet = new Map();
+    const netWallet = new Map();
     (entry.trades || []).forEach((t) => {
       perWallet.set(t.wallet, (perWallet.get(t.wallet) || 0) + t.usd);
+      const signed = t.kind === 'buy' ? t.usd : -t.usd;
+      netWallet.set(t.wallet, (netWallet.get(t.wallet) || 0) + signed);
     });
+    const times = (entry.trades || []).map((t) => t.at).filter(Boolean);
     sets.set(entry.poolAddress, {
       at: entry.at,
       symbol: entry.symbol,
       wallets: perWallet,
+      net: netWallet,
+      firstTradeAt: times.length ? Math.min(...times) : null,
+      lastTradeAt: times.length ? Math.max(...times) : null,
       stats: tradeStatsFrom(entry.trades || []),
     });
   });
@@ -488,43 +510,146 @@ export function rotationFor(walletSets, poolAddress) {
   };
 }
 
-/** The whole graph: every pool pair that shares wallets. */
+/**
+ * The whole graph: every pool pair that shares wallets, and which way the
+ * money went.
+ *
+ * A bare overlap is ambiguous. The same wallet being busy in two pools could
+ * be rotation, or could be two unrelated positions opened in the same hour.
+ * The net sign separates the two cases. For each wallet present in both pools:
+ *
+ *   net < 0 here, net > 0 there  ->  capital left here and arrived there. The
+ *                                    amount attributable to the move is
+ *                                    min(|out|, in) - the part that can be
+ *                                    accounted for on BOTH sides. The sum
+ *                                    would double-count the same dollars.
+ *   same sign in both            ->  parallel behaviour, NOT a rotation. Kept
+ *                                    as parallelUsd so it stays visible rather
+ *                                    than being quietly folded into the total.
+ *
+ * Pools are keyed by address throughout, never by symbol: two sampled pools
+ * can carry the same ticker, and matching on the ticker would merge them.
+ *
+ * Every number here describes the sampled window and nothing outside it, which
+ * is why the window bounds are returned alongside the graph.
+ */
 export function rotationGraph(walletSets) {
   const pools = [...walletSets.entries()];
+  // Null when the provider never named the pool. Deliberately NOT defaulted
+  // to an address prefix: "Q2sPHPdU" rendered next to real tickers reads as
+  // one, and inventing a ticker is the thing this tab is not allowed to do.
+  const symbolOf = (key, entry) => entry.symbol || null;
   const edges = [];
+
   for (let i = 0; i < pools.length; i++) {
     for (let k = i + 1; k < pools.length; k++) {
       const [keyA, a] = pools[i];
       const [keyB, b] = pools[k];
+
       let shared = 0;
       let usd = 0;
+      let aToB = 0;
+      let bToA = 0;
+      let parallel = 0;
+
       a.wallets.forEach((usdA, wallet) => {
-        if (b.wallets.has(wallet)) { shared += 1; usd += usdA + b.wallets.get(wallet); }
+        if (!b.wallets.has(wallet)) return;
+        shared += 1;
+        usd += usdA + b.wallets.get(wallet);
+        const netA = (a.net && a.net.get(wallet)) || 0;
+        const netB = (b.net && b.net.get(wallet)) || 0;
+        if (netA < 0 && netB > 0) aToB += Math.min(-netA, netB);
+        else if (netA > 0 && netB < 0) bToA += Math.min(netA, -netB);
+        else parallel += Math.min(Math.abs(netA), Math.abs(netB));
       });
-      if (shared) {
-        edges.push({
-          from: a.symbol || keyA.slice(0, 8),
-          to: b.symbol || keyB.slice(0, 8),
-          sharedWallets: shared,
-          combinedUsd: Math.round(usd),
-        });
-      }
+      if (!shared) continue;
+
+      const rotated = aToB + bToA;
+      const forward = aToB >= bToA;
+      const symA = symbolOf(keyA, a);
+      const symB = symbolOf(keyB, b);
+      edges.push({
+        from: symA,
+        to: symB,
+        fromPool: keyA,
+        toPool: keyB,
+        // The direction the larger share of the rotated USD actually went.
+        source: forward ? symA : symB,
+        target: forward ? symB : symA,
+        sourcePool: forward ? keyA : keyB,
+        targetPool: forward ? keyB : keyA,
+        sharedWallets: shared,
+        combinedUsd: Math.round(usd),
+        rotatedUsd: Math.round(rotated),
+        dominantUsd: Math.round(forward ? aToB : bToA),
+        counterUsd: Math.round(forward ? bToA : aToB),
+        parallelUsd: Math.round(parallel),
+        // 1 = every rotated dollar went one way; 0.5 = the two sides cancel.
+        directionality: rotated ? round(Math.max(aToB, bToA) / rotated, 3) : null,
+        // Shared wallets against the SMALLER crowd: a 20-wallet overlap means
+        // far more between two 30-wallet pools than between two 900-wallet ones.
+        overlapPct: round((shared / Math.max(1, Math.min(a.wallets.size, b.wallets.size))) * 100, 1),
+      });
     }
   }
-  edges.sort((x, y) => y.combinedUsd - x.combinedUsd);
+  edges.sort((x, y) => (y.rotatedUsd - x.rotatedUsd) || (y.combinedUsd - x.combinedUsd));
 
-  const nodes = pools.map(([, entry]) => {
-    const touching = edges.filter((e) => e.from === entry.symbol || e.to === entry.symbol);
+  const nodes = pools.map(([key, entry]) => {
+    const touching = edges.filter((x) => x.fromPool === key || x.toPool === key);
+    let inUsd = 0;
+    let outUsd = 0;
+    touching.forEach((x) => {
+      if (x.targetPool === key) { inUsd += x.dominantUsd; outUsd += x.counterUsd; }
+      else { outUsd += x.dominantUsd; inUsd += x.counterUsd; }
+    });
     return {
-      symbol: entry.symbol,
+      symbol: symbolOf(key, entry),
+      poolAddress: key,
       wallets: entry.wallets.size,
+      trades: (entry.stats && entry.stats.trades) || 0,
       connections: touching.length,
-      sharedUsd: touching.reduce((s, e) => s + e.combinedUsd, 0),
+      sharedUsd: touching.reduce((sum, x) => sum + x.combinedUsd, 0),
+      rotatedUsd: touching.reduce((sum, x) => sum + x.rotatedUsd, 0),
+      inUsd: Math.round(inUsd),
+      outUsd: Math.round(outUsd),
+      netRotationUsd: Math.round(inUsd - outUsd),
       sampledAt: entry.at,
     };
-  }).sort((a, b) => b.sharedUsd - a.sharedUsd);
+  }).sort((x, y) => (y.rotatedUsd - x.rotatedUsd) || (y.sharedUsd - x.sharedUsd));
 
-  return { poolsSampled: pools.length, nodes, edges: edges.slice(0, 40) };
+  // A wallet counts as shared the second time it is seen, in a different pool.
+  const seen = new Set();
+  const sharedWallets = new Set();
+  pools.forEach(([, entry]) => entry.wallets.forEach((_, wallet) => {
+    if (seen.has(wallet)) sharedWallets.add(wallet);
+    seen.add(wallet);
+  }));
+
+  const sampledAts = pools.map(([, entry]) => entry.at).filter(Boolean);
+  const tradeAts = pools
+    .flatMap(([, entry]) => [entry.firstTradeAt, entry.lastTradeAt])
+    .filter(Boolean);
+
+  return {
+    poolsSampled: pools.length,
+    pairsPossible: (pools.length * (pools.length - 1)) / 2,
+    pairsConnected: edges.length,
+    // Counted over every edge, not the 40 returned below: rotatedUsd sums
+    // the full list too, and a total over one set with a count over another
+    // is how a tab ends up quietly lying about its own denominator.
+    pathsRotating: edges.filter((x) => x.rotatedUsd > 0).length,
+    distinctWallets: seen.size,
+    sharedWalletCount: sharedWallets.size,
+    tradesSampled: pools.reduce((sum, [, entry]) => sum + ((entry.stats && entry.stats.trades) || 0), 0),
+    rotatedUsd: edges.reduce((sum, x) => sum + x.rotatedUsd, 0),
+    parallelUsd: edges.reduce((sum, x) => sum + x.parallelUsd, 0),
+    oldestSampleAt: sampledAts.length ? Math.min(...sampledAts) : null,
+    newestSampleAt: sampledAts.length ? Math.max(...sampledAts) : null,
+    firstTradeAt: tradeAts.length ? Math.min(...tradeAts) : null,
+    lastTradeAt: tradeAts.length ? Math.max(...tradeAts) : null,
+    nodes,
+    edges: edges.slice(0, 40),
+  };
 }
 
 /* ======================================================== 7. wallets ===== */
@@ -578,6 +703,47 @@ function dispersion(values) {
   if (!mean) return { mean: 0, cv: null };
   const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
   return { mean, cv: Math.sqrt(variance) / Math.abs(mean) };
+}
+
+/**
+ * How much corroboration a cluster actually has.
+ *
+ * An earlier version graded on size tightness alone, plus whether ANY exit
+ * burst existed. That ranked a ten-wallet cluster whose every member sold
+ * together BELOW a four-wallet one, purely because its entry sizes varied by
+ * 20% instead of 6% - which is backwards. Ten wallets entering inside two
+ * seconds and all ten leaving as a group is far less likely to be a
+ * coincidence than four doing the same, whatever the sizes were; and an
+ * operator who wants to stay hidden varies the sizes deliberately, so size
+ * spread is weak evidence AGAINST coordination.
+ *
+ * So three independent signals are scored and added, and the reasons are
+ * carried out with the grade so the panel can say why rather than just assert
+ * a colour.
+ */
+function gradeCluster(wallets, cv, exit) {
+  const exitShare = exit ? exit.wallets / wallets : 0;
+  const reasons = [];
+  let score = 0;
+
+  if (cv <= COENTRY_HIGH_CV) { score += 3; reasons.push('identical entry sizes'); }
+  else if (cv <= COENTRY_MEDIUM_CV) { score += 2; reasons.push('near-identical entry sizes'); }
+  else { score += 1; reasons.push('similar entry sizes'); }
+
+  if (wallets >= 8) { score += 3; reasons.push(wallets + ' wallets at once'); }
+  else if (wallets >= 6) { score += 2; reasons.push(wallets + ' wallets at once'); }
+  else { score += 1; reasons.push(wallets + ' wallets at once'); }
+
+  if (exitShare >= 0.9) { score += 3; reasons.push('all of them exited together'); }
+  else if (exitShare >= 0.6) { score += 2; reasons.push('most of them exited together'); }
+  else if (exitShare > 0) { score += 1; reasons.push('some of them exited together'); }
+  else reasons.push('no group exit yet');
+
+  return {
+    confidence: score >= 6 ? 'high' : score >= 4 ? 'medium' : 'low',
+    confidenceScore: score,
+    reasons,
+  };
 }
 
 /**
@@ -645,12 +811,7 @@ function coEntryClusters(wallets, spanMs, allTrades) {
       avgEntryUsd: Math.round(spread.mean),
       sizeSpreadPct: round(spread.cv * 100, 1),
       grossUsd: Math.round(group.reduce((s, w) => s + w.grossUsd, 0)),
-      // Graded rather than asserted. Identical-to-the-cent sizes are a machine;
-      // "roughly similar" is a hint, and the panel should not present the two
-      // as if they carried the same weight.
-      confidence: spread.cv <= COENTRY_HIGH_CV && exit ? 'high'
-        : spread.cv <= COENTRY_HIGH_CV || (spread.cv <= COENTRY_MEDIUM_CV && exit) ? 'medium'
-          : 'low',
+      ...gradeCluster(group.length, spread.cv, exit),
       exit,
       members: group.map((w) => w.address),
     });
@@ -844,10 +1005,167 @@ export function tokenWalletIntel({
     },
     clusters,
     holders,
+    // Supply held by the top holders, EXCLUDING the pool and any other pool we
+    // sample. The provider's own list puts the pool contract near the top of
+    // almost every token, so summing it raw overstates concentration on every
+    // row; this is the figure the quality score should use.
+    holderSharePct: holders.length
+      ? round(holders.filter((h) => !h.isPool)
+        .reduce((sum, h) => sum + (h.supplyPct || 0), 0), 2)
+      : null,
     rows,
     poolsCompared: Math.max(0, walletSets.size - 1),
   };
 }
+
+
+/**
+ * WALLET QUALITY - the number this module sends to the score.
+ *
+ * This used to live in asset-detail.js as two separate components, which meant
+ * the wallet verdict was computed somewhere the WALLETS tab could not show it,
+ * and split across two places that disagreed about what "wallet quality" meant:
+ * one measured who HOLDS the supply, the other who TRADES it. They are now one
+ * number, computed here, displayed on the WALLETS tab, and consumed by the
+ * score model as a single input.
+ *
+ * Four questions, each answered only when the data to answer it is present:
+ *
+ *   holderSpread       is the supply spread out, or does a handful hold it?
+ *   crowdIndependence  are the buyers independent, or one operator's wallets?
+ *   positionIntent     are they building positions, or churning for volume?
+ *   volumeSpread       is the flow spread across the crowd, or one wallet?
+ *
+ * The first comes from the provider holder list; the other three are measured
+ * from the pool's own sampled trades. A question with no data is not guessed
+ * and not counted - `coverage` reports how much of the verdict was actually
+ * measurable, the same way the main model reports dataQuality.
+ *
+ * Then three modifiers, which adjust rather than answer: an insider graph and
+ * a creator with a long history of other tokens both make the same holder
+ * spread mean less; locked liquidity makes it mean more.
+ */
+
+const QUALITY_PARTS = Object.freeze([
+  { key: 'holderSpread', label: 'Holder spread', weight: 35 },
+  { key: 'crowdIndependence', label: 'Crowd independence', weight: 30 },
+  { key: 'volumeSpread', label: 'Volume spread', weight: 20 },
+  { key: 'positionIntent', label: 'Position intent', weight: 15 },
+]);
+
+/** Below this many active wallets a behavioural read is not worth trusting. */
+const QUALITY_MIN_WALLETS = 12;
+/** How much a cluster counts against the crowd, by how sure we are of it. */
+const COORDINATION_WEIGHT = Object.freeze({ high: 1, medium: 0.6, low: 0.25 });
+
+/**
+ * @param intel   a tokenWalletIntel() result, or null
+ * @param context holder-list and contract facts, where the caller has them:
+ *                { topHolderSharePct, insidersDetected, creatorOtherTokens,
+ *                  lpLockedPct, holderSource }
+ */
+export function walletQualityScore(intel, context = {}) {
+  const parts = {};
+  const notes = {};
+  const set = (key, value, note) => {
+    if (value === null || value === undefined) return;
+    parts[key] = to100(clamp01(value));
+    notes[key] = note;
+  };
+
+  // --- who holds it ---
+  const topShare = toNumber(context.topHolderSharePct);
+  if (Number.isFinite(topShare)) {
+    // 60% in the top holders is the point where the rest of the float stops
+    // mattering; below that the penalty scales smoothly.
+    set('holderSpread', 1 - topShare / 60,
+      'top holders hold ' + round(topShare, 2) + '%' +
+      (context.holderSource ? ' (' + context.holderSource + ')' : ''));
+  }
+
+  // --- who trades it ---
+  const window = (intel && intel.window) || null;
+  const active = window ? window.wallets : 0;
+  if (intel && active >= QUALITY_MIN_WALLETS) {
+    const counts = intel.counts || {};
+    const flow = intel.flow || {};
+
+    const coordinated = (intel.clusters || []).reduce(
+      (sum, c) => sum + c.wallets * (COORDINATION_WEIGHT[c.confidence] || 0.25), 0);
+    // Coordination is scaled up because a coordinated wallet is worse than a
+    // merely absent one: it is actively pretending to be demand.
+    set('crowdIndependence', 1 - clamp01(coordinated / active) * 1.6,
+      coordinated >= 1
+        ? Math.round(coordinated) + ' of ' + active + ' wallets acting together'
+        : 'no coordinated entry among ' + active + ' wallets');
+
+    const top = toNumber(flow.topWalletSharePct);
+    if (Number.isFinite(top)) {
+      // One big buyer is normal; one wallet being most of the window is not,
+      // so nothing is charged below a quarter.
+      set('volumeSpread', 1 - clamp01((top - 25) / 50),
+        'largest wallet is ' + round(top, 1) + '% of window volume');
+    }
+
+    set('positionIntent', 1 - clamp01((counts.churn || 0) / active),
+      counts.churn
+        ? counts.churn + ' of ' + active + ' wallets churning without a position'
+        : 'no churn among ' + active + ' wallets');
+  }
+
+  const resolved = QUALITY_PARTS.filter((p) => parts[p.key] !== undefined);
+  if (!resolved.length) {
+    return {
+      score: null,
+      grade: null,
+      coverage: 0,
+      measured: 0,
+      total: QUALITY_PARTS.length,
+      parts: QUALITY_PARTS.map((p) => ({ ...p, value: null, note: null })),
+      modifiers: [],
+      note: 'No wallet data for this pool yet.',
+    };
+  }
+
+  const weight = resolved.reduce((s, p) => s + p.weight, 0);
+  let value = resolved.reduce((s, p) => s + parts[p.key] * p.weight, 0) / weight;
+
+  // --- modifiers: the same spread can mean different things ---
+  const modifiers = [];
+  if (context.insidersDetected) {
+    value *= 0.75;
+    modifiers.push({ label: 'Insider graph detected', effect: -25 });
+  }
+  if (Number.isFinite(context.creatorOtherTokens) && context.creatorOtherTokens > 20) {
+    value *= 0.8;
+    modifiers.push({
+      label: 'Creator has launched ' + context.creatorOtherTokens + ' tokens',
+      effect: -20,
+    });
+  }
+  if (Number.isFinite(context.lpLockedPct) && context.lpLockedPct > 90) {
+    value = Math.min(100, value * 1.15);
+    modifiers.push({ label: 'Liquidity locked', effect: +15 });
+  }
+
+  const score = Math.round(Math.min(100, Math.max(0, value)));
+  return {
+    score,
+    grade: score >= 70 ? 'strong' : score >= 45 ? 'fair' : 'weak',
+    coverage: Math.round((resolved.length / QUALITY_PARTS.length) * 100),
+    measured: resolved.length,
+    total: QUALITY_PARTS.length,
+    parts: QUALITY_PARTS.map((p) => ({
+      ...p,
+      value: parts[p.key] === undefined ? null : parts[p.key],
+      note: notes[p.key] || null,
+    })),
+    modifiers,
+    note: resolved.map((p) => notes[p.key]).filter(Boolean).join('; '),
+  };
+}
+
+export { QUALITY_PARTS };
 
 /* ========================================================= 8. social ===== */
 
@@ -889,6 +1207,80 @@ const CRYPTO_CONTEXT = new RegExp([
  * Unique authors is a real count of distinct accounts, not a guess: 4chan is
  * anonymous and contributes none, which is why anonPosts is reported beside it.
  */
+/**
+ * One pass over the corpus, so every ticker after the first is a lookup.
+ *
+ * The scanner now measures the WHOLE board on every tick, not just whichever
+ * token is on screen. Scanning ~4,000 posts per symbol per tick is tens of
+ * thousands of regex tests a second; indexing the corpus once and then asking
+ * it questions is the same answer for a fraction of the work.
+ *
+ * The index is keyed on the posts array itself, so it is rebuilt exactly when
+ * the server hands over a new corpus and reused for every symbol in between.
+ * A WeakMap means a replaced corpus is collected with its index.
+ */
+const corpusIndexes = new WeakMap();
+
+/**
+ * Tokens that count, by the same rules the regexes used:
+ *   cashtag - "$sym", case-insensitive, so it is stored upper-cased
+ *   bare    - "SYM", case-SENSITIVE, so only upper-case tokens are stored
+ * Splitting on non-alphanumerics reproduces the word boundaries exactly.
+ */
+function indexCorpus(posts) {
+  const byCash = new Map();
+  const byBare = new Map();
+  const context = new Uint8Array(posts.length);
+
+  for (let i = 0; i < posts.length; i++) {
+    const text = (posts[i] && posts[i].text) || '';
+    if (CRYPTO_CONTEXT.test(text)) context[i] = 1;
+
+    const seenCash = new Set();
+    const seenBare = new Set();
+    const tokens = text.split(/[^A-Za-z0-9$]+/);
+
+    for (const token of tokens) {
+      if (!token) continue;
+      if (token.charCodeAt(0) === 36) {
+        const word = token.replace(/^\$+/, '').replace(/\$+$/, '');
+        if (word && /^[A-Za-z0-9]+$/.test(word)) seenCash.add(word.toUpperCase());
+      } else {
+        const word = token.replace(/\$+$/, '');
+        // Upper-case only: "PAID" is a ticker, "paid" is a salary.
+        if (word && word === word.toUpperCase() && /^[A-Za-z0-9]+$/.test(word)) seenBare.add(word);
+      }
+    }
+
+    for (const w of seenCash) {
+      const list = byCash.get(w); if (list) list.push(i); else byCash.set(w, [i]);
+    }
+    for (const w of seenBare) {
+      const list = byBare.get(w); if (list) list.push(i); else byBare.set(w, [i]);
+    }
+  }
+  return { byCash, byBare, context };
+}
+
+function corpusIndex(posts) {
+  let index = corpusIndexes.get(posts);
+  if (!index) { index = indexCorpus(posts); corpusIndexes.set(posts, index); }
+  return index;
+}
+
+/**
+ * Counts how often one symbol is named across every social feed.
+ *
+ * Two tiers, kept apart on purpose:
+ *   cashtag    - "$SYM", unambiguous
+ *   contextual - bare "SYM" in a post that also talks about trading
+ * and a third, `loose`, which is every other bare hit. Loose hits are
+ * reported but never counted, because that is the number that used to make an
+ * English word look like a trending ticker.
+ *
+ * Unique authors is a real count of distinct accounts, not a guess: 4chan is
+ * anonymous and contributes none, which is why anonPosts is reported beside it.
+ */
 export function mentionsFor(posts, symbol) {
   const clean = String(symbol || '').replace(/[^A-Za-z0-9]/g, '');
   const empty = {
@@ -900,31 +1292,31 @@ export function mentionsFor(posts, symbol) {
     return Object.assign({}, empty, { reason: 'symbol too generic to match safely' });
   }
 
-  const cashRe = new RegExp('\\$' + clean + '\\b', 'i');
-  // Bare hits are matched case-SENSITIVELY against the upper-case ticker.
-  // "PAID" is a ticker; "paid" is a person describing their salary. Case is
-  // the cheapest discriminator there is, and it removes most of the English-
-  // word false positives on its own; CRYPTO_CONTEXT then has to agree too.
-  const bareRe = new RegExp('(?:^|[^A-Za-z0-9$])' + clean.toUpperCase() + '(?![A-Za-z0-9])');
+  const list = posts || [];
+  const upper = clean.toUpperCase();
+  const index = corpusIndex(list);
+
+  const cashHits = index.byCash.get(upper) || [];
+  const bareHits = index.byBare.get(upper) || [];
+  const isCash = new Set(cashHits);
 
   const matched = [];
   let cashtag = 0; let contextual = 0; let loose = 0;
 
-  for (const p of posts || []) {
-    const text = p.text || '';
-    const isCash = cashRe.test(text);
-    const isBare = !isCash && bareRe.test(text);
-    if (!isCash && !isBare) continue;
-
-    if (isCash) { cashtag += 1; }
-    else if (CRYPTO_CONTEXT.test(text)) { contextual += 1; }
-    else { loose += 1; continue; }
-
+  const take = (i, cash) => {
+    const p = list[i];
     matched.push({
       source: p.source, id: p.id, author: p.author || null,
       time: p.time || null, replies: p.replies || 0, reactions: p.reactions || 0,
-      cashtag: isCash, text: text.slice(0, 400),
+      cashtag: cash, text: (p.text || '').slice(0, 400),
     });
+  };
+
+  for (const i of cashHits) { cashtag += 1; take(i, true); }
+  for (const i of bareHits) {
+    // A post naming both forms is already counted as a cashtag hit.
+    if (isCash.has(i)) continue;
+    if (index.context[i]) { contextual += 1; take(i, false); } else { loose += 1; }
   }
 
   matched.sort((a, b) => (b.time || 0) - (a.time || 0));

@@ -1,5 +1,9 @@
 import React from 'react';
 import { UNAVAILABLE } from '../utils/formatters';
+import { chainNameToKey } from '../data/chains';
+import {
+  socialIntelFor, socialSources, socialPromoFor, socialAbsent, socialIntelStatus,
+} from '../services/social-intel';
 
 /** Per-source badge colour, so a post's origin is readable at a glance. */
 const SOURCE_STYLE = {
@@ -56,32 +60,37 @@ function ago(ms) {
  * counted. See mentionsFor() in src/calculations/core.js.
  */
 export function socialVals(app, sel) {
-  const api = app.state.apiSocial;
+  const status = socialIntelStatus();
 
   // The board model carries the ticker as `sym` with a leading $; the raw
   // server row carries it bare. Neither is called `symbol`, which is how the
   // heading used to read $UNDEFINED.
   const ticker = String(
-    (api && api.symbol) || (sel && sel.rawServerRow && sel.rawServerRow.symbol) ||
-    (sel && sel.sym) || '',
+    (sel && sel.rawServerRow && sel.rawServerRow.symbol) || (sel && sel.sym) || '',
   ).replace(/^\$/, '').toUpperCase();
 
   if (!sel) return { socialReady: false, socialOffline: false };
-  if (!api || api.server !== 'ok') {
+
+  const intel = ticker ? socialIntelFor(ticker) : null;
+  const m = (intel && intel.mention) || null;
+
+  // The service holds the corpus between sweeps, so "nothing yet" only means
+  // the very first poll has not landed - not that the tab was never opened.
+  if (!status.corpusPosts) {
     return {
       socialReady: false,
       socialOffline: true,
       socialToken: ticker,
-      socialOfflineNote: app.state.serverError
-        ? 'The data server is unreachable, so no feed could be read. Nothing is shown rather than simulated.'
+      socialOfflineNote: status.lastError
+        ? 'The data server is unreachable (' + status.lastError + '), so no feed ' +
+          'could be read. Nothing is shown rather than simulated.'
         : 'Waiting for the first social sweep to return.',
     };
   }
 
-  const m = api.mention || null;
-  const baseline = api.baseline || {};
-  const sources = api.sources || [];
-  const live = sources.filter((s) => s.ok).length;
+  const baseline = (intel && intel.baseline) || {};
+  const sources = socialSources();
+  const live = sources.filter((x) => x.ok).length;
 
   const dim = (value) => (value == null ? UNAVAILABLE : '#ffffff');
 
@@ -108,12 +117,12 @@ export function socialVals(app, sel) {
     },
     {
       label: 'POSTS SCANNED',
-      value: String(api.scanned || 0),
+      value: String(status.corpusPosts || 0),
       color: '#f06ee2',
     },
   ];
 
-  const socialPosts = ((m && m.matched) || []).slice(0, 40).map((p, i) => {
+  const socialPosts = ((intel && intel.matched) || []).map((p, i) => {
     const st = sourceStyle(p.source);
     return {
       key: p.source + ':' + p.id + ':' + i,
@@ -133,21 +142,25 @@ export function socialVals(app, sel) {
     };
   });
 
-  const socialSources = sources.map((s) => ({
-    key: s.source,
-    name: sourceStyle(s.source).label,
-    fg: sourceStyle(s.source).fg,
-    url: s.url || '',
+  const socialSourceRows = sources.map((x) => ({
+    key: x.source,
+    name: sourceStyle(x.source).label,
+    fg: sourceStyle(x.source).fg,
+    url: x.url || '',
     // The label is the sentence under the link: which subreddits, which tags.
-    title: s.label || '',
-    posts: String(s.posts),
-    ok: s.ok,
-    state: s.ok ? 'LIVE' : 'DOWN',
-    stateFg: s.ok ? '#4fc3f7' : '#ff4fae',
-    hit: m && m.bySource ? String(m.bySource[s.source] || 0) : '0',
-    hitFg: m && m.bySource && m.bySource[s.source] ? '#4d8dff' : '#3a4568',
-    error: s.error || '',
+    title: x.label || '',
+    posts: String(x.posts),
+    ok: x.ok,
+    state: x.ok ? 'LIVE' : 'DOWN',
+    stateFg: x.ok ? '#4fc3f7' : '#ff4fae',
+    hit: m && m.bySource ? String(m.bySource[x.source] || 0) : '0',
+    hitFg: m && m.bySource && m.bySource[x.source] ? '#4d8dff' : '#3a4568',
+    error: x.error || '',
   }));
+
+  const chainKey = (sel.rawServerRow && sel.rawServerRow.chain) ||
+    chainNameToKey[sel.chain] || 'solana';
+  const promo = socialPromoFor(chainKey, sel.rawServerRow && sel.rawServerRow.tokenAddress);
 
   return {
     socialReady: true,
@@ -155,30 +168,42 @@ export function socialVals(app, sel) {
     socialToken: ticker,
     socialStats,
     socialPosts,
-    socialSources,
+    socialSources: socialSourceRows,
     socialLive: live + ' of ' + sources.length + ' sources answering',
     socialCountable: Boolean(m && m.countable),
     // A missing measurement and an unmatchable ticker are different failures.
-    // Both used to print 'not matched against text: .' with a blank cause.
     socialReason: (m && m.reason) ||
-      (m ? '' : 'the sweep returned no posts to match against — the data server may be serving an older build'),
+      (m ? '' : 'this token has not been measured against the corpus yet'),
     socialLoose: m && m.loose ? String(m.loose) : '',
     socialAnon: m && m.anonPosts ? String(m.anonPosts) : '',
+
+    // What the standing memory adds over a single sweep: the tab used to say
+    // "no baseline yet" forever, because the series only advanced while the
+    // tab was open. The service keeps measuring, so this fills in on its own.
     socialBaselineNote: baseline.samples
-      ? 'Baseline from ' + baseline.samples + ' earlier sweeps in this tab' +
+      ? 'Baseline from ' + baseline.samples + ' samples' +
+        (baseline.baseline != null ? ' · normally ' + baseline.baseline : '') +
         (baseline.z != null ? ' · z ' + baseline.z : '')
-      : 'No baseline yet — it builds from this tab’s own sweeps, about one a minute.',
-    socialBoosted: Boolean(api.boosted),
-    socialPromo: api.promo
+      : 'Baseline still building — one sample a minute, in the background.',
+    socialPeak: intel && intel.peakMentions
+      ? 'Peak ' + intel.peakMentions + ' mentions' + (intel.peakAt ? ' · ' + ago(intel.peakAt) : '')
+      : '',
+    socialWatched: status.symbolsMeasured
+      ? status.symbolsMeasured + ' tokens measured every ' + Math.round(status.tickMs / 1000) +
+        's · ' + status.symbolsWithMentions + ' with chatter now'
+      : '',
+
+    socialBoosted: Boolean(promo),
+    socialPromo: promo
       ? {
-          description: api.promo.description || '',
-          kind: api.promo.kind,
-          links: (api.promo.links || []).map((l, i) => ({
+          description: promo.description || '',
+          kind: promo.kind,
+          links: (promo.links || []).map((l, i) => ({
             key: i, type: String(l.type || 'link').toUpperCase(), url: l.url,
           })),
         }
       : null,
-    socialAbsent: api.absent || '',
+    socialAbsent: socialAbsent(),
     socialEmpty: !socialPosts.length,
   };
 }
@@ -216,7 +241,10 @@ export default function SocialScanner({ v, css }) {
           <div style={css('font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:4px', { v })}>
             POSTS MENTIONING ${String(v.socialToken).toUpperCase()} — NEWEST FIRST
           </div>
-          <div style={css('font-size:9.5px;color:#6b7699;margin-bottom:10px', { v })}>{v.socialBaselineNote}</div>
+          <div style={css('font-size:9.5px;color:#6b7699;margin-bottom:2px', { v })}>
+            {v.socialBaselineNote}{v.socialPeak ? ' · ' + v.socialPeak : ''}
+          </div>
+          <div style={css('font-size:9px;color:#4a5578;margin-bottom:10px', { v })}>{v.socialWatched}</div>
 
           {!v.socialCountable && (
             <div style={css('background:#101c38;border:1px solid #45103a;border-radius:10px;padding:10px 12px;font-size:10.5px;color:#c6d1ea;line-height:1.55', { v })}>

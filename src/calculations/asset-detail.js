@@ -20,7 +20,7 @@
 
 import {
   toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
-  zScoresFrom, bucketBaselines, rotationFor,
+  zScoresFrom, bucketBaselines, rotationFor, walletQualityScore,
 } from './core.js';
 
 /* =================================================== the model =========== */
@@ -41,7 +41,7 @@ export const SCORE_MODEL = Object.freeze([
   { key: 'liquidity', label: 'Liquidity / executability', weight: 14 },
   { key: 'priceConfirmation', label: 'Price confirmation', weight: 8 },
   { key: 'holderGrowth', label: 'Holder growth', weight: 7 },
-  { key: 'walletQuality', label: 'Wallet quality', weight: 8 },
+  { key: 'walletQuality', label: 'Wallet quality', weight: 12 },
   { key: 'capitalRotation', label: 'Capital rotation', weight: 8 },
   { key: 'crossVenue', label: 'Cross-venue confirm', weight: 4 },
   { key: 'usdReference', label: 'USD reference', weight: 3 },
@@ -316,6 +316,7 @@ export function computeComponents(row, extras) {
   const rotation = extras.rotation || null;
   const usdRef = extras.usdReference || null;
   const jup = extras.jupiter || (row && row.jupiter) || null;
+  const wallet = extras.walletIntel || null;
 
   const parts = {};
   const evidence = {};
@@ -401,23 +402,46 @@ export function computeComponents(row, extras) {
       (jup.holderCount ? ' on ' + jup.holderCount.toLocaleString() : '') + ' (Jupiter)');
   }
 
-  // --- is the holder base concentrated, and who created it? ---
-  if (jup && jup.audit && Number.isFinite(jup.audit.topHoldersPercentage) &&
-      !(intel && intel.holders && intel.holders.topHolderSharePct !== null)) {
-    set('walletQuality', to100(clamp01(1 - jup.audit.topHoldersPercentage / 60)),
-      'top holders ' + jup.audit.topHoldersPercentage.toFixed(1) + '% (Jupiter audit)' +
-      (jup.audit.devMigrations ? ', dev has ' + jup.audit.devMigrations + ' prior migrations' : ''));
-  }
-  if (intel && intel.holders && intel.holders.topHolderSharePct !== null) {
-    const cs = intel.contractSafety || {};
-    let value = clamp01(1 - intel.holders.topHolderSharePct / 60);
-    if (cs.insidersDetected) value *= 0.75;
-    if (Number.isFinite(cs.creatorOtherTokens) && cs.creatorOtherTokens > 20) value *= 0.8;
-    if (Number.isFinite(cs.lpLockedPct) && cs.lpLockedPct > 90) value = Math.min(1, value * 1.15);
-    set('walletQuality', to100(value),
-      'top-10 hold ' + intel.holders.topHolderSharePct + '%' +
-      (cs.insidersDetected ? ', insider graph detected' : '') +
-      (Number.isFinite(cs.creatorOtherTokens) ? ', creator has ' + cs.creatorOtherTokens + ' tokens' : ''));
+  // --- what do the wallets say? ---
+  //
+  // Nothing is decided here. Wallet quality is one number, computed by the
+  // wallets module (walletQualityScore in core.js) from the same inputs the
+  // WALLETS tab displays, so the figure on that tab and the figure in this
+  // score are the same figure by construction rather than by coincidence.
+  //
+  // This block's whole job is to supply the holder-side context that the
+  // wallets module cannot see - it reads trades, not provider holder lists -
+  // and to record what comes back.
+  {
+    const cs = (intel && intel.contractSafety) || {};
+    const holders = (intel && intel.holders) || {};
+    const jupTop = jup && jup.audit ? toNumber(jup.audit.topHoldersPercentage) : null;
+    // Preferred in this order: the wallets module's own figure (which excludes
+    // the pool contract), then the provider sum, then Jupiter's audit. The
+    // first is what the WALLETS tab shows, so preferring it is what keeps the
+    // two views on the same number.
+    const walletTop = wallet && wallet.holderSharePct !== null &&
+      wallet.holderSharePct !== undefined ? wallet.holderSharePct : null;
+    const providerTop = holders.topHolderSharePct !== null &&
+      holders.topHolderSharePct !== undefined ? holders.topHolderSharePct : null;
+    const topHolderSharePct = walletTop !== null ? walletTop
+      : (providerTop !== null ? providerTop : jupTop);
+
+    const quality = walletQualityScore(wallet, {
+      topHolderSharePct,
+      holderSource: walletTop !== null ? 'GoPlus, pool excluded'
+        : (providerTop !== null ? 'GoPlus' : (jupTop !== null ? 'Jupiter audit' : null)),
+      insidersDetected: cs.insidersDetected,
+      creatorOtherTokens: cs.creatorOtherTokens,
+      lpLockedPct: cs.lpLockedPct,
+    });
+
+    if (quality.score !== null) {
+      set('walletQuality', quality.score,
+        quality.note + (quality.measured < quality.total
+          ? ' (' + quality.measured + ' of ' + quality.total + ' wallet checks)' : ''));
+      evidence.walletQualityDetail = quality;
+    }
   }
 
   // --- is the same money moving in from other pools we watch? ---
@@ -654,6 +678,10 @@ export function scoreAsset(row, extras) {
       pending: !modifiers[m.key],
       evidence: modifiers[m.key] ? modifiers[m.key].evidence : null,
     })),
+    // The wallets module's full verdict, not just the number that went into
+    // the weighted average - so the WALLETS tab can render the breakdown it
+    // produced without recomputing it and risking a different answer.
+    walletQuality: evidence.walletQualityDetail || null,
     weightCovered: weightUsed,
     componentsPresent: breakdown.filter((b) => !b.pending).length,
     dataQuality: round(weightUsed / 100, 2),
@@ -679,7 +707,7 @@ export function scoreAsset(row, extras) {
  *                them yet; the score is computed on fewer inputs when we do not
  *   reference  - the quote token's price across CEX venues
  */
-export function evaluateAsset(row, { samples, walletSets, intel, reference } = {}) {
+export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel } = {}) {
   const poolSamples = (samples && samples[row.poolAddress]) || [];
   const fromSamples = zScoresFrom(poolSamples);
   const own = walletSets && walletSets.get(row.poolAddress);
@@ -696,6 +724,8 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference } = {
     rotation: walletSets ? rotationFor(walletSets, row.poolAddress) : null,
     usdReference: reference || null,
     intel: intel || null,
+    // The behavioural read on this pool, from the background wallet service.
+    walletIntel: walletIntel || null,
     jupiter: row.jupiter || null,
   };
 

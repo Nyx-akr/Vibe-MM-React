@@ -126,6 +126,28 @@ const status = {
 
 const listeners = new Set();
 
+/**
+ * Modules that derive their OWN picture from the same sampled trades.
+ *
+ * This is a seam, not a second poller. /api/trades already returns every
+ * pool the server holds in one response, and this loop already reduces it to
+ * the per-chain wallet set. A module that needs the same input subscribes
+ * here rather than issuing its own request - so adding one costs no extra
+ * upstream calls and cannot drift out of step with what WALLETS is showing.
+ */
+const sampleConsumers = new Set();
+
+/**
+ * Receive every chain's sampled pools as this loop reads them.
+ *
+ * The callback gets { chain, pools, walletSets, stale, at }. Returns an
+ * unsubscribe function.
+ */
+export function onSampledPools(fn) {
+  sampleConsumers.add(fn);
+  return () => sampleConsumers.delete(fn);
+}
+
 /** Subscribe to "the memory changed"; returns an unsubscribe function. */
 export function onWalletIntel(fn) {
   listeners.add(fn);
@@ -326,6 +348,13 @@ async function pollChain(chain) {
       fresh += rememberTrades(chain, pool, pool.trades);
       rememberClusters(chain, pool, intel.clusters);
     }
+  });
+
+  // Hand the same sample to anything else deriving from it, before this
+  // function returns, so every module is describing one read of one moment.
+  const handoff = { chain, pools, walletSets, stale: Boolean(data.stale), at: Date.now() };
+  sampleConsumers.forEach((fn) => {
+    try { fn(handoff); } catch (e) { /* a bad consumer must not stop the loop */ }
   });
 
   return { pools: pools.length, fresh };

@@ -35,8 +35,8 @@ export default function AlertToasts({ v, css }) {
           onClick={v.closeAllToasts}
           style={{
             cursor: 'pointer', fontSize: 8.5, fontWeight: 700, letterSpacing: 0.8,
-            color: '#8b96b8', background: 'rgba(13,23,48,.97)',
-            border: '1px solid #1c2a4d', borderRadius: 999, padding: '4px 10px'
+            color: '#ffffff', background: 'rgba(13,23,48,.97)',
+            border: '1px solid #ffffff', borderRadius: 999, padding: '4px 10px'
           }}
         >
           CLOSE ALL ✕

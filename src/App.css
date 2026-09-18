@@ -166,6 +166,14 @@ a:hover {
   50%      { box-shadow: 0 0 0 2px rgba(255, 255, 255, .95); }
 }
 
+/* "The table I mean is THIS one." Fired when a tab that needs a token is
+ * clicked with nothing selected. Returns to the resting border colour at 100%
+ * so the table looks untouched once the animation is removed. */
+@keyframes vsTablePing {
+  0%, 100% { border-color: #1c2a4d; box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+  50%      { border-color: #ffffff; box-shadow: 0 0 0 3px rgba(255, 255, 255, .3); }
+}
+
 @keyframes vsFlash {
   0% { background: rgba(227,95,242,.20); }
   100% { background: transparent; }

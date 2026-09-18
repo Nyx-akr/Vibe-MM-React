@@ -5,6 +5,7 @@ import { shortAddress, normalizeRegistry } from '../data/wallet-registry';
 import {
   walletIntelForPool, walletProfile, walletIntelStatus, recentClusters,
 } from '../services/wallet-intel';
+import { walletQualityScore } from '../calculations/core';
 
 /**
  * The wallet read on ONE token.
@@ -172,6 +173,21 @@ export function walletsVals(app, sel) {
   const counts = source.counts;
   const filter = st.walletFilter || 'ALL';
 
+  // WALLET QUALITY is produced by the wallets module (walletQualityScore in
+  // core.js) and consumed by the score model - not the other way round.
+  //
+  // The scoring pass runs it for every row with the fullest input set it has,
+  // and the result rides along on the asset, so the preferred move here is to
+  // display that object rather than run the function again: recomputing with
+  // whatever context this tab happens to hold produced a DIFFERENT number for
+  // the same token whenever the provider holder list was missing and only the
+  // score's Jupiter fallback filled the gap. Recomputing locally is the
+  // fallback, for a pool the board has not scored.
+  const quality = sel.walletQuality || walletQualityScore(source, {
+    topHolderSharePct: source.holderSharePct,
+    holderSource: source.holderSharePct === null ? null : 'GoPlus, pool excluded',
+  });
+
   // The pool contract trades against everybody, so it is excluded from the
   // behavioural table; it stays visible in the holder panel, labelled.
   const visible = source.rows.filter((r) => !r.isPool)
@@ -250,10 +266,12 @@ export function walletsVals(app, sel) {
     };
   });
 
+  // The label says what the grade MEANS, not just how strong it is: "LOW" on
+  // its own reads like a defect rather than like a weak-but-real signal.
   const CONF = {
-    high: { fg: '#ff4fae', bd: '#45103a', bg: '#150a18', label: 'HIGH CONFIDENCE' },
-    medium: { fg: '#e35ff2', bd: '#33124a', bg: '#130a1a', label: 'MEDIUM' },
-    low: { fg: '#a89bff', bd: '#2a2360', bg: '#0d0b1c', label: 'LOW' },
+    high: { fg: '#ff4fae', bd: '#45103a', bg: '#150a18', label: 'LIKELY ONE OPERATOR' },
+    medium: { fg: '#e35ff2', bd: '#33124a', bg: '#130a1a', label: 'POSSIBLY COORDINATED' },
+    low: { fg: '#a89bff', bd: '#2a2360', bg: '#0d0b1c', label: 'WEAK — COULD BE COINCIDENCE' },
   };
   const clusterPanel = source.clusters.map((c, i) => {
     const conf = CONF[c.confidence] || CONF.low;
@@ -270,6 +288,8 @@ export function walletsVals(app, sel) {
         ? c.exit.wallets + ' of them sold together ' + dur(c.exit.afterMs) + ' later'
         : null,
       gross: fmtUsd(c.grossUsd),
+      // What the grade is actually based on, so it can be argued with.
+      why: (c.reasons || []).join(' · '),
     };
   });
 
@@ -296,6 +316,28 @@ export function walletsVals(app, sel) {
       (w.spanMinutes === null ? 'unknown span' : 'last ' + dur(w.spanMinutes * 60000)) +
       ' · sampled ' + ago(source.sampledAt),
     windowPool: shortAddress(source.poolAddress),
+
+    // The number this tab sends to the score. Computed here, from this tab's
+    // own data, by the same function the score model calls - so the figure
+    // below and the "Wallet quality" line on ASSET DETAIL cannot disagree.
+    quality: {
+      ...quality,
+      color: quality.score === null ? UNAVAILABLE
+        : quality.grade === 'strong' ? '#4fd6c1'
+          : quality.grade === 'fair' ? '#ffbe4d' : '#ff4fae',
+      gradeLabel: quality.score === null ? 'NOT MEASURED'
+        : quality.grade === 'strong' ? 'CLEAN' : quality.grade === 'fair' ? 'MIXED' : 'POOR',
+      barParts: quality.parts.map((p) => ({
+        ...p,
+        pct: p.value === null ? 0 : p.value,
+        barW: (p.value === null ? 0 : p.value) + '%',
+        valueTxt: p.value === null ? '—' : String(p.value),
+        color: p.value === null ? UNAVAILABLE
+          : p.value >= 70 ? '#4fd6c1' : p.value >= 45 ? '#ffbe4d' : '#ff4fae',
+        noteTxt: p.note || 'not measurable from this sample',
+      })),
+      coverageTxt: quality.measured + ' of ' + quality.total + ' checks measurable',
+    },
 
     walletStats: [
       stat('ACTIVE WALLETS', w.wallets, '#ffffff',
@@ -328,9 +370,15 @@ export function walletsVals(app, sel) {
       ? 'Top holders by share of supply, from GoPlus. The pool contract itself is labelled rather than counted as a whale.'
       : 'No provider returned a holder list for this token.',
     clusterPanel,
+    // What the panel is FOR, in one line, above the findings - because a box
+    // of numbers with no stated purpose is just noise on the screen.
+    clustersPurpose: 'Groups of wallets acting as one. One person running many ' +
+      'wallets can fake buyer demand: the volume and holder count look real ' +
+      'because the addresses are real. These are the groups that gave ' +
+      'themselves away by moving together.',
     clustersNote: source.clusters.length
-      ? 'Wallets whose first trade landed together, for near-identical size, more often than this pool’s own arrival rate explains.'
-      : 'No co-ordinated entry in this window. Wallets arrived at the rate and in the sizes you would expect from unrelated traders.',
+      ? 'Detected by comparing each burst against this pool’s own arrival rate, then checking whether the same wallets also left as a group. Treat their buying as one buyer, not many.'
+      : 'No co-ordinated entry in this window. Wallets arrived at the rate and in the sizes you would expect from unrelated traders — which is the good case.',
     rotationNote: source.poolsCompared
       ? 'Cross-pool overlap is measured against ' + source.poolsCompared + ' other pools sampled on ' + source.chain + '.'
       : 'No other pools sampled on this chain yet, so cross-pool overlap cannot be measured.',
@@ -414,6 +462,45 @@ export default function Wallets({ v, css }) {
         <span style={css('width:6px;height:6px;border-radius:50%;background:' + (v.intelLive ? '#4fd6c1' : '#6b7699') + ';display:inline-block;flex:0 0 auto', { v })} />
         <span style={css('letter-spacing:.5px', { v })}>WALLET MEMORY — {v.intelLine}</span>
       </div>
+
+      {/* The verdict this tab produces, and what it is made of. */}
+      <div style={css(CARD + ';padding:12px 14px;margin-bottom:10px;display:grid;grid-template-columns:168px 1fr;gap:16px;align-items:center', { v })}>
+        <div>
+          <div style={css(CAP, { v })}>WALLET QUALITY</div>
+          <div style={css('display:flex;align-items:baseline;gap:7px;margin-top:2px', { v })}>
+            <span style={css('font-size:34px;font-weight:800;line-height:1;color:{{ v.quality.color }}', { v })}>{v.quality.score === null ? '—' : v.quality.score}</span>
+            <span style={css('font-size:11px;color:#6b7699', { v })}>/100</span>
+          </div>
+          <div style={css('font-size:9px;font-weight:800;letter-spacing:.8px;margin-top:4px;color:{{ v.quality.color }}', { v })}>{v.quality.gradeLabel}</div>
+          <div style={css('font-size:8.5px;color:#6b7699;margin-top:3px', { v })}>{v.quality.coverageTxt}</div>
+          <div style={css('font-size:8.5px;color:#8f7bff;margin-top:5px;line-height:1.4', { v })}>sent to ASSET DETAIL as the wallet-quality input</div>
+        </div>
+
+        <div style={css('display:grid;grid-template-columns:repeat(4,1fr);gap:12px;min-width:0', { v })}>
+          {v.quality.barParts.map((p) => (
+            <div key={p.key} style={css('min-width:0', { v, p })}>
+              <div style={css('display:flex;justify-content:space-between;align-items:baseline;gap:5px', { v, p })}>
+                <span style={css('font-size:9px;color:#8b96b8;letter-spacing:.4px', { v, p })}>{p.label}</span>
+                <span style={css('font-size:11px;font-weight:700;color:{{ p.color }}', { v, p })}>{p.valueTxt}</span>
+              </div>
+              <div style={css('height:5px;background:#0d1730;border-radius:3px;margin:4px 0 3px;overflow:hidden', { v, p })}>
+                <div style={css('height:100%;width:{{ p.barW }};background:{{ p.color }}', { v, p })} />
+              </div>
+              <div style={css('font-size:8px;color:#6b7699;line-height:1.4', { v, p })}>{p.noteTxt}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {v.quality.modifiers.length > 0 && (
+        <div style={css('display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 10px', { v })}>
+          {v.quality.modifiers.map((m, i) => (
+            <span key={i} style={css('font-size:8.5px;font-weight:700;padding:3px 9px;border-radius:999px;background:' + (m.effect < 0 ? '#3a1533' : '#0d2f3a') + ';color:' + (m.effect < 0 ? '#ff8fa3' : '#4fd6c1'), { v, m })}>
+              {m.label} {m.effect > 0 ? '+' : ''}{m.effect}%
+            </span>
+          ))}
+        </div>
+      )}
 
       <div style={css('display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px', { v })}>
         {v.walletStats.map((s, i) => (
@@ -509,7 +596,8 @@ export default function Wallets({ v, css }) {
           </div>
 
           <div style={css(CARD + ';padding:12px', { v })}>
-            <div style={css(CAP + ';margin-bottom:8px', { v })}>CO-ORDINATED ENTRY</div>
+            <div style={css(CAP, { v })}>CO-ORDINATED ENTRY</div>
+            <div style={css('font-size:9px;color:#8b96b8;line-height:1.55;margin:5px 0 9px', { v })}>{v.clustersPurpose}</div>
             {v.clusterPanel.map((c) => (
               <div key={c.key} style={css('padding:7px 9px;border:1px solid {{ c.bd }};background:{{ c.bg }};border-radius:8px;margin-bottom:6px', { v, c })}>
                 <div style={css('display:flex;justify-content:space-between;gap:6px;align-items:center', { v, c })}>
@@ -520,6 +608,7 @@ export default function Wallets({ v, css }) {
                 <div style={css('font-size:9px;color:#8b96b8;margin-top:3px', { v, c })}>{c.detail}</div>
                 {c.exit && <div style={css('font-size:9px;color:{{ c.fg }};margin-top:1px', { v, c })}>{c.exit}</div>}
                 <div style={css('font-size:9px;color:#6b7699;margin-top:1px', { v, c })}>{c.gross} traded by the group</div>
+                <div style={css('font-size:8.5px;color:#6b7699;margin-top:4px;padding-top:4px;border-top:1px solid #1c2a4d;line-height:1.5', { v, c })}>graded on: {c.why}</div>
               </div>
             ))}
             <div style={css('font-size:9px;color:#6b7699;line-height:1.6', { v })}>{v.clustersNote}</div>
@@ -527,7 +616,8 @@ export default function Wallets({ v, css }) {
             {/* Found on other tokens by the background service, whether or not
                 this tab was open at the time. */}
             {v.elsewhereClusters.length > 0 && <>
-              <div style={css('font-size:8.5px;letter-spacing:.8px;color:#6b7699;font-weight:600;margin:10px 0 5px;padding-top:8px;border-top:1px solid #16223f', { v })}>SEEN ON OTHER TOKENS</div>
+              <div style={css('font-size:8.5px;letter-spacing:.8px;color:#6b7699;font-weight:600;margin:10px 0 3px;padding-top:8px;border-top:1px solid #16223f', { v })}>SEEN ON OTHER TOKENS</div>
+              <div style={css('font-size:8.5px;color:#6b7699;margin-bottom:5px;line-height:1.5', { v })}>Found by the background service while you were elsewhere. Same test, other pools — worth knowing before you open them.</div>
               {v.elsewhereClusters.map((e) => (
                 <div key={e.key} style={css('display:flex;justify-content:space-between;gap:6px;padding:3px 0;font-size:9px', { v, e })}>
                   <span style={css('font-weight:700;color:{{ e.fg }}', { v, e })}>{e.sym}</span>

@@ -22,9 +22,7 @@ import { defaultWalletRegistry, normalizeRegistry } from './data/wallet-registry
 import { nextTape } from './services/live-feed';
 import {
   fetchLiveMarketData,
-  fetchLiveRotationData,
   fetchLiveWalletData,
-  fetchLiveSocialData,
   fetchLiveEvalData,
   fetchLiveSystemData,
   fetchLiveTokenIntel,
@@ -34,6 +32,12 @@ import {
 import {
   startWalletIntel, stopWalletIntel, onWalletIntel, walletIntelStatus,
 } from './services/wallet-intel';
+import {
+  startSocialIntel, stopSocialIntel, onSocialIntel,
+} from './services/social-intel';
+import {
+  startRotationIntel, stopRotationIntel, onRotationIntel,
+} from './services/rotation-intel';
 import AppHeader from './components/AppHeader';
 import SelectAssetPrompt from './components/SelectAssetPrompt';
 import SideNav from './components/SideNav';
@@ -54,12 +58,14 @@ const TOAST_VISIBLE = 3;
 const TOAST_BACKLOG = 12;
 /** How long the opened card keeps blinking before it settles. */
 const ALERT_PING_MS = 1800;
+/** How long the feed table keeps blinking after a disabled tab is clicked. */
+const TABLE_PING_MS = 1900;
 
-const SELECTION_TABS = { detail: 'ASSET DETAIL', rotation: 'ROTATION', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
+const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
 
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', watch: {}, soundOn: false, toasts: [], alertPing: null, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
+    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
     try { const w = JSON.parse(localStorage.getItem('vs_watchlist') || 'null'); if (w) this.state.watch = w; } catch (e) { }
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
@@ -97,10 +103,7 @@ class App extends React.Component {
 
         const chain = this.state.chainF !== 'ALL' ? (chainNameToKey[this.state.chainF] || 'solana') : 'solana';
 
-        if (this.state.page === 'rotation') {
-          const rotationData = await fetchLiveRotationData(chain);
-          if (rotationData) this.setState({ apiRotation: rotationData });
-        } else if (this.state.page === 'wallets') {
+        if (this.state.page === 'wallets') {
           // Wallets reads ONE pool's trades, so it follows the selection, not
           // the chain filter - and it follows the selected token's own chain,
           // which is not necessarily the one the filter is pointing at.
@@ -111,12 +114,6 @@ class App extends React.Component {
             ? await fetchLiveWalletData(walletChain, selected, this.trackedAddresses())
             : null;
           this.setState({ apiWallets: walletData });
-        } else if (this.state.page === 'social') {
-          // The scanner reads one token at a time, so only the selected one
-          // is measured. Without a selection the page shows the picker.
-          const selected = this.assets.find((x) => x.id === this.state.selectedId) || null;
-          const socialData = await fetchLiveSocialData(chain, selected);
-          if (socialData) this.setState({ apiSocial: socialData });
         } else if (this.state.page === 'eval') {
           const evalData = await fetchLiveEvalData(chain);
           if (evalData) this.setState({ apiEval: evalData });
@@ -131,9 +128,7 @@ class App extends React.Component {
         this.assets = [];
         this.setState({
           serverError: true,
-          apiRotation: null,
           apiWallets: null,
-          apiSocial: null,
           apiEval: null,
           apiSystem: null
         });
@@ -142,9 +137,7 @@ class App extends React.Component {
       this.assets = [];
       this.setState({
         serverError: true,
-        apiRotation: null,
         apiWallets: null,
-        apiSocial: null,
         apiEval: null,
         apiSystem: null
       });
@@ -169,6 +162,30 @@ class App extends React.Component {
     // Re-render on new wallet findings; the tick is throttled, not per-trade.
     this.offWalletIntel = onWalletIntel(() => {
       if (this.state.page === 'wallets') this.setState({ walletIntelAt: Date.now() });
+    });
+
+    // Social intelligence runs on the same terms: every token on the board is
+    // measured every tick whether or not the SOCIAL SCANNER is open, so the
+    // mention history keeps building instead of restarting on each visit and
+    // any module can ask about a ticker at any time.
+    startSocialIntel({
+      baseUrl: API_ORIGIN,
+      chains: chainKeys,
+      getSymbols: () => this.assets.map((a) => ({
+        symbol: (a.rawServerRow && a.rawServerRow.symbol) || a.sym,
+      })),
+    });
+    this.offSocialIntel = onSocialIntel(() => {
+      if (this.state.page === 'social') this.setState({ socialIntelAt: Date.now() });
+    });
+
+    // Rotation runs on the same terms, and costs nothing extra: it attaches
+    // to the trade samples wallet intelligence is already reading, so the
+    // graph for every chain is standing ready before the tab is opened and
+    // any module can ask what a pool is rotating into.
+    startRotationIntel();
+    this.offRotationIntel = onRotationIntel(() => {
+      if (this.state.page === 'rotation') this.setState({ rotationIntelAt: Date.now() });
     });
 
     for (let i = 0; i < 7; i++) this.pushTape(false);
@@ -229,13 +246,33 @@ class App extends React.Component {
     });
   }
 
+  /**
+   * Answer to clicking a tab that needs a token when none is picked. Pointing
+   * at the table is no use from another tab, so this goes to the feed first and
+   * then blinks the table there - the instruction and the thing it refers to
+   * end up on screen together.
+   */
+  promptSelectAsset() {
+    clearTimeout(this.tablePingTimer);
+    // Restart the animation even if it is already running.
+    this.setState({ page: 'live', tablePing: false }, () => {
+      this.setState({ tablePing: true });
+      this.tablePingTimer = setTimeout(() => this.setState({ tablePing: false }), TABLE_PING_MS);
+    });
+  }
+
   componentWillUnmount() {
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
     clearInterval(this.apiTimer);
     clearTimeout(this.pingTimer);
+    clearTimeout(this.tablePingTimer);
     if (this.offWalletIntel) this.offWalletIntel();
     stopWalletIntel();
+    if (this.offSocialIntel) this.offSocialIntel();
+    stopSocialIntel();
+    if (this.offRotationIntel) this.offRotationIntel();
+    stopRotationIntel();
   }
   beep() { try { const ctx = this.audioCtx || (this.audioCtx = new (window.AudioContext || window.webkitAudioContext)()); const o = ctx.createOscillator(), g = ctx.createGain(); o.connect(g); g.connect(ctx.destination); o.frequency.value = 880; g.gain.setValueAtTime(0.08, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35); o.start(); o.stop(ctx.currentTime + 0.36); } catch (e) { } }
   simTick() {
@@ -360,9 +397,13 @@ class App extends React.Component {
       label, arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
       sort: k ? () => this.setState(s => ({ sortKey: k, sortDir: s.sortKey === k ? -s.sortDir : -1 })) : () => { }
     }));
+    // Typed once here rather than per row - $ is stripped from both sides so
+    // "cate" matches $CATE and "$cate" matches it too.
+    const q = st.searchQ.trim().toLowerCase().replace(/\$/g, '');
     const filtered = this.assets.filter(a => {
       if (st.chainF !== 'ALL' && a.chain !== st.chainF) return false;
       if (st.classF !== 'ALL' && a.cls !== st.classF) return false;
+      if (q && (a.sym + ' ' + a.name).toLowerCase().replace(/\$/g, '').indexOf(q) === -1) return false;
       if (st.viewF === 'WATCHLIST' && !st.watch[a.id]) return false;
       if (st.viewF === 'CONFIRMED' && a.stage < 3) return false;
       if (st.viewF === 'EXPERIMENTAL' && a.liq >= 60000) return false;
@@ -382,9 +423,16 @@ class App extends React.Component {
       const tr = a.spark.slice(-14); const tMax = Math.max(...tr), tMin = Math.min(...tr);
       const spMax = Math.max(...a.spark), spMin = Math.min(...a.spark);
       return {
-        // Clicking anywhere on the row opens this token in the Asset Detail tab.
-        open: () => this.setState({ page: 'detail', selectedId: a.id }),
+        // Clicking a row FOCUSES the token - it does not navigate. You stay in
+        // the feed, the eye lights up, and the row opens to offer the scoped
+        // tabs. Jumping straight to Asset Detail used to cost you your place in
+        // the table every time you wanted a second look at something.
+        open: () => this.setState((s) => s.expandedId === a.id
+          ? { expandedId: null }
+          : { expandedId: a.id, selectedId: a.id }),
         goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
+        goSocial: () => this.setState({ page: 'social', selectedId: a.id }),
+        goWallets: () => this.setState({ page: 'wallets', selectedId: a.id }),
         star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
         // A tint alone reads as "slightly different row" at a glance. The white
         // ring is the thing that actually locates the selection - drawn inset so
@@ -428,35 +476,37 @@ class App extends React.Component {
     // Nav mirrors SELECTION_TABS: everything asset-scoped hangs off ASSET DETAIL,
     // everything else is app-wide. Deriving `child` from the same map keeps the
     // sidebar honest if a tab later changes scope.
-    const navItem = (k, label) => {
+    // One flat list. The three token-scoped tabs are indented under LIVE
+    // OPPORTUNITIES because that is where you pick the token they describe -
+    // the indent carries the relationship, so no group headers are needed and
+    // the items can stay one word each.
+    const navItem = (k, label, child) => {
       const active = st.page === k;
-      const child = Boolean(SELECTION_TABS[k]) && k !== 'detail';
+      const scoped = Boolean(SELECTION_TABS[k]);
+      // A scoped tab with nothing selected has nothing to show, so it does not
+      // open at all - it sends you to where the choice is actually made and
+      // flags the table, rather than dumping you on an empty page.
+      const disabled = scoped && !sel;
       return {
-        label, child, go: nav(k),
+        label, child: !!child, disabled,
+        go: disabled ? () => this.promptSelectAsset() : nav(k),
+        hint: disabled ? 'Choose an asset from Live Opportunities' : '',
         indent: child ? 30 : 16,
-        fg: active ? '#e35ff2' : (child && !sel ? '#5c6684' : '#8b96b8'),
+        fg: active ? '#e35ff2' : (disabled ? '#4a5473' : '#8b96b8'),
         tickC: active ? '#e35ff2' : '#39445f',
         line: active ? '#e35ff2' : 'transparent',
         bg: active ? 'rgba(227,95,242,0.07)' : 'transparent'
       };
     };
-    const navGroups = [
-      {
-        title: 'MARKET', items: [
-          navItem('live', 'LIVE OPPORTUNITIES'),
-          navItem('detail', 'ASSET DETAIL'),
-          navItem('social', 'SOCIAL SCANNER'),
-          navItem('wallets', 'WALLETS'),
-          navItem('rotation', 'ROTATION')
-        ]
-      },
-      {
-        title: 'SYSTEM', items: [
-          navItem('alerts', 'ALERT CARDS'),
-          navItem('eval', 'EVALUATION'),
-          navItem('health', 'SYSTEM HEALTH')
-        ]
-      }
+    const navItems = [
+      navItem('live', 'LIVE OPPORTUNITIES'),
+      navItem('detail', 'DETAIL', true),
+      navItem('social', 'SOCIAL', true),
+      navItem('wallets', 'WALLETS', true),
+      navItem('rotation', 'ROTATION'),
+      navItem('alerts', 'ALERTS'),
+      navItem('eval', 'EVALUATION'),
+      navItem('health', 'HEALTH')
     ];
     const d = detailVals(this, sel, showAdj, {
       intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs
@@ -488,7 +538,8 @@ class App extends React.Component {
     ];
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
-      clock: st.clock, navGroups,
+      clock: st.clock, navItems,
+      tablePingAnim: st.tablePing ? 'vsTablePing .62s ease-in-out 3' : 'none',
       liveDotColor: st.serverError ? '#ff4fae' : (live ? '#4d8dff' : '#e35ff2'),
       liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),
@@ -504,6 +555,10 @@ class App extends React.Component {
       isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
       goLive: nav('live'), stats, headers, rows, tape, d, rowCount: rows.length,
       views, chainFilters, classFilters,
+      searchQ: st.searchQ,
+      onSearch: (e) => this.setState({ searchQ: e.target.value }),
+      clearSearch: () => this.setState({ searchQ: '' }),
+      hasSearch: st.searchQ.trim().length > 0,
       isAlerts: st.page === 'alerts', isSocial: st.page === 'social', isWallets: st.page === 'wallets',
       toggleSound: () => this.setState(s => ({ soundOn: !s.soundOn })),
       soundLabel: st.soundOn ? 'SOUND ON' : 'SOUND OFF', soundFg: st.soundOn ? '#f06ee2' : '#6b7699',
@@ -579,10 +634,10 @@ class App extends React.Component {
               <AlertCards v={v} css={css} />
               {v.needsSelection ? <SelectAssetPrompt v={v} css={css} /> : (<>
                 <AssetDetail v={v} css={css} />
-                <Rotation v={v} css={css} />
                 <Wallets v={v} css={css} />
                 <SocialScanner v={v} css={css} />
               </>)}
+              <Rotation v={v} css={css} />
               <Evaluation v={v} css={css} />
               <SystemHealth v={v} css={css} />
               </div>
