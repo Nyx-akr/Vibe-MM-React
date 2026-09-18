@@ -652,7 +652,7 @@ class App extends React.Component {
   render() {
     const v = this.renderVals(); return (
       <>
-        <div style={css("font-family:'Poppins',sans-serif;font-size:12px;background:linear-gradient(180deg,#03060f 0%,#081736 55%,#0c2b63 140%);min-height:100vh;display:flex;flex-direction:column", { v })}>
+        <div style={css("font-family:'Poppins',sans-serif;font-size:12px;background:#081736;min-height:100vh;display:flex;flex-direction:column", { v })}>
           <AppHeader v={v} css={css} />
           {v.serverError ? (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center' }}>

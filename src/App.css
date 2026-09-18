@@ -136,7 +136,9 @@
 html, body {
   margin: 0;
   padding: 0;
-  background: #04070f;
+  /* Matches the app shell, so overscroll and any gap below a short page show
+   * the same blue rather than the old near-black. */
+  background: #081736;
   color: #dfe6f6;
 }
 
