@@ -392,9 +392,28 @@ class App extends React.Component {
     const chainFilters = ['ALL'].concat(chainList.map((c) => c.name))
       .map(k => chainChip(k, st.chainF === k, () => this.setState({ chainF: k })));
     const classFilters = ['ALL', 'MEME', 'TOKEN'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
-    const cols = [[null, ''], ['stage', 'STAGE'], ['score', 'SCORE'], ['conf', 'CONF'], ['sym', 'ASSET'], ['chain', 'CHAIN'], ['cls', 'CLASS'], ['age', 'AGE'], ['price', 'PRICE'], ['chg', 'Δ5M'], ['liq', 'LIQ'], [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H'], ['buyers', 'BUYERS 5M'], ['nf', 'NET FLOW'], ['wash', 'WASH'], [null, 'VOL TREND'], [null, 'TOP REASON']];
-    const headers = cols.map(([k, label]) => ({
-      label, arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
+    // Ten columns, ordered by how much they matter - the feed drops the trailing
+    // ones as the window narrows (see .vs-feed-* in App.css). Seven of the old
+    // seventeen were folded into the cells they belong with rather than dropped:
+    // chain, class and age ride under the symbol, confidence under the score,
+    // Δ5M under the price, and buyers under net flow. Only TOP REASON left the
+    // row outright - it is a sentence, it never fit, and the expanded row has
+    // always shown the same triggers in full.
+    const cols = [
+      [null, '', 'mark'],
+      ['sym', 'ASSET', 'asset'],
+      ['stage', 'STAGE', 'stage'],
+      ['score', 'SCORE', 'score', true],
+      ['price', 'PRICE', 'price', true],
+      ['liq', 'LIQUIDITY', 'liq', true],
+      [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H', 'vol', true],
+      ['wash', 'WASH', 'risk', true],
+      ['nf', 'NET FLOW', 'flow', true],
+      [null, 'TREND', 'trend']
+    ];
+    const headers = cols.map(([k, label, col, num]) => ({
+      label, col, num: !!num, sortable: !!k,
+      arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
       sort: k ? () => this.setState(s => ({ sortKey: k, sortDir: s.sortKey === k ? -s.sortDir : -1 })) : () => { }
     }));
     // Typed once here rather than per row - $ is stripped from both sides so
@@ -421,7 +440,6 @@ class App extends React.Component {
     const rows = sorted.map(a => {
       const si = stageInfo(a.stage);
       const tr = a.spark.slice(-14); const tMax = Math.max(...tr), tMin = Math.min(...tr);
-      const spMax = Math.max(...a.spark), spMin = Math.min(...a.spark);
       return {
         // Clicking a row FOCUSES the token - it does not navigate. You stay in
         // the feed, the eye lights up, and the row opens to offer the scoped
@@ -444,8 +462,39 @@ class App extends React.Component {
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
         expanded: st.expandedId === a.id,
         trend: tr.map(v => ({ h: Math.round(15 + (v - tMin) / (tMax - tMin + 0.01) * 85) + '%', c: v >= tr[0] ? '#4d8dff' : '#ff4fae' })),
-        peekSpark: a.spark.map((v, i) => ({ h: Math.round(8 + (v - spMin) / (spMax - spMin + 0.01) * 92) + '%', c: i === a.spark.length - 1 ? '#e35ff2' : v >= (a.spark[i - 1] ?? v) ? '#2f66d0' : '#8a2f7c' })),
-        peekReasons: a.reasons.slice(0, 3).map(x => ({ code: x.code, text: x.text, z: x.z })),
+        // What the expanded row shows: the same figures the table carries, but
+        // every one of them captioned in words. The sparkline and the trigger
+        // codes it used to show were the two things nobody could read at a
+        // glance, and the columns the feed hides on a narrow window are exactly
+        // the ones worth spelling out here.
+        peekStats: [
+          { label: 'LIQUIDITY', value: fmtUsd(a.liq), sub: 'pool depth', color: '#dfe6f6' },
+          {
+            label: showAdj ? 'VOLUME 5M' : 'VOLUME 24H',
+            value: fmtUsd(showAdj ? a.adj : a.vol), sub: 'traded', color: '#dfe6f6'
+          },
+          {
+            label: 'BUYERS 5M', value: a.buyers == null ? '—' : String(a.buyers),
+            sub: 'separate wallets', color: '#dfe6f6'
+          },
+          {
+            label: 'NET FLOW', value: fmtUsd(a.nf), sub: a.nf >= 0 ? 'more in than out' : 'more out than in',
+            color: a.nf >= 0 ? '#4d8dff' : '#ff4fae'
+          },
+          {
+            label: 'PRICE 5M', value: (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
+            sub: 'move this bar', color: a.chg >= 0 ? '#4d8dff' : '#ff4fae'
+          },
+          {
+            label: 'WASH', value: a.wash == null ? '—' : Math.round(a.wash * 100) + '%',
+            // A percentage means nothing without knowing which way is good.
+            sub: a.wash == null ? 'not measured yet'
+              : a.wash < 0.15 ? 'looks like real trading'
+                : a.wash < 0.35 ? 'some self-trading' : 'mostly self-trading',
+            color: a.wash == null ? '#3a4568' : washColor(a.wash)
+          },
+          { label: 'AGE', value: fmtAge(a.age), sub: 'since the pool opened', color: '#dfe6f6' }
+        ],
         peekFlags: a.flags.slice(0, 2).map(f => ({ sev: f.sev, bg: sevMap[f.sev].bg, fg: sevMap[f.sev].fg, text: f.text })),
         anim: st.flashId === a.id ? 'vsFlash 1.2s ease-out' : 'none',
         stage: si.n, stageBg: si.bg, stageFg: si.fg,

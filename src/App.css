@@ -166,6 +166,88 @@ a:hover {
   50%      { box-shadow: 0 0 0 2px rgba(255, 255, 255, .95); }
 }
 
+/* ==================================================== live feed table ==== */
+/*
+ * The feed used to declare seventeen fixed-width columns inside a
+ * min-width:1500px wrapper, so every window narrower than that got a
+ * horizontal scrollbar and half the data lived off-screen.
+ *
+ * Instead the table sheds its least-important columns as the window narrows.
+ * A display:none cell leaves the grid flow entirely, so the visible cells fill
+ * the tracks in DOM order: each breakpoint's template lists widths in the order
+ * the cells that SURVIVE it appear, not the order of all ten.
+ *
+ * Priority order: identity and score always survive; liquidity and volume go
+ * next; then wash, net flow, and the trend sparkline last.
+ */
+.vs-feed-head,
+.vs-feed-row {
+  display: grid;
+  grid-template-columns: 38px minmax(104px, 1.7fr) 62px 96px;
+  gap: 0 10px;
+  align-items: center;
+}
+
+.vs-feed-c-stage,
+.vs-feed-c-liq,
+.vs-feed-c-vol,
+.vs-feed-c-risk,
+.vs-feed-c-flow,
+.vs-feed-c-trend { display: none; }
+
+/* Stage is a word-width badge, so it is the first thing worth its space once
+ * there is any to spare. Below this the row is identity, score and price. */
+@media (min-width: 900px) {
+  .vs-feed-head,
+  .vs-feed-row { grid-template-columns: 38px minmax(120px, 1.7fr) 88px 62px 104px; }
+  .vs-feed-c-stage { display: block; }
+}
+
+@media (min-width: 1040px) {
+  .vs-feed-head,
+  .vs-feed-row { grid-template-columns: 38px minmax(130px, 1.7fr) 88px 62px 104px 92px 98px; }
+  .vs-feed-c-liq,
+  .vs-feed-c-vol { display: block; }
+}
+
+@media (min-width: 1260px) {
+  .vs-feed-head,
+  .vs-feed-row { grid-template-columns: 38px minmax(140px, 1.7fr) 88px 62px 104px 92px 98px 68px; }
+  .vs-feed-c-risk { display: block; }
+}
+
+@media (min-width: 1440px) {
+  .vs-feed-head,
+  .vs-feed-row { grid-template-columns: 38px minmax(150px, 1.7fr) 88px 62px 104px 92px 98px 68px 100px; }
+  .vs-feed-c-flow { display: block; }
+}
+
+@media (min-width: 1640px) {
+  .vs-feed-head,
+  .vs-feed-row { grid-template-columns: 38px minmax(160px, 1.7fr) 88px 62px 104px 92px 98px 68px 100px 78px; }
+  .vs-feed-c-trend { display: flex; }
+}
+
+/* The expanded row's statistics. auto-fit rather than a fixed count: the tiles
+ * reflow instead of squeezing, so each caption stays on one or two lines. */
+.vs-peek-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 10px 14px;
+}
+
+/* Figures line up digit-for-digit down the column, so magnitudes are
+ * comparable by eye instead of by reading each number. */
+.vs-feed-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Row hover lives here rather than inline: an inline background would win the
+ * cascade and the hover would never show. Selected rows set their own
+ * background inline and so opt out of this. */
+.vs-feed-row:hover { background: #101c38; }
+
 /* "The table I mean is THIS one." Fired when a tab that needs a token is
  * clicked with nothing selected. Returns to the resting border colour at 100%
  * so the table looks untouched once the animation is removed. */
