@@ -598,9 +598,21 @@ export function rotationGraph(walletSets) {
     const touching = edges.filter((x) => x.fromPool === key || x.toPool === key);
     let inUsd = 0;
     let outUsd = 0;
+    // Pools this one actually sent to / received from, counted per DIRECTION
+    // rather than per edge. An edge is filed under whichever way the larger
+    // share went, so a pool that mostly received from a peer but also sent some
+    // back still belongs in both counts. Counting edges by their dominant side
+    // instead is how "LEFT $36" ends up captioned "3 destinations" when most of
+    // that $36 went to pools filed on the inbound side.
+    let sentTo = 0;
+    let receivedFrom = 0;
     touching.forEach((x) => {
-      if (x.targetPool === key) { inUsd += x.dominantUsd; outUsd += x.counterUsd; }
-      else { outUsd += x.dominantUsd; inUsd += x.counterUsd; }
+      const gained = x.targetPool === key ? x.dominantUsd : x.counterUsd;
+      const gave = x.targetPool === key ? x.counterUsd : x.dominantUsd;
+      inUsd += gained;
+      outUsd += gave;
+      if (gained > 0) receivedFrom += 1;
+      if (gave > 0) sentTo += 1;
     });
     return {
       symbol: symbolOf(key, entry),
@@ -613,7 +625,37 @@ export function rotationGraph(walletSets) {
       inUsd: Math.round(inUsd),
       outUsd: Math.round(outUsd),
       netRotationUsd: Math.round(inUsd - outUsd),
+      // Counts that match inUsd / outUsd exactly, so a caller can caption one
+      // with the other without the two describing different sets.
+      receivedFrom,
+      sentTo,
       sampledAt: entry.at,
+      // This pool's own counterparties, carried on the node because `edges` is
+      // truncated below for display. A per-token view reading the trimmed list
+      // would silently lose the peers of any pool outside the biggest 40 pairs
+      // - which, on a well-sampled chain, is most of them.
+      peers: touching
+        .map((x) => {
+          const outbound = x.sourcePool === key;
+          const otherKey = outbound ? x.targetPool : x.sourcePool;
+          const otherEntry = walletSets.get(otherKey);
+          return {
+            symbol: outbound ? x.target : x.source,
+            poolAddress: otherKey,
+            // Which way the larger share of the rotated USD actually went.
+            direction: outbound ? 'out' : 'in',
+            rotatedUsd: x.rotatedUsd,
+            // Signed from THIS pool's point of view, so a caller can sort by
+            // "who took the most from me" without re-deriving the sign.
+            netUsd: outbound ? -x.dominantUsd + x.counterUsd : x.dominantUsd - x.counterUsd,
+            sharedWallets: x.sharedWallets,
+            overlapPct: x.overlapPct,
+            directionality: x.directionality,
+            parallelUsd: x.parallelUsd,
+            sampledAt: otherEntry ? otherEntry.at : null,
+          };
+        })
+        .sort((a, b) => b.rotatedUsd - a.rotatedUsd),
     };
   }).sort((x, y) => (y.rotatedUsd - x.rotatedUsd) || (y.sharedUsd - x.sharedUsd));
 

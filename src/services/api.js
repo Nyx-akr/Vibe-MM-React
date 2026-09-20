@@ -28,10 +28,61 @@ import {
 import { walletIntelForPool } from './wallet-intel';
 
 // Vercel serves this app as static files with no backend, so API calls need an
-// absolute URL to the data server. Override with VITE_API_BASE (e.g.
-// http://127.0.0.1:8787 to run against a local server).
-const BASE_URL = (import.meta.env.VITE_API_BASE || 'https://vibe-mm-server.onrender.com')
+// absolute URL to the data server. Override with VITE_API_BASE.
+const REMOTE_BASE = (import.meta.env.VITE_API_BASE || 'https://vibe-mm-server.onrender.com')
   .replace(/\/+$/, '');
+const LOCAL_BASE = (import.meta.env.VITE_LOCAL_API_BASE || 'http://localhost:8787')
+  .replace(/\/+$/, '');
+
+// Live binding: importers see the value initApiBase() settles on.
+let BASE_URL = REMOTE_BASE;
+export let API_ORIGIN = REMOTE_BASE;
+
+/**
+ * In DEV ONLY, prefer a local data server when one is actually answering.
+ *
+ * This is how you see a server change before pushing it: run the server
+ * locally, reload, and the app reads from it. Stop it - or never start it -
+ * and the app falls back to the deployed one, which also keeps the app usable
+ * when the deployed server is down.
+ *
+ * Deliberately NOT done in production. On Vercel the fetch runs on the
+ * VISITOR'S machine, so `localhost` is their computer, never the dev box - it
+ * could only ever pick up whatever they happen to be running on that port.
+ * Add to that mixed-content blocking on an HTTPS page and a probe of a
+ * stranger's local port on every load, and the production answer is simply
+ * REMOTE_BASE.
+ *
+ * Call once, before the first request. Safe to call again; it re-probes.
+ */
+export async function initApiBase() {
+  if (!import.meta.env.DEV) {
+    BASE_URL = REMOTE_BASE;
+    API_ORIGIN = REMOTE_BASE;
+    return BASE_URL;
+  }
+  let chosen = REMOTE_BASE;
+  try {
+    // Short leash: a refused connection returns at once, but a filtered port
+    // would otherwise hang the whole startup behind fetch's default timeout.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`${LOCAL_BASE}/health`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' }
+    });
+    clearTimeout(timer);
+    if (res.ok) chosen = LOCAL_BASE;
+  } catch (e) {
+    // No local server, or it is not healthy - the deployed one it is.
+  }
+  BASE_URL = chosen;
+  API_ORIGIN = chosen;
+  return BASE_URL;
+}
+
+/** Which server the app settled on, for anything that wants to say so. */
+export const usingLocalApi = () => BASE_URL === LOCAL_BASE;
 
 async function fetchJson(url) {
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
@@ -538,4 +589,4 @@ export async function fetchCatalog() {
   return catalogPayload(SCORE_MODEL);
 }
 
-export const API_ORIGIN = BASE_URL;
+// API_ORIGIN is declared and kept current next to BASE_URL, above.

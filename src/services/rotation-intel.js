@@ -208,9 +208,11 @@ export function rotationChains() {
 /**
  * The chain with the most rotation right now.
  *
- * Used when the board filter is ALL: rotation is measured within one chain, so
- * "all chains" has no single graph to show, and picking the busiest is more
- * useful than defaulting to Solana and calling it the answer.
+ * Nothing consumes this today: the ROTATION tab is scoped to the selected
+ * token, so it reads that token's own chain rather than choosing one. Kept as
+ * part of this service's read API for anything chain-level that comes later -
+ * a market-regime strip, say - because the ranking is already computed by
+ * rotationChains() and throwing it away would only mean writing it again.
  */
 export function busiestRotationChain() {
   const ranked = rotationChains();
@@ -224,7 +226,7 @@ export function busiestRotationChain() {
  * Returns null when the pool is not in a graph yet, which is the honest answer
  * before the sampling rotation has reached it.
  */
-export function rotationForPool(poolAddress) {
+export function rotationForPool(poolAddress, { peerLimit = 12 } = {}) {
   if (!poolAddress) return null;
 
   let found = null;
@@ -238,20 +240,13 @@ export function rotationForPool(poolAddress) {
   if (!found) return null;
 
   const entry = byChain.get(chain);
-  const peers = (entry.graph.edges || [])
-    .filter((e) => e.fromPool === poolAddress || e.toPool === poolAddress)
-    .map((e) => {
-      const outbound = e.sourcePool === poolAddress;
-      return {
-        symbol: outbound ? e.target : e.source,
-        poolAddress: outbound ? e.targetPool : e.sourcePool,
-        direction: outbound ? 'out' : 'in',
-        rotatedUsd: e.rotatedUsd,
-        sharedWallets: e.sharedWallets,
-        overlapPct: e.overlapPct,
-      };
-    })
-    .sort((a, b) => b.rotatedUsd - a.rotatedUsd);
+  // Read from the node, not from graph.edges: that list is truncated for
+  // display, so filtering it would quietly drop the counterparties of any pool
+  // outside the biggest 40 pairs. rotationGraph() carries every pool's own
+  // peers on its node for exactly this caller.
+  const peers = found.peers || [];
+  const inAll = peers.filter((p) => p.direction === 'in' && p.rotatedUsd > 0);
+  const outAll = peers.filter((p) => p.direction === 'out' && p.rotatedUsd > 0);
 
   const memory = byPool.get(poolAddress) || null;
 
@@ -268,7 +263,30 @@ export function rotationForPool(poolAddress) {
     netRotationUsd: found.netRotationUsd,
     sampledAt: found.sampledAt,
     poolsCompared: Math.max(0, entry.graph.poolsSampled - 1),
-    peers: peers.slice(0, 5),
+    trades: found.trades,
+    peers: peers.slice(0, peerLimit),
+    peerCount: peers.length,
+    // Sliced PER DIRECTION, and counted before slicing.
+    //
+    // One combined top-N ranked by size hid whole directions: a pool with 20
+    // inbound peers and 1 outbound put the outbound one at rank 21, so a tab
+    // drawing the slice showed "0 destinations" beside a LEFT tile of $930 -
+    // money leaving for nowhere. The counts here describe every edge; the
+    // lists are what is small enough to draw.
+    inPeers: inAll.slice(0, peerLimit),
+    outPeers: outAll.slice(0, peerLimit),
+    inCount: inAll.length,
+    outCount: outAll.length,
+    // Counts that match inUsd / outUsd, as opposed to the two above which match
+    // the drawn lists. Both are needed, and they answer different questions: a
+    // tile captions the money, a diagram caption describes the paths it had
+    // room to draw.
+    receivedFrom: found.receivedFrom,
+    sentTo: found.sentTo,
+    // The window this pool's figures describe, carried alongside them so a
+    // caller never has to reach back into the graph to caption its own numbers.
+    firstTradeAt: entry.graph.firstTradeAt,
+    lastTradeAt: entry.graph.lastTradeAt,
     // Cross-tick context: null until the service has watched it for a while.
     firstRotatingAt: memory && memory.firstRotatingAt,
     peakRotatedUsd: memory && memory.peakRotatedUsd,

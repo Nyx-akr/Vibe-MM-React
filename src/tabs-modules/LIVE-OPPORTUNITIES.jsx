@@ -117,10 +117,23 @@ export default function LiveOpportunities({ v, css }) {
                   </div>
                 )}
 
+                {/* One jump per token-scoped tab, in sidebar order. They are
+                    peers, so they are drawn as peers: DETAIL used to carry a
+                    gradient fill and every label an arrow, which made one
+                    destination look like the primary action and the rest like
+                    afterthoughts. */}
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
-                  <div onClick={r.goDetail} style={{ padding: '5px 14px', borderRadius: 999, background: 'linear-gradient(135deg,#2b6bff,#e35ff2)', color: '#ffffff', fontSize: 10, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}>DETAIL →</div>
-                  <div className="hf6f5791f" onClick={r.goSocial} style={{ padding: '5px 14px', borderRadius: 999, border: '1px solid #1c2a4d', color: '#b6c2de', fontSize: 10, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}>SOCIAL →</div>
-                  <div className="hf6f5791f" onClick={r.goWallets} style={{ padding: '5px 14px', borderRadius: 999, border: '1px solid #1c2a4d', color: '#b6c2de', fontSize: 10, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}>WALLETS →</div>
+                  {[
+                    ['DETAIL', r.goDetail],
+                    ['SOCIAL', r.goSocial],
+                    ['WALLETS', r.goWallets],
+                    ['ROTATION', r.goRotation],
+                  ].map(([label, go]) => (
+                    <div
+                      key={label} className="hf6f5791f" onClick={go}
+                      style={{ padding: '5px 14px', borderRadius: 999, border: '1px solid #1c2a4d', color: '#b6c2de', fontSize: 10, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                    >{label}</div>
+                  ))}
                 </div>
               </div>
             </>)}

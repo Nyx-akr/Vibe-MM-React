@@ -27,6 +27,8 @@ import {
   fetchLiveSystemData,
   fetchLiveTokenIntel,
   fetchLiveOhlcv,
+  initApiBase,
+  usingLocalApi,
   API_ORIGIN
 } from './services/api';
 import {
@@ -61,11 +63,11 @@ const ALERT_PING_MS = 1800;
 /** How long the feed table keeps blinking after a disabled tab is clicked. */
 const TABLE_PING_MS = 1900;
 
-const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SOCIAL SCANNER' };
+const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SOCIAL SCANNER', rotation: 'ROTATION' };
 
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
+    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, apiBase: null, apiIsLocal: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
     try { const w = JSON.parse(localStorage.getItem('vs_watchlist') || 'null'); if (w) this.state.watch = w; } catch (e) { }
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
@@ -148,8 +150,18 @@ class App extends React.Component {
     const clockFn = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); this.setState({ clock: p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) }); };
     clockFn(); this.clockTimer = setInterval(clockFn, 1000);
     this.simTimer = setInterval(() => this.simTick(), 2400 / Math.max(1, this.props.simSpeed ?? 2));
-    this.syncLiveData();
-    this.apiTimer = setInterval(() => this.syncLiveData(), 5000);
+    // Which server answers has to be settled BEFORE anything asks one, or the
+    // first round of requests goes to the deployed server regardless and the
+    // intel services below capture the wrong base for their whole lifetime.
+    this.apiReady = initApiBase().then((base) => {
+      this.setState({ apiBase: base, apiIsLocal: usingLocalApi() });
+      this.syncLiveData();
+      this.apiTimer = setInterval(() => this.syncLiveData(), 5000);
+      this.startIntelServices();
+    });
+  }
+
+  startIntelServices() {
 
     // Wallet intelligence runs whether or not the WALLETS tab is open, so
     // every module can ask about a wallet at any time and the memory keeps
@@ -448,9 +460,11 @@ class App extends React.Component {
         open: () => this.setState((s) => s.expandedId === a.id
           ? { expandedId: null }
           : { expandedId: a.id, selectedId: a.id }),
+        // One jump per token-scoped tab, in the same order as the sidebar.
         goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
         goSocial: () => this.setState({ page: 'social', selectedId: a.id }),
         goWallets: () => this.setState({ page: 'wallets', selectedId: a.id }),
+        goRotation: () => this.setState({ page: 'rotation', selectedId: a.id }),
         star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
         // A tint alone reads as "slightly different row" at a glance. The white
         // ring is the thing that actually locates the selection - drawn inset so
@@ -522,7 +536,7 @@ class App extends React.Component {
     else sel = null;
     const staleMs = sel && this.lastSelected === sel && !this.assets.includes(sel) ? Date.now() - this.lastSelectedAt : 0;
 
-    // Nav mirrors SELECTION_TABS: everything asset-scoped hangs off ASSET DETAIL,
+    // Nav mirrors SELECTION_TABS: everything asset-scoped is indented,
     // everything else is app-wide. Deriving `child` from the same map keeps the
     // sidebar honest if a tab later changes scope.
     // One flat list. The three token-scoped tabs are indented under LIVE
@@ -552,7 +566,7 @@ class App extends React.Component {
       navItem('detail', 'DETAIL', true),
       navItem('social', 'SOCIAL', true),
       navItem('wallets', 'WALLETS', true),
-      navItem('rotation', 'ROTATION'),
+      navItem('rotation', 'ROTATION', true),
       navItem('alerts', 'ALERTS'),
       navItem('eval', 'EVALUATION'),
       navItem('health', 'HEALTH')
@@ -592,7 +606,7 @@ class App extends React.Component {
       liveDotColor: st.serverError ? '#ff4fae' : (live ? '#4d8dff' : '#e35ff2'),
       liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
       liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),
-      serverError: st.serverError,
+      serverError: st.serverError, apiIsLocal: st.apiIsLocal,
       hasSelection: Boolean(sel),
       // The identity bar belongs to the asset-scoped tabs only - the same set
       // the sidebar nests under ASSET DETAIL. ALERT CARDS, EVALUATION and
@@ -623,7 +637,7 @@ class App extends React.Component {
       chepeStats: [{ k: 'Hard vetoes today', v: '14' }, { k: 'Honeypots blocked', v: '6' }, { k: 'Fake stock tokens', v: '2' }, { k: 'Wash clusters flagged', v: '5' }],
       chepeLast: 'Last veto — $SAFEGEM2 (BNB): honeypot, sell path reverts. Chepe says no.',
       ...this.chepePickVals(),
-      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this), ...evalVals(this), ...healthVals(this)
+      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...evalVals(this), ...healthVals(this)
     };
   }
 
@@ -670,7 +684,11 @@ class App extends React.Component {
                   $ npm run server
                 </div>
                 <div style={{ fontSize: '9.5px', color: '#6b7699' }}>
-                  Start the server at <span style={{ color: '#4fc3f7' }}>https://vibe-mm-server.onrender.com/</span> to resume live streaming. Retrying automatically every 5s...
+                  {/* Name the server that actually failed - with a local one in
+                      play, "the server" is ambiguous. */}
+                  No answer from <span style={{ color: '#4fc3f7' }}>{API_ORIGIN}</span>
+                  {v.apiIsLocal ? ' (local)' : ' (deployed)'}. Retrying automatically every 5s...
+                  {!v.apiIsLocal && <> Start a local server and reload to use it instead.</>}
                 </div>
               </div>
             </div>

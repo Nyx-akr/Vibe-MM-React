@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "deploy:web": "vite build && node scripts/copy-build-to-server.mjs",
     "preview": "vite preview"
   },
   "dependencies":{"react":"^18.3.1","react-dom":"^18.3.1"},
