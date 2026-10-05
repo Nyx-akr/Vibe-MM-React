@@ -1,3 +1,4 @@
+import { ethosFor, ethosColor, ethosNote } from '../services/ethos-intel';
 import React from 'react';
 import { UNAVAILABLE } from '../utils/formatters';
 import { chainNameToKey } from '../data/chains';
@@ -60,6 +61,14 @@ function ago(ms) {
  * counted. See mentionsFor() in src/calculations/core.js.
  */
 export function socialVals(app, sel) {
+  // Who the project says it is, and what Ethos thinks of them. This is the
+  // only identity signal on this tab that does not come from counting posts:
+  // mentions measure attention, reputation measures standing, and a token can
+  // have plenty of one with none of the other.
+  const rep = sel ? ethosFor(
+    String((sel.rawServerRow && sel.rawServerRow.chain) || sel.chain || '').toLowerCase(),
+    (sel.rawServerRow && sel.rawServerRow.tokenAddress) || sel.tokenAddress,
+  ) : null;
   const status = socialIntelStatus();
 
   // The board model carries the ticker as `sym` with a leading $; the raw
@@ -171,6 +180,14 @@ export function socialVals(app, sel) {
     socialSources: socialSourceRows,
     socialLive: live + ' of ' + sources.length + ' sources answering',
     socialCountable: Boolean(m && m.countable),
+    // Project identity, from Ethos. Rendered beside the mention counts.
+    ethos: rep,
+    ethosNote: ethosNote(rep),
+    ethosColor: ethosColor(rep && rep.state),
+    ethosLabel: !rep || !rep.linked ? 'NO X ACCOUNT'
+      : rep.score === 0 ? 'UNRATED'
+      : rep.score == null ? 'PENDING'
+      : String(rep.score),
     // A missing measurement and an unmatchable ticker are different failures.
     socialReason: (m && m.reason) ||
       (m ? '' : 'this token has not been measured against the corpus yet'),
@@ -214,6 +231,17 @@ export default function SocialScanner({ v, css }) {
   if (v.socialOffline) {
     return (
       <div data-screen-label="Social scanner" style={css('flex:1;overflow:auto;padding:12px 14px;min-height:0', { v })}>
+      {/* Identity, not attention. Mentions say how loudly a token is being
+          talked about; this says whether the account doing the talking has a
+          reputation to lose. */}
+      <div style={css('display:flex;align-items:center;gap:14px;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:10px 14px;margin-bottom:10px', { v })}>
+        <div style={css('font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;flex-shrink:0', { v })}>PROJECT REPUTATION · ETHOS</div>
+        {v.ethos && v.ethos.linked ? (
+          <a href={v.ethos.url} target="_blank" rel="noreferrer" style={css('font-size:11px;font-weight:700;color:{{ v.ethosColor }};text-decoration:none;flex-shrink:0', { v })}>@{v.ethos.handle}</a>
+        ) : null}
+        <span style={css('font-size:14px;font-weight:700;color:{{ v.ethosColor }};flex-shrink:0', { v })}>{v.ethosLabel}</span>
+        <span style={css('font-size:10px;color:#6b7699;line-height:1.5', { v })}>{v.ethosNote}</span>
+      </div>
         <div style={css('background:#0a1226;border:1px solid #45103a;border-radius:10px;padding:18px 20px', { v })}>
           <div style={css('font-size:9px;letter-spacing:1.2px;color:#ff4fae;font-weight:800;margin-bottom:8px', { v })}>SOCIAL FEED UNAVAILABLE</div>
           <div style={css('font-size:11px;color:#c6d1ea;line-height:1.6', { v })}>{v.socialOfflineNote}</div>

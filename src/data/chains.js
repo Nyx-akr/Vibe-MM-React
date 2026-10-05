@@ -1,7 +1,7 @@
 /**
  * The chains the dashboard fetches and can filter by.
  *
- * `key` is the server's chain id (/api/market?chain=...), `name` is the short
+ * `key` is the server's chain id (the raw store path <chain>/market.json), `name` is the short
  * label shown in the table's chain selector.
  */
 export const chains = [

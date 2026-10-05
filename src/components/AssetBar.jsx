@@ -33,9 +33,35 @@ export default function AssetBar({ v }) {
       </div>
 
       <div style={{ display: 'flex', gap: 20, flexShrink: 0 }}>
-      <div style={{ textAlign: 'right' }}>
-        <div style={{ fontSize: 8.5, color: '#8b96b8', letterSpacing: 1 }}>FINAL SCORE</div>
+      <div style={{ textAlign: 'right' }} title={d.scoreWindowNote || ''}>
+        <div style={{ fontSize: 8.5, color: '#8b96b8', letterSpacing: 1 }}>SCORE · {d.scoreWindowLabel}</div>
         <div style={{ fontSize: 20, fontWeight: 700, color: d.scoreColor }}>{d.score}</div>
+        {d.scoreRange && (
+          <div style={{ fontSize: 8, color: '#4a5578', marginTop: 1 }}>{d.scoreRange}</div>
+        )}
+      </div>
+      {d.scoreSpark && (
+        <div style={{ alignSelf: 'center' }} title={d.scoreSpark.title}>
+          <svg width={d.scoreSpark.w} height={d.scoreSpark.h} style={{ display: 'block', overflow: 'visible' }}>
+            {/* the average, as a hairline one shade off the surface */}
+            {d.scoreSpark.avgY && (
+              <line x1="0" y1={d.scoreSpark.avgY} x2={d.scoreSpark.w} y2={d.scoreSpark.avgY}
+                stroke="#2b3a60" strokeWidth="1" />
+            )}
+            <polyline points={d.scoreSpark.points} fill="none" stroke="#4d8dff"
+              strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+            {/* where the score is right now */}
+            <circle cx={d.scoreSpark.lastX} cy={d.scoreSpark.lastY} r="3"
+              fill={d.scoreSpark.lastColor} stroke="#0a1226" strokeWidth="2" />
+          </svg>
+        </div>
+      )}
+      <div style={{ textAlign: 'right' }} title="This poll on its own, before averaging">
+        <div style={{ fontSize: 8.5, color: '#8b96b8', letterSpacing: 1 }}>RIGHT NOW</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: d.scoreNowColor }}>{d.scoreNow}</div>
+        {d.scoreDrift && (
+          <div style={{ fontSize: 8, color: d.scoreDriftColor, marginTop: 1 }}>{d.scoreDrift}</div>
+        )}
       </div>
       <div style={{ textAlign: 'right' }}>
         <div style={{ fontSize: 8.5, color: '#8b96b8', letterSpacing: 1 }}>CONFIDENCE</div>

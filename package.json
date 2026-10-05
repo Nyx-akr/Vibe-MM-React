@@ -1,14 +1,21 @@
 {
-  "name":"vibescreener-react",
-  "private":true,
-  "version":"1.0.0",
-  "type":"module",
+  "name": "vibescreener-react",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "deploy:web": "vite build && node scripts/copy-build-to-server.mjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node test/precision.test.js && node test/outcomes.test.js"
   },
-  "dependencies":{"react":"^18.3.1","react-dom":"^18.3.1"},
-  "devDependencies":{"@vitejs/plugin-react":"latest","vite":"latest"}
+  "dependencies": {
+    "lightweight-charts": "^5.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest"
+  }
 }

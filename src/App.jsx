@@ -3,6 +3,7 @@ import './App.css';
 import LiveOpportunities from './tabs-modules/LIVE-OPPORTUNITIES';
 import AssetDetail from './tabs-modules/ASSET-DETAIL';
 import Rotation from './tabs-modules/ROTATION';
+import MarketRotation, { marketRotationVals } from './tabs-modules/MARKET-ROTATION';
 import Wallets from './tabs-modules/WALLETS';
 import SocialScanner from './tabs-modules/SOCIAL-SCANNER';
 import AlertCards from './tabs-modules/ALERT-CARDS';
@@ -18,9 +19,69 @@ import { healthVals } from './tabs-modules/SYSTEM-HEALTH';
 import { css } from './utils/css';
 import { fmtUsd, fmtAge, fmtPrice, stageInfo, chainColor, clsColor, scoreColor, washColor } from './utils/formatters';
 import { chains as chainList, chainKeys, chainNameToKey } from './data/chains';
+
+/**
+ * The chain filter is a SET of chains, not one chain or ALL. Every chain on is
+ * what ALL means, so there is no separate flag to drift out of step with it.
+ */
+const allChains = () => Object.fromEntries(chainList.map((c) => [c.name, true]));
+const selectedChains = (sel) => chainList.map((c) => c.name).filter((n) => sel && sel[n]);
+const isAllChains = (sel) => selectedChains(sel).length === chainList.length;
+
+/**
+ * One click on a chain chip toggles that chain, and nothing else:
+ *   - with ALL on (every chain on), clicking a chain turns it off - and so ALL
+ *     reads off, because ALL simply means every chain is on;
+ *   - turning the last missing chain back on makes ALL read on again;
+ *   - turning off the only chain still on would leave an empty board, so that
+ *     click restores every chain instead of showing nothing.
+ */
+/**
+ * A saved selection, kept only for chains that still exist. Nothing saved, or
+ * nothing left of it, is ALL - so a renamed chain never strands the board empty.
+ */
+function restoreChains(saved) {
+  if (!saved) return allChains();
+  const kept = Object.fromEntries(chainList.map((c) => c.name).filter((n) => saved[n]).map((n) => [n, true]));
+  return Object.keys(kept).length ? kept : allChains();
+}
+
+/** Remembers the chips across reloads. ALL is stored as nothing, like apiTarget's 'auto'. */
+function saveChains(sel) {
+  setInput('chainSelection', isAllChains(sel) ? null : sel);
+  return sel;
+}
+
+/**
+ * The stage bar's selection works exactly like the chain chips: a set of
+ * stages (1 WATCH .. 4 EXCEPTIONAL), every one on meaning "all stages".
+ */
+const STAGE_KEYS = ['1', '2', '3', '4'];
+const allStages = () => Object.fromEntries(STAGE_KEYS.map((k) => [k, true]));
+const isAllStages = (sel) => STAGE_KEYS.every((k) => sel && sel[k]);
+function restoreStages(saved) {
+  if (!saved) return allStages();
+  const kept = Object.fromEntries(STAGE_KEYS.filter((k) => saved[k]).map((k) => [k, true]));
+  return Object.keys(kept).length ? kept : allStages();
+}
+function saveStages(sel) {
+  setInput('stageSelection', isAllStages(sel) ? null : sel);
+  return sel;
+}
+function toggleStage(sel, key) {
+  const next = Object.assign({}, sel, { [key]: !sel[key] });
+  if (!next[key]) delete next[key];
+  return STAGE_KEYS.some((k) => next[k]) ? next : allStages();
+}
+
+function toggleChain(sel, name) {
+  const next = Object.assign({}, sel, { [name]: !sel[name] });
+  if (!next[name]) delete next[name];
+  return selectedChains(next).length ? next : allChains();
+}
 import { defaultWalletRegistry, normalizeRegistry } from './data/wallet-registry';
 import { nextTape } from './services/live-feed';
-import {
+import { fetchTokenOutcomes,
   fetchLiveMarketData,
   fetchLiveWalletData,
   fetchLiveEvalData,
@@ -29,7 +90,12 @@ import {
   fetchLiveOhlcv,
   initApiBase,
   usingLocalApi,
-  API_ORIGIN
+  apiTarget,
+  API_ORIGIN,
+  fetchPrecisionInputs,
+  fetchStorageTimeline,
+  restoreDerived,
+  storeFreshness
 } from './services/api';
 import {
   startWalletIntel, stopWalletIntel, onWalletIntel, walletIntelStatus,
@@ -40,6 +106,14 @@ import {
 import {
   startRotationIntel, stopRotationIntel, onRotationIntel,
 } from './services/rotation-intel';
+import { startEthosIntel, stopEthosIntel } from './services/ethos-intel';
+import * as historyStore from './services/storage/history-store';
+import { migrateLegacyStorage } from './services/storage/migrate';
+import { getInput, setInput } from './services/storage/input-store';
+import { hydrateJournal, journalFor } from './services/score-journal';
+// Precision@20 is a calculation, so it lives in calculations/ like every other
+// derived number - App only decides when to run it and how to caption it.
+import { precisionAtK } from './calculations/core';
 import AppHeader from './components/AppHeader';
 import SelectAssetPrompt from './components/SelectAssetPrompt';
 import SideNav from './components/SideNav';
@@ -65,15 +139,155 @@ const TABLE_PING_MS = 1900;
 
 const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SOCIAL SCANNER', rotation: 'ROTATION' };
 
+/**
+ * The PRECISION@20 · 24H tile.
+ *
+ * It used to be a hard-coded em dash captioned "needs outcome tracking". The
+ * archive is that outcome tracking, so the number is now measured - but a
+ * measured number still has to say how much it is worth, and that is what the
+ * sub-line carries.
+ *
+ * THE NUMBER IS NOT DISCOUNTED BY COVERAGE. Scaling a precision by uptime
+ * yields something that is no longer a precision: 0.70 measured across half a
+ * day would print as 0.35 and read as a bad model rather than a thin sample.
+ * So the value stays honest and the caveat sits beside it, and below a floor
+ * of either coverage or sample size the tile withholds the number entirely
+ * rather than showing one nobody should act on.
+ */
+const PRECISION_MIN_PICKS = 20;
+/** Market files older than this mean the collector has stopped writing. */
+const STORE_STALE_MS = 60000;
+/**
+ * Distinct moments the picks must come from.
+ *
+ * The first version gated on raw COVERAGE, which was the same discounting
+ * mistake this file argues against one paragraph up - suppressing the number
+ * entirely is just a discount to zero. Coverage being low does not make a
+ * precision wrong; it makes it unrepresentative, and the way that bites is
+ * every pick coming from one short burst.
+ *
+ * `slicesEvaluated` measures exactly that, so it is the gate, and coverage
+ * stays what it should be: a caveat printed beside the number.
+ */
+const PRECISION_MIN_SLICES = 4;
+/** Outcomes move on the scale of hours; re-measuring faster is wasted work. */
+const PRECISION_REFRESH_MS = 300000;
+/** A 24h strip bucket is 30 minutes wide; polling faster cannot move a pixel. */
+const STORAGE_TIMELINE_MS = 60000;
+
+/**
+ * Horizons to try, longest first.
+ *
+ * 24h is the one worth having, and it is the one the record can least often
+ * support: it needs a score mark and a price a full day apart, so a single
+ * outage anywhere in that day breaks every pick that spans it. Measured on
+ * the live archive, the 24-48h mark band was entirely empty while 3h and 12h
+ * both had over a thousand resolvable picks.
+ *
+ * So rather than print a permanent em dash next to a day of real data, the
+ * tile takes the LONGEST horizon that actually resolves and says which one it
+ * used. It upgrades itself to 24h the moment a continuous day exists.
+ */
+const PRECISION_HORIZONS = [86400000, 43200000, 21600000, 10800000, 3600000];
+
+const hoursLabel = (ms) => {
+  const h = ms / 3600000;
+  return (h >= 1 ? Math.round(h) : h) + 'H';
+};
+
+function precisionTile(p) {
+  const dim = '#3a4568';
+  // Says what is measured in plain words - "of our top 20, how many went up,
+  // this long after we ranked them" - instead of the jargon "PRECISION@20".
+  // The window is the one actually used: 24H when a full day of marks exists,
+  // otherwise the longest shorter one that resolves (see PRECISION_HORIZONS),
+  // so a 3H reading can never be mistaken for the 24H one.
+  const label = 'TOP 20 HIT RATE · ' + hoursLabel((p && p.horizonMs) || 86400000) + ' LATER';
+  if (!p) return { label, value: '—', color: dim, sub: 'measuring…' };
+  if (p.error) return { label, value: '—', color: dim, sub: p.error };
+
+  const pct = p.coverage == null ? null : Math.round(p.coverage * 100);
+  // Coverage is always stated over the last 24h of the RECORD. It describes
+  // how complete the archive is, not the precision's own window, so it stays
+  // a fixed span whichever horizon ends up being used.
+  const cov = pct == null ? 'coverage unknown' : pct + '% of last 24h recorded';
+
+  if (p.evaluated < PRECISION_MIN_PICKS) {
+    return {
+      label, value: '—', color: dim,
+      sub: p.exhausted
+        ? 'no horizon resolves yet · ' + cov
+        : p.pending
+          ? p.pending + ' picks still maturing · ' + cov
+          : p.evaluated + ' of ' + PRECISION_MIN_PICKS + ' picks resolved · ' + cov,
+    };
+  }
+  if ((p.slicesEvaluated || 0) < PRECISION_MIN_SLICES) {
+    return {
+      label, value: '—', color: dim,
+      sub: 'picks come from only ' + (p.slicesEvaluated || 0) + ' moment' +
+        ((p.slicesEvaluated || 0) === 1 ? '' : 's') + ' · ' + cov,
+    };
+  }
+
+  // Shown as a percentage, with what it is a percentage OF in the sub-line: a
+  // bare 0.28 left "out of what?" unanswered. The calculation still returns a
+  // 0-1 fraction; only the display changes.
+  const value = p.precision == null ? '—' : Math.round(p.precision * 100) + '%';
+  // Colour tracks the target, not the coverage; the caveat is the sub-line's
+  // job so the colour never implies a verdict the sample cannot support.
+  const good = p.precision != null && p.precision >= 0.55;
+  const fellBack = p.horizonMs && p.horizonMs < PRECISION_HORIZONS[0];
+  const hitPct = p.precision == null ? null : Math.round(p.precision * 100);
+  // A plain-words verdict against the two reference points the bar marks:
+  // 50% is a coin flip, 55% is the target the colour already used.
+  const verdict = hitPct == null ? null
+    : hitPct >= 55 ? 'beating target' : hitPct >= 50 ? 'above coin flip' : 'below coin flip';
+  const median = p.medianReturnPct;
+  return {
+    label, value, mid: true,
+    color: p.precision == null ? dim : (good ? '#4d8dff' : '#e35ff2'),
+    verdict,
+    // One line: the count behind the percentage, and how the picks did on
+    // average. Coverage and the fallback note live behind the ? instead.
+    subLine: [
+      { text: p.wins + ' of ' + p.evaluated + ' rose' },
+      median != null && { text: 'median ' + (median > 0 ? '+' : '') + median + '%', color: median >= 0 ? '#3ddc97' : '#ff4fae' },
+    ].filter(Boolean),
+  };
+}
+
+/**
+ * What the hit-rate tile means, behind its ?. Carries the details the tile no
+ * longer prints: how much of the day was recorded, and why the window may be
+ * shorter than 24h.
+ */
+function precisionHelp(p) {
+  const h = p && p.horizonMs ? hoursLabel(p.horizonMs).toLowerCase() : '24h';
+  const recorded = p && p.coverage != null ? Math.round(p.coverage * 100) + '%' : 'an unknown share';
+  const fellBack = p && p.horizonMs && p.horizonMs < PRECISION_HORIZONS[0];
+  return {
+    title: 'Top 20 hit rate',
+    text: 'Of the 20 tokens we ranked highest at a past moment, the share whose price was higher ' + h +
+      ' later. 50% is a coin flip; 55% is the target. The median is the typical return of those picks. ' +
+      'This browser recorded ' + recorded + ' of the last 24 hours' +
+      (fellBack ? ', which is not enough for a 24h reading yet, so the longest window that resolves is shown. ' +
+        'It switches to 24h after a full day of uptime.' : '.'),
+  };
+}
+
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainF: 'ALL', classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, apiBase: null, apiIsLocal: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
-    try { const w = JSON.parse(localStorage.getItem('vs_watchlist') || 'null'); if (w) this.state.watch = w; } catch (e) { }
+    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainSel: allChains(), classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, apiBase: null, apiIsLocal: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
+    // User inputs come from the input store, which validates the shape and
+    // falls back to a default rather than handing render code a bad value.
+    this.state.watch = getInput('watchlist');
+    this.state.chainSel = restoreChains(getInput('chainSelection'));
+    this.state.stageSel = restoreStages(getInput('stageSelection'));
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
     this.state.walletFilter = 'ALL';
-    let saved = null; try { saved = JSON.parse(localStorage.getItem('vs_wallet_registry') || 'null'); } catch (e) { }
-    this.state.registry = normalizeRegistry(saved || defaultWalletRegistry);
+    this.state.registry = normalizeRegistry(getInput('walletRegistry') || defaultWalletRegistry);
   }
 
   /** Full addresses the user is tracking, for the wallet join. */
@@ -103,7 +317,8 @@ class App extends React.Component {
       if (liveAssets && liveAssets.length > 0) {
         this.assets = liveAssets;
 
-        const chain = this.state.chainF !== 'ALL' ? (chainNameToKey[this.state.chainF] || 'solana') : 'solana';
+        const picked = selectedChains(this.state.chainSel);
+        const chain = picked.length === 1 ? (chainNameToKey[picked[0]] || 'solana') : 'solana';
 
         if (this.state.page === 'wallets') {
           // Wallets reads ONE pool's trades, so it follows the selection, not
@@ -124,7 +339,11 @@ class App extends React.Component {
           if (systemData) this.setState({ apiSystem: systemData });
         }
 
-        this.setState({ serverError: false });
+        const fresh = storeFreshness();
+        this.setState({
+          serverError: false,
+          storeAgeMs: fresh.newestWrittenAt ? Date.now() - fresh.newestWrittenAt : null,
+        });
         this.syncAlertToasts();
       } else {
         this.assets = [];
@@ -153,12 +372,109 @@ class App extends React.Component {
     // Which server answers has to be settled BEFORE anything asks one, or the
     // first round of requests goes to the deployed server regardless and the
     // intel services below capture the wrong base for their whole lifetime.
-    this.apiReady = initApiBase().then((base) => {
-      this.setState({ apiBase: base, apiIsLocal: usingLocalApi() });
+    this.apiReady = initApiBase().then(async (base) => {
+      this.setState({ apiBase: base, apiIsLocal: usingLocalApi(), apiTarget: apiTarget() });
+
+      // The app store is asynchronous, and everything that scores reads its
+      // memory the moment it starts: the intel services, the journal, and the
+      // stage machine and 15-minute score window. The first board read used to
+      // run BEFORE this, so it scored against an empty window and then saved
+      // that empty window over the real one - every reload re-settled the whole
+      // board from scratch. Hydrating is a few ms of IndexedDB; the board waits.
+      const opened = await historyStore.hydrate();
+      await migrateLegacyStorage();
+      hydrateJournal();
+      restoreDerived();
+      console.log('storage: history in ' + historyStore.describe() +
+        ', ' + opened.keys + ' key(s)');
+
+      this.startIntelServices();
+
+      // The board reads the raw store; nothing here asks the server to fetch.
       this.syncLiveData();
       this.apiTimer = setInterval(() => this.syncLiveData(), 5000);
-      this.startIntelServices();
+
+      // Precision@20 joins ~24h of prices to ~24h of our own score marks. That
+      // is megabytes and it changes on the scale of hours, so it runs on its
+      // own slow timer rather than riding the 5s poll.
+      this.refreshPrecision();
+      this.precisionTimer = setInterval(() => this.refreshPrecision(), PRECISION_REFRESH_MS);
+
+      // The storage strip in SYSTEM HEALTH. A bucket is half an hour wide at
+      // 24h, so re-reading it faster than a minute cannot change a pixel.
+      this.refreshStorageTimeline();
+      this.storageTimer = setInterval(() => this.refreshStorageTimeline(), STORAGE_TIMELINE_MS);
     });
+
+    // A closing tab should not take the pending app-store writes with it.
+    this.onHide = () => {
+      if (document.visibilityState === 'hidden') historyStore.flush();
+    };
+    document.addEventListener('visibilitychange', this.onHide);
+  }
+
+  /**
+   * Measures Precision@20 over the last 24h from stored data.
+   *
+   * The two halves come from the two stores: the score marks are ours, out of
+   * the app store (they never leave the browser), and the forward prices are
+   * raw observations the collector wrote from its archive. Coverage comes with them, because a precision measured across a
+   * window we only watched a fifth of is a different claim from one measured
+   * across a full day - and the tile has to be able to say which it is.
+   */
+  async refreshPrecision() {
+    const chain = chainKeys[0];
+    try {
+      const inputs = await fetchPrecisionInputs({ chain, windowMs: 86400000, horizonMs: 86400000, k: 20 });
+      if (!inputs) {
+        this.setState({ precision: { error: 'raw store unreachable' } });
+        return;
+      }
+      // The app store's journal is the only record of what we scored. It
+      // holds ~50h, so a window this browser was closed for simply has no
+      // marks - reported as unresolved/thin, never filled in.
+      const journal = journalFor(chain);
+
+      // Longest horizon that actually resolves. A 24h reading is the one worth
+      // having, but it needs a mark and a price a day apart, so one outage in
+      // that day breaks every pick spanning it - see PRECISION_HORIZONS.
+      let result = null;
+      let exhausted = true;
+      for (const horizonMs of PRECISION_HORIZONS) {
+        const attempt = precisionAtK(inputs.observations, journal, {
+          k: 20, horizonMs, windowMs: Math.max(horizonMs, 43200000),
+        });
+        if (!result) result = attempt;
+        if (attempt.evaluated >= PRECISION_MIN_PICKS) { result = attempt; exhausted = false; break; }
+      }
+
+      this.setState({
+        precision: Object.assign({}, result, {
+          exhausted,
+          coverage: inputs.coverage ? inputs.coverage.coverage : null,
+          missingMs: inputs.coverage ? inputs.coverage.missingMs : null,
+          longestGapMs: inputs.coverage ? inputs.coverage.longestGapMs : null,
+          source: inputs.source,
+          at: Date.now(),
+        }),
+      });
+    } catch (e) {
+      this.setState({ precision: { error: 'could not measure' } });
+    }
+  }
+
+  /**
+   * Two strips: the last day at half-hour resolution, and the last week at
+   * three-hour resolution. The day answers "is it recording now", the week
+   * answers "how much of my history is actually there" - and they are the
+   * same read with a different window, so neither costs more than the other.
+   */
+  async refreshStorageTimeline() {
+    const [day, week] = await Promise.all([
+      fetchStorageTimeline({ windowMs: 86400000, buckets: 96 }),
+      fetchStorageTimeline({ windowMs: 7 * 86400000, buckets: 56 }),
+    ]);
+    this.setState({ storageTimeline: { day, week, at: Date.now() } });
   }
 
   startIntelServices() {
@@ -167,7 +483,6 @@ class App extends React.Component {
     // every module can ask about a wallet at any time and the memory keeps
     // building across tokens instead of restarting on each visit.
     startWalletIntel({
-      baseUrl: API_ORIGIN,
       chains: chainKeys,
       getTracked: () => this.trackedAddresses(),
     });
@@ -181,7 +496,6 @@ class App extends React.Component {
     // mention history keeps building instead of restarting on each visit and
     // any module can ask about a ticker at any time.
     startSocialIntel({
-      baseUrl: API_ORIGIN,
       chains: chainKeys,
       getSymbols: () => this.assets.map((a) => ({
         symbol: (a.rawServerRow && a.rawServerRow.symbol) || a.sym,
@@ -195,9 +509,14 @@ class App extends React.Component {
     // to the trade samples wallet intelligence is already reading, so the
     // graph for every chain is standing ready before the tab is opened and
     // any module can ask what a pool is rotating into.
+    // Reputation of each token's X account. One small file, read on its own
+    // slow clock - the collector refreshes it every 30 min because reputation
+    // moves on the order of days.
+    startEthosIntel();
+
     startRotationIntel();
     this.offRotationIntel = onRotationIntel(() => {
-      if (this.state.page === 'rotation') this.setState({ rotationIntelAt: Date.now() });
+      if (this.state.page === 'rotation' || this.state.page === 'market') this.setState({ rotationIntelAt: Date.now() });
     });
 
     for (let i = 0; i < 7; i++) this.pushTape(false);
@@ -209,8 +528,8 @@ class App extends React.Component {
 
   /**
    * Loads the per-token extras the feed does not carry: contract safety, holder
-   * counts and routed price impact (/api/intel) plus real minute bars
-   * (/api/ohlcv). Fetched once per token and re-fetched when the selection
+   * counts and routed price impact (<chain>/intel.json) plus real minute bars
+   * (<chain>/ohlcv.json), both from the raw store. Read once per token and again when the selection
    * changes; a failure is recorded so the view can grey the fields out.
    */
   async loadDetailData(a) {
@@ -219,7 +538,13 @@ class App extends React.Component {
     const key = row.chain + ':' + row.tokenAddress + ':' + row.poolAddress;
     if (this.detailKey === key) return;
     this.detailKey = key;
-    this.setState({ intel: null, intelState: 'loading', bars: null, barsState: 'loading' });
+    this.setState({ intel: null, intelState: 'loading', bars: null, barsState: 'loading', tokenOutcomes: null });
+    // What this token actually did after we scored it. Same source as the
+    // Evaluation tab, filtered to one token.
+    fetchTokenOutcomes(row.chain, row.tokenAddress).then((outcomes) => {
+      if (this.detailKey === key) this.setState({ tokenOutcomes: outcomes });
+    });
+
     const [intel, bars] = await Promise.all([
       fetchLiveTokenIntel(row.chain, row.tokenAddress, row.poolAddress || '', row),
       fetchLiveOhlcv(row.chain, row.poolAddress, 'minute', 1, 60)
@@ -234,14 +559,15 @@ class App extends React.Component {
     const barList = (bars && bars.bars) || [];
     const hasBars = barList.length > 1;
     this.setState({
-      intel, intelState: intel ? 'ready' : 'error',
+      intel, intelState: intel ? 'ready' : 'pending',
       bars: hasBars ? barList : null,
       barsState: hasBars
         ? (bars.reason === 'local_history' ? 'local_history' : 'ready')
         : ((bars && bars.reason) || 'error')
     });
-    // A rate-limited chart is temporary - retry once the GT budget refills.
-    if (!hasBars && bars && bars.reason === 'rate_limited') {
+    // Neither missing piece is permanent: the collector pre-fetches intel and
+    // bars for every board token on a rotation, so look again shortly.
+    if (!intel || (!hasBars && bars && bars.retryAfterMs)) {
       const retryKey = this.detailKey;
       setTimeout(() => {
         if (this.detailKey === retryKey) { this.detailKey = null; this.componentDidUpdate(); }
@@ -253,7 +579,7 @@ class App extends React.Component {
     this.setState(s => {
       const watch = { ...s.watch };
       if (watch[id]) delete watch[id]; else watch[id] = true;
-      try { localStorage.setItem('vs_watchlist', JSON.stringify(watch)); } catch (e) { }
+      setInput('watchlist', watch);
       return { watch };
     });
   }
@@ -277,6 +603,8 @@ class App extends React.Component {
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
     clearInterval(this.apiTimer);
+    clearInterval(this.precisionTimer);
+    clearInterval(this.storageTimer);
     clearTimeout(this.pingTimer);
     clearTimeout(this.tablePingTimer);
     if (this.offWalletIntel) this.offWalletIntel();
@@ -285,12 +613,16 @@ class App extends React.Component {
     stopSocialIntel();
     if (this.offRotationIntel) this.offRotationIntel();
     stopRotationIntel();
+    stopEthosIntel();
+    if (this.onHide) document.removeEventListener('visibilitychange', this.onHide);
+    // Debounced writes may still be pending; drain them rather than dropping.
+    historyStore.flush();
   }
   beep() { try { const ctx = this.audioCtx || (this.audioCtx = new (window.AudioContext || window.webkitAudioContext)()); const o = ctx.createOscillator(), g = ctx.createGain(); o.connect(g); g.connect(ctx.destination); o.frequency.value = 880; g.gain.setValueAtTime(0.08, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35); o.start(); o.stop(ctx.currentTime + 0.36); } catch (e) { } }
   simTick() {
     if (this.props.liveFeed === false || this.state.serverError || !this.assets.length) return;
     const r = Math.random;
-    // Asset values are NOT touched here. They come from /api/market every 5s and
+    // Asset values are NOT touched here. They come from the raw store every 5s and
     // drifting them locally would mean showing numbers no server ever reported.
     this.pushTape(true);
     const flash = r() < 0.3 ? this.assets[Math.floor(r() * this.assets.length)].id : null;
@@ -381,7 +713,11 @@ class App extends React.Component {
       fg: active ? CHIP_ACTIVE_FG : '#8b96b8',
       bd: active ? CHIP_ACTIVE_BD : '#1c2a4d'
     });
-    const views = [['ALL', 'All'], ['WATCHLIST', '★ Watchlist'], ['CONFIRMED', 'Confirmed+'], ['EXPERIMENTAL', 'Experimental']].map(([k, label]) => chip(label, st.viewF === k, () => this.setState({ viewF: k })));
+    // Only the watchlist is left here, as an on/off toggle. Confirmed+ moved to
+    // the STAGES bar (hide WATCH and EMERGING), which also covers every other
+    // stage combination; All is simply the watchlist switched off.
+    const views = [chip('★ Watchlist', st.viewF === 'WATCHLIST',
+      () => this.setState((prev) => ({ viewF: prev.viewF === 'WATCHLIST' ? 'ALL' : 'WATCHLIST' })))];
     // The table's chain chips are the only chain selector; the old navbar
     // pills duplicated this and carried invented latency figures.
     // Chain chips carry the same colour the chain has in the table's CHAIN
@@ -401,9 +737,21 @@ class App extends React.Component {
         bd: active ? CHIP_ACTIVE_BD : tint(c, 0.35)
       };
     };
-    const chainFilters = ['ALL'].concat(chainList.map((c) => c.name))
-      .map(k => chainChip(k, st.chainF === k, () => this.setState({ chainF: k })));
-    const classFilters = ['ALL', 'MEME', 'TOKEN'].map(k => chip(k, st.classF === k, () => this.setState({ classF: k })));
+    // They live in the TOKENS TRACKED tile, each with the number of tokens the
+    // board is tracking on that chain - the tile's total is their sum.
+    const allOn = isAllChains(st.chainSel);
+    const stagesAll = isAllStages(st.stageSel);
+    const perChain = {};
+    this.assets.forEach((a) => { perChain[a.chain] = (perChain[a.chain] || 0) + 1; });
+    const chainFilters = [
+      Object.assign(chainChip('ALL', allOn, () => this.setState({ chainSel: saveChains(allChains()) })),
+        // The total now lives on ALL itself, so ALL carries the tile's weight.
+        { count: this.assets.length, big: true, fg: '#ffffff' }),
+    ].concat(chainList.map((c) => Object.assign(
+      chainChip(c.name, Boolean(st.chainSel[c.name]),
+        () => this.setState((prev) => ({ chainSel: saveChains(toggleChain(prev.chainSel, c.name)) }))),
+      { count: perChain[c.name] || 0 },
+    )));
     // Ten columns, ordered by how much they matter - the feed drops the trailing
     // ones as the window narrows (see .vs-feed-* in App.css). Seven of the old
     // seventeen were folded into the cells they belong with rather than dropped:
@@ -432,12 +780,11 @@ class App extends React.Component {
     // "cate" matches $CATE and "$cate" matches it too.
     const q = st.searchQ.trim().toLowerCase().replace(/\$/g, '');
     const filtered = this.assets.filter(a => {
-      if (st.chainF !== 'ALL' && a.chain !== st.chainF) return false;
+      if (!allOn && !st.chainSel[a.chain]) return false;
+      if (!stagesAll && !st.stageSel[String(a.stage)]) return false;
       if (st.classF !== 'ALL' && a.cls !== st.classF) return false;
       if (q && (a.sym + ' ' + a.name).toLowerCase().replace(/\$/g, '').indexOf(q) === -1) return false;
       if (st.viewF === 'WATCHLIST' && !st.watch[a.id]) return false;
-      if (st.viewF === 'CONFIRMED' && a.stage < 3) return false;
-      if (st.viewF === 'EXPERIMENTAL' && a.liq >= 60000) return false;
       return true;
     });
     const sorted = [...filtered].sort((a, b) => {
@@ -567,46 +914,157 @@ class App extends React.Component {
       navItem('social', 'SOCIAL', true),
       navItem('wallets', 'WALLETS', true),
       navItem('rotation', 'ROTATION', true),
+      navItem('market', 'MARKET ROTATION'),
       navItem('alerts', 'ALERTS'),
       navItem('eval', 'EVALUATION'),
       navItem('health', 'HEALTH')
     ];
     const d = detailVals(this, sel, showAdj, {
-      intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs
+      intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs,
+      tokenOutcomes: st.tokenOutcomes
     });
     const counts = [0, 0, 0, 0, 0]; this.assets.forEach(a => counts[a.stage]++);
-    // Organic score comes from Jupiter (Solana) or a trade-sample analysis;
-    // tokens without one are excluded rather than counted as average.
-    const organicScores = this.assets
-      .map(a => {
-        const row = a.rawServerRow || {};
-        const jup = row.jupiter;
-        if (jup && Number.isFinite(jup.organicScore)) return jup.organicScore;
-        if (row.flow && Number.isFinite(row.flow.organicFlow)) return row.flow.organicFlow;
-        return null;
-      })
-      .filter(x => x !== null);
-    const avgOrganic = organicScores.length
-      ? (organicScores.reduce((sum, x) => sum + x, 0) / organicScores.length / 100).toFixed(2)
+    // STAGES: the score, bucketed at 55 / 70 / 85, as one bar. Counted over the
+    // chains that are switched on, so picking SOL shows Solana's mix. Each
+    // segment's width is its share; clicking one toggles that stage on the
+    // board, with the same rules as the chain chips.
+    const chainOn = isAllChains(st.chainSel);
+    const stageCounts = [0, 0, 0, 0, 0];
+    this.assets.forEach((a) => { if (chainOn || st.chainSel[a.chain]) stageCounts[a.stage] += 1; });
+    const stageTotal = stageCounts[1] + stageCounts[2] + stageCounts[3] + stageCounts[4];
+    const stagesOn = isAllStages(st.stageSel);
+    const stageTile = {
+      label: 'STAGES', value: String(stageTotal), color: '#ffffff', hideValue: true, wide: true,
+      // Buttons only - the proportional bar above them was removed at the user's request.
+      noBar: true,
+      sub: stagesOn ? 'score bands 55 / 70 / 85 · click to filter' : null,
+      reset: stagesOn ? null : () => this.setState({ stageSel: saveStages(allStages()) }),
+      segments: [1, 2, 3, 4].map((n) => {
+        const info = stageInfo(n);
+        const on = Boolean(st.stageSel[String(n)]);
+        return {
+          name: info.n, count: stageCounts[n], bg: info.bg, fg: info.fg, on,
+          share: stageTotal ? stageCounts[n] / stageTotal : 0.25,
+          go: () => this.setState((prev) => ({ stageSel: saveStages(toggleStage(prev.stageSel, String(n))) })),
+        };
+      }),
+    };
+    // AVG ORGANIC SCORE averages OUR score and only our score.
+    //
+    // It used to take Jupiter's number where it existed and a locally computed
+    // one otherwise, then average the two together. Those are different
+    // quantities over different windows, and Jupiter only covers Solana, so the
+    // "board average" was really a Solana average with a few of our own numbers
+    // mixed in. Filtering on basis === 'sample' is what keeps the tile honest;
+    // tokens Jupiter alone answered for are counted as unscored here and
+    // reported separately in the subline.
+    //
+    // Each token is weighted by how much of the model resolved for it, so a
+    // token read on one of four parts does not count as much as a complete one.
+    const organicReads = this.assets
+      .map(a => (a.rawServerRow || {}).organicFlow)
+      .filter(o => o && o.score !== null);
+    const ours = organicReads.filter(o => o.basis === 'sample');
+    const borrowed = organicReads.length - ours.length;
+    const weightSum = ours.reduce((sum, o) => sum + Math.max(o.coverage, 25), 0);
+    const avgOrganic = ours.length
+      ? Math.round(
+        ours.reduce((sum, o) => sum + o.score * Math.max(o.coverage, 25), 0) / weightSum
+      ) + ''
       : '—';
 
-    const stats = [
-      { label: 'TOKENS TRACKED', value: String(this.assets.length), color: '#ffffff' },
-      { label: 'CONFIRMED+', value: String(counts[3] + counts[4]), color: '#4d8dff' },
-      { label: 'EXCEPTIONAL', value: String(counts[4]), color: '#f06ee2' },
-      { label: 'AVG ORGANIC SCORE', value: avgOrganic, color: avgOrganic === '—' ? '#3a4568' : '#dfe6f6',
-        sub: organicScores.length ? organicScores.length + ' of ' + this.assets.length + ' scored' : 'no source' },
-      // Precision@20 needs forward returns, which nothing records yet.
-      { label: 'PRECISION@20 · 24H', value: '—', color: '#3a4568', sub: 'needs outcome tracking' }
+    // The organic model's own grades (organicFlowScore): weak < 45, fair 45-69,
+    // strong 70+. The gauge draws those zones; the split bar shows how the
+    // sampled tokens fall across them, so one average cannot hide a board that
+    // is half strong and half weak.
+    const ORGANIC_ZONES = [
+      { from: 0, to: 45, color: '#ff4fae', name: 'WEAK' },
+      { from: 45, to: 70, color: '#ffb454', name: 'FAIR' },
+      { from: 70, to: 100, color: '#3ddc97', name: 'STRONG' },
     ];
+    const gradeOf = (score) => ORGANIC_ZONES.find((z) => score < z.to) || ORGANIC_ZONES[2];
+    const organicAvg = ours.length ? Number(avgOrganic) : null;
+    const gradeCounts = { STRONG: 0, FAIR: 0, WEAK: 0 };
+    ours.forEach((o) => { gradeCounts[gradeOf(o.score).name] += 1; });
+    const organicTile = {
+      label: 'AVG ORGANIC SCORE', value: organicAvg == null ? '—' : organicAvg + '%', mid: true,
+      color: organicAvg == null ? '#3a4568' : gradeOf(organicAvg).color,
+      verdict: organicAvg == null ? null : gradeOf(organicAvg).name.toLowerCase(),
+      subLine: ours.length ? [{ text: ours.length + ' of ' + this.assets.length + ' sampled' }] : null,
+      sub: ours.length ? null : (borrowed ? borrowed + ' Jupiter-only, excluded' : 'awaiting trade samples'),
+      help: {
+        title: 'Organic score',
+        text: 'How much of the trading looks like a real crowd - many independent wallets, none dominating - ' +
+          'rather than volume manufactured by a few. Averaged over the tokens we have sampled trades for. ' +
+          'Grades: weak below 45%, fair 45-69%, strong 70% and up. ' +
+          'Right now: ' + gradeCounts.STRONG + ' strong, ' + gradeCounts.FAIR + ' fair, ' + gradeCounts.WEAK + ' weak' +
+          (borrowed ? '; ' + borrowed + ' Solana tokens with only a Jupiter reading are left out.' : '.'),
+      },
+    };
+
+    // One tile for "what is on the board": the total as plain text, then a
+    // toggle row per filter. The chain and stage rows each get a reset link
+    // while anything in them is off, since ALL is no longer a button.
+    const perClass = {};
+    this.assets.forEach((x) => { perClass[x.cls] = (perClass[x.cls] || 0) + 1; });
+    const boardTile = {
+      label: 'TOKENS TRACKED', value: 'ALL ' + this.assets.length, color: '#ffffff', wide: true, inlineValue: true,
+      rows: [
+        {
+          name: 'CHAIN',
+          chips: chainFilters.slice(1).map((c) => ({ label: c.label, count: c.count, go: c.go, fg: c.fg, bg: c.bg, bd: c.bd })),
+          reset: allOn ? null : () => this.setState({ chainSel: saveChains(allChains()) }),
+        },
+        {
+          name: 'STAGES',
+          help: { title: 'Stages', text: 'Stages are the score in bands: WATCH below 55, EMERGING 55-69, CONFIRMED 70-84, EXCEPTIONAL 85 and up. A token’s stage moves the moment its score crosses a band, in either direction. Click a stage to show or hide it on the board.' },
+          chips: stageTile.segments.map((g) => ({
+            label: g.name, count: g.count, go: g.go, fg: g.fg,
+            bg: g.on ? g.bg : '#0a1226', bd: g.on ? g.fg : '#1c2a4d', dim: !g.on,
+          })),
+          reset: stageTile.reset,
+        },
+        {
+          // MEME / TOKEN, with the same toggle rules as the rows above. Two
+          // types, so classF's ALL | MEME | TOKEN already says everything:
+          // both on is ALL; clicking one turns it off (the other stays);
+          // clicking the only one left brings both back.
+          name: 'TYPE',
+          chips: ['MEME', 'TOKEN'].map((k) => {
+            const on = st.classF === 'ALL' || st.classF === k;
+            const fg = clsColor(k);
+            return {
+              label: k, count: perClass[k] || 0, fg,
+              bg: on ? CHIP_ACTIVE_BG : '#0a1226', bd: on ? CHIP_ACTIVE_BD : '#1c2a4d', dim: !on,
+              go: () => this.setState((prev) => ({
+                classF: prev.classF === 'ALL' ? (k === 'MEME' ? 'TOKEN' : 'MEME') : 'ALL',
+              })),
+            };
+          }),
+          reset: st.classF === 'ALL' ? null : () => this.setState({ classF: 'ALL' }),
+        },
+      ],
+    };
+
+    const stats = [
+      boardTile,
+      organicTile,
+      Object.assign(precisionTile(st.precision), { help: precisionHelp(st.precision) })
+    ];
+    const storeStale = Number.isFinite(st.storeAgeMs) && st.storeAgeMs > STORE_STALE_MS;
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
       clock: st.clock, navItems,
       tablePingAnim: st.tablePing ? 'vsTablePing .62s ease-in-out 3' : 'none',
-      liveDotColor: st.serverError ? '#ff4fae' : (live ? '#4d8dff' : '#e35ff2'),
-      liveDotAnim: st.serverError ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
-      liveLabel: st.serverError ? 'SERVER OFFLINE' : (live ? 'LIVE' : 'PAUSED'),
-      serverError: st.serverError, apiIsLocal: st.apiIsLocal,
+      // The collector rewrites market files every few seconds, so old files
+      // mean it has stopped. The board keeps showing the last write, but must
+      // not call it live.
+      liveDotColor: st.serverError ? '#ff4fae' : storeStale ? '#ffb020' : (live ? '#4d8dff' : '#e35ff2'),
+      liveDotAnim: st.serverError || storeStale ? 'none' : (live ? 'vsBlink 1.4s infinite' : 'none'),
+      liveLabel: st.serverError ? 'STORE OFFLINE'
+        : storeStale ? 'STORE STALE · ' + Math.round(st.storeAgeMs / 1000) + 's'
+          : (live ? 'LIVE' : 'PAUSED'),
+      serverError: st.serverError, apiIsLocal: st.apiIsLocal, apiTarget: st.apiTarget,
       hasSelection: Boolean(sel),
       // The identity bar belongs to the asset-scoped tabs only - the same set
       // the sidebar nests under ASSET DETAIL. ALERT CARDS, EVALUATION and
@@ -617,7 +1075,7 @@ class App extends React.Component {
       selectionTabLabel: SELECTION_TABS[st.page] || '',
       isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
       goLive: nav('live'), stats, headers, rows, tape, d, rowCount: rows.length,
-      views, chainFilters, classFilters,
+      views, chainFilters,
       searchQ: st.searchQ,
       onSearch: (e) => this.setState({ searchQ: e.target.value }),
       clearSearch: () => this.setState({ searchQ: '' }),
@@ -637,7 +1095,7 @@ class App extends React.Component {
       chepeStats: [{ k: 'Hard vetoes today', v: '14' }, { k: 'Honeypots blocked', v: '6' }, { k: 'Fake stock tokens', v: '2' }, { k: 'Wash clusters flagged', v: '5' }],
       chepeLast: 'Last veto — $SAFEGEM2 (BNB): honeypot, sell path reverts. Chepe says no.',
       ...this.chepePickVals(),
-      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...evalVals(this), ...healthVals(this)
+      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...marketRotationVals(this), ...evalVals(this), ...healthVals(this)
     };
   }
 
@@ -675,20 +1133,39 @@ class App extends React.Component {
                   CONNECTION ERROR
                 </div>
                 <div style={{ fontSize: '20px', fontWeight: '800', color: '#ffffff', marginBottom: '12px' }}>
-                  ( server not working )
+                  ( raw store not reachable )
                 </div>
                 <div style={{ fontSize: '11px', color: '#8b96b8', lineHeight: '1.6', marginBottom: '20px' }}>
-                  The VibeScreener market data server is offline or unreachable. All live assets, feeds, and analytics across all tabs have been hidden.
+                  Nothing could be read from the raw store the collector writes. All live assets, feeds, and analytics across all tabs have been hidden.
                 </div>
-                <div style={{ background: '#0d1730', border: '1px solid #1c2a4d', borderRadius: '8px', padding: '10px 14px', fontSize: '10px', color: '#c6d1ea', fontFamily: 'monospace', textAlign: 'left', marginBottom: '16px' }}>
-                  $ npm run server
+                {/* The real command, and where to run it.
+                    This said `npm run server`, which cannot work: there is no
+                    package.json at the repo root. Worse, getting a prompt to
+                    type it means Ctrl+C in the supervisor window - so following
+                    this hint killed the collector and produced the very error
+                    that was showing it. */}
+                <div style={{ background: '#0d1730', border: '1px solid #1c2a4d', borderRadius: '8px', padding: '10px 14px', fontSize: '10px', color: '#c6d1ea', fontFamily: 'monospace', textAlign: 'left', marginBottom: '8px' }}>
+                  .\start-server.cmd
+                </div>
+                <div style={{ fontSize: '9.5px', color: '#6b7699', marginBottom: '16px' }}>
+                  from the repo root, in its own window — Ctrl+C there stops the collector.
                 </div>
                 <div style={{ fontSize: '9.5px', color: '#6b7699' }}>
                   {/* Name the server that actually failed - with a local one in
                       play, "the server" is ambiguous. */}
-                  No answer from <span style={{ color: '#4fc3f7' }}>{API_ORIGIN}</span>
+                  No raw store at <span style={{ color: '#4fc3f7' }}>{API_ORIGIN}/raw</span>
                   {v.apiIsLocal ? ' (local)' : ' (deployed)'}. Retrying automatically every 5s...
-                  {!v.apiIsLocal && <> Start a local server and reload to use it instead.</>}
+                  {/* A PINNED target skips the probe entirely, so "start the
+                      collector" is the wrong advice - it can already be running
+                      and this screen would still show. Say which it is. */}
+                  {!v.apiIsLocal && v.apiTarget === 'remote' && (
+                    <> This is pinned to <span style={{ color: '#ffb454' }}>DEPLOYED</span>, so a local
+                    collector would not be tried even if one were running. Switch to AUTO or LOCAL in
+                    /admin, or run <span style={{ color: '#c6d1ea' }}>localStorage.removeItem('vs_api_target')</span> and reload.</>
+                  )}
+                  {!v.apiIsLocal && v.apiTarget !== 'remote' && (
+                    <> Start the local collector and reload to use it instead.</>
+                  )}
                 </div>
               </div>
             </div>
@@ -705,6 +1182,7 @@ class App extends React.Component {
                 <SocialScanner v={v} css={css} />
               </>)}
               <Rotation v={v} css={css} />
+              <MarketRotation v={v} css={css} />
               <Evaluation v={v} css={css} />
               <SystemHealth v={v} css={css} />
               </div>

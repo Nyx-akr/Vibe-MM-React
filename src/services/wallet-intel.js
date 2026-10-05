@@ -20,12 +20,13 @@
  *
  * So the work is split by what is actually expensive:
  *
- *   SAMPLING  (upstream, slow)  the server's warm loop refreshes pools on a
- *                               rotation. A given pool's trades are re-read
- *                               every few minutes, not every five seconds.
- *   READING   (cheap)           /api/trades?chain=X returns every pool the
- *                               server currently holds, in one response, from
- *                               memory. One request per chain per tick.
+ *   SAMPLING  (upstream, slow)  the server's collector refreshes pools on a
+ *                               rotation and writes <chain>/trades.json. A
+ *                               given pool's trades are re-read every few
+ *                               minutes, not every five seconds.
+ *   READING   (cheap)           that file holds every pool sampled so far. One
+ *                               read per chain per tick, and an unchanged file
+ *                               is not even re-parsed (storage/raw-store.js).
  *   PROCESSING(free, local)     every held pool is re-analysed on every tick.
  *   MEMORY    (free, local)     what each tick learns is accumulated, so the
  *                               picture keeps deepening between samples.
@@ -44,41 +45,37 @@
  */
 
 import { buildWalletSets, tokenWalletIntel } from '../calculations/core';
+import * as historyStore from './storage/history-store';
+import { readRaw } from './storage/raw-store';
 
 /* -------------------------------------------------------------- storage -- */
 
-const STORAGE_KEY = 'vs_wallet_memory';
+const STORAGE_KEY = 'wallet-memory';
 
 /**
- * Same deal as the score journal: one interface, localStorage behind it for
- * now. Swap this object to move the memory somewhere shared.
+ * The fast history store (IndexedDB), not localStorage.
+ *
+ * This memory is the biggest thing the app persists - 4000 wallets and 200
+ * clusters, re-serialised every 30s. Under localStorage that was a
+ * synchronous multi-megabyte stringify on the main thread, against a ~5MB
+ * quota it shared with the watchlist. `save` is now a write-through to an
+ * async store, so the tick no longer blocks on it.
+ *
+ * Reads stay synchronous because the store is hydrated into RAM at boot,
+ * before the poller starts - see storage/history-store.js.
  */
-const localStorageBackend = {
-  name: 'localStorage',
-  describe: () => 'this browser only',
-  load(key) {
-    try {
-      const raw = window.localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) {
-      return null;
-    }
-  },
-  save(key, data) {
-    try {
-      window.localStorage.setItem(key, JSON.stringify(data));
-      return true;
-    } catch (e) {
-      return false;
-    }
-  },
+const historyBackend = {
+  name: 'history-store',
+  describe: () => historyStore.describe(),
+  load(key) { return historyStore.get(key); },
+  save(key, data) { return historyStore.put(key, data); },
 };
 
-const ACTIVE_BACKEND = localStorageBackend;
+const ACTIVE_BACKEND = historyBackend;
 
 export const walletMemoryBackend = {
   name: ACTIVE_BACKEND.name,
-  describe: ACTIVE_BACKEND.describe(),
+  get describe() { return ACTIVE_BACKEND.describe(); },
 };
 
 /* --------------------------------------------------------------- limits -- */
@@ -96,6 +93,22 @@ const CLUSTER_TTL_MS = 3 * 3600000;
 const SEEN_PER_POOL = 1200;
 /** Persist at most this often; the tick is faster than localStorage wants. */
 const PERSIST_EVERY_MS = 30000;
+/**
+ * Per-token numeric snapshots kept for later analysis.
+ *
+ * The WALLETS tab renders a bubble map, which is the right way to LOOK at this
+ * - but a picture is not a record. These snapshots keep the numbers behind the
+ * bubbles: every wallet's flow, counts, timings and tags for a token, as at a
+ * moment, so a window can be replayed, exported or back-tested after the fact.
+ * Nothing in the UI depends on them; they exist to be used later.
+ */
+const SNAPSHOT_KEY = 'wallet-snapshots';
+/** Tokens with a stored snapshot. Beyond this the least recent are dropped. */
+const MAX_SNAPSHOT_POOLS = 120;
+/** Wallets recorded per snapshot, biggest absolute flow first. */
+const MAX_SNAPSHOT_ROWS = 120;
+/** Snapshots older than this stop being worth the space. */
+const SNAPSHOT_TTL_MS = 24 * 3600000;
 
 /* ---------------------------------------------------------------- state -- */
 
@@ -107,11 +120,12 @@ const byWallet = new Map();
 let clusterLog = [];
 /** poolAddress -> { sampledAt, seen:Set(tradeKey) } */
 const poolCursors = new Map();
+/** poolAddress -> the last numeric snapshot written for that token. */
+const snapshots = new Map();
 
 let timer = null;
 let running = false;
 let lastPersistAt = 0;
-let baseUrl = '';
 let chainList = [];
 const status = {
   startedAt: null,
@@ -129,8 +143,8 @@ const listeners = new Set();
 /**
  * Modules that derive their OWN picture from the same sampled trades.
  *
- * This is a seam, not a second poller. /api/trades already returns every
- * pool the server holds in one response, and this loop already reduces it to
+ * This is a seam, not a second poller. trades.json already holds every
+ * pool the collector has sampled, and this loop already reduces it to
  * the per-chain wallet set. A module that needs the same input subscribes
  * here rather than issuing its own request - so adding one costs no extra
  * upstream calls and cannot drift out of step with what WALLETS is showing.
@@ -176,6 +190,61 @@ function hydrate() {
     });
   });
   clusterLog = (saved.clusters || []).filter((c) => c && c.at > Date.now() - CLUSTER_TTL_MS);
+
+  const savedSnapshots = ACTIVE_BACKEND.load(SNAPSHOT_KEY);
+  const snapCutoff = Date.now() - SNAPSHOT_TTL_MS;
+  ((savedSnapshots && savedSnapshots.pools) || []).forEach((s) => {
+    if (s && s.poolAddress && (s.at || 0) >= snapCutoff) snapshots.set(s.poolAddress, s);
+  });
+}
+
+/**
+ * Records the numbers behind one token's bubble map.
+ *
+ * Only the fields that survive being read back cold: no functions, no colours,
+ * no derived display strings. Written when a pool's sample actually moves, so
+ * a snapshot is one real window rather than the same window re-saved.
+ */
+function rememberSnapshot(chain, pool, intel) {
+  const rows = (intel.rows || [])
+    .filter((r) => !r.isPool)
+    .slice(0, MAX_SNAPSHOT_ROWS)
+    .map((r) => ({
+      address: r.address,
+      netUsd: r.netUsd,
+      buyUsd: r.buyUsd,
+      sellUsd: r.sellUsd,
+      grossUsd: r.grossUsd,
+      buys: r.buys,
+      sells: r.sells,
+      trades: r.trades,
+      firstAt: r.firstAt,
+      lastAt: r.lastAt,
+      activeMs: r.activeMs,
+      avgTradeUsd: r.avgTradeUsd,
+      supplyPct: r.supplyPct,
+      clusterIndex: r.clusterIndex,
+      poolsTouched: r.poolsTouched,
+      alsoIn: r.alsoIn.map((p) => p.symbol),
+      tags: r.tags,
+    }));
+
+  snapshots.set(pool.poolAddress, {
+    poolAddress: pool.poolAddress,
+    chain,
+    symbol: pool.symbol || null,
+    at: pool.at || Date.now(),
+    window: intel.window,
+    flow: intel.flow,
+    counts: intel.counts,
+    holderSharePct: intel.holderSharePct,
+    clusters: (intel.clusters || []).map((c) => ({
+      at: c.at, wallets: c.wallets, avgEntryUsd: c.avgEntryUsd,
+      sizeSpreadPct: c.sizeSpreadPct, confidence: c.confidence,
+      grossUsd: c.grossUsd, members: c.members,
+    })),
+    rows,
+  });
 }
 
 function persist(force = false) {
@@ -191,6 +260,13 @@ function persist(force = false) {
     .map((w) => ({ ...w, pools: [...w.pools.values()], chains: [...w.chains] }));
 
   ACTIVE_BACKEND.save(STORAGE_KEY, { savedAt: now, wallets, clusters: clusterLog });
+
+  const cutoff = now - SNAPSHOT_TTL_MS;
+  const pools = [...snapshots.values()]
+    .filter((s) => (s.at || 0) >= cutoff)
+    .sort((a, b) => (b.at || 0) - (a.at || 0))
+    .slice(0, MAX_SNAPSHOT_POOLS);
+  ACTIVE_BACKEND.save(SNAPSHOT_KEY, { savedAt: now, pools });
 }
 
 function prune() {
@@ -308,12 +384,8 @@ function rememberClusters(chain, pool, clusters) {
 /* ----------------------------------------------------------------- loop -- */
 
 async function pollChain(chain) {
-  const res = await fetch(`${baseUrl}/api/trades?chain=${chain}`, {
-    headers: { Accept: 'application/json' },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  if (!data || data.server !== 'ok') return { pools: 0, fresh: 0 };
+  const data = await readRaw(chain + '/trades.json');
+  if (!data) return { pools: 0, fresh: 0 };
 
   const pools = (data.pools || []).filter((p) => (p.trades || []).length);
   if (!pools.length) return { pools: 0, fresh: 0 };
@@ -341,18 +413,19 @@ async function pollChain(chain) {
       chain,
       symbol: pool.symbol || null,
       sampledAt: pool.at || null,
-      stale: Boolean(data.stale),
+      stale: Boolean(data.rateLimited),
     });
 
     if (sampleMoved) {
       fresh += rememberTrades(chain, pool, pool.trades);
       rememberClusters(chain, pool, intel.clusters);
+      rememberSnapshot(chain, pool, intel);
     }
   });
 
   // Hand the same sample to anything else deriving from it, before this
   // function returns, so every module is describing one read of one moment.
-  const handoff = { chain, pools, walletSets, stale: Boolean(data.stale), at: Date.now() };
+  const handoff = { chain, pools, walletSets, stale: Boolean(data.rateLimited), at: Date.now() };
   sampleConsumers.forEach((fn) => {
     try { fn(handoff); } catch (e) { /* a bad consumer must not stop the loop */ }
   });
@@ -393,13 +466,11 @@ async function tick() {
 /**
  * Starts the background loop. Safe to call twice; the second call is ignored.
  *
- * @param baseUrlIn   the data server origin
  * @param chains      chain keys to keep watch on
  * @param getTracked  returns the user's tracked addresses
  */
-export function startWalletIntel({ baseUrl: baseUrlIn, chains, getTracked } = {}) {
+export function startWalletIntel({ chains, getTracked } = {}) {
   if (running) return;
-  baseUrl = String(baseUrlIn || '').replace(/\/+$/, '');
   chainList = (chains || []).slice();
   if (typeof getTracked === 'function') trackedProvider = getTracked;
 
@@ -499,6 +570,38 @@ export function walletIntelStatus() {
     backend: walletMemoryBackend.describe,
     intervalMs: TICK_MS,
   };
+}
+
+/* ------------------------------------------------------------ snapshots -- */
+
+/**
+ * The numbers behind one token's bubble map, as last recorded.
+ *
+ * The map is what the tab shows; this is what it was drawn from. Kept so a
+ * window can be replayed or exported after the fact - nothing on screen reads
+ * it, and nothing on screen breaks if it is empty.
+ */
+export function walletSnapshotFor(poolAddress) {
+  return poolAddress ? snapshots.get(poolAddress) || null : null;
+}
+
+/** Every stored snapshot, newest first. */
+export function walletSnapshots({ limit = 120, chain = null } = {}) {
+  return [...snapshots.values()]
+    .filter((s) => !chain || s.chain === chain)
+    .sort((a, b) => (b.at || 0) - (a.at || 0))
+    .slice(0, limit);
+}
+
+/** Flat rows for export: one line per wallet per token. */
+export function walletSnapshotRows({ chain = null } = {}) {
+  const out = [];
+  walletSnapshots({ limit: MAX_SNAPSHOT_POOLS, chain }).forEach((s) => {
+    (s.rows || []).forEach((r) => {
+      out.push({ chain: s.chain, symbol: s.symbol, poolAddress: s.poolAddress, at: s.at, ...r });
+    });
+  });
+  return out;
 }
 
 /** Drops the accumulated memory. Exposed for the admin panel. */

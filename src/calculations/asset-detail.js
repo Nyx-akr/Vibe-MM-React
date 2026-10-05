@@ -20,7 +20,7 @@
 
 import {
   toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
-  zScoresFrom, bucketBaselines, rotationFor, walletQualityScore,
+  zScoresFrom, bucketBaselines, rotationFor, walletQualityScore, organicFlowScore,
 } from './core.js';
 
 /* =================================================== the model =========== */
@@ -47,6 +47,13 @@ export const SCORE_MODEL = Object.freeze([
   { key: 'usdReference', label: 'USD reference', weight: 3 },
   { key: 'dataQuality', label: 'Data quality', weight: 5 },
 ]);
+
+/**
+ * The weights do not have to sum to 100 - they are only ever used as relative
+ * weights - so confidence is measured against their actual total. Hard-coding
+ * 100 here is what once reported a confidence of 1.04.
+ */
+export const TOTAL_WEIGHT = SCORE_MODEL.reduce((sum, c) => sum + c.weight, 0);
 
 /** Not scored directly - these feed the risk penalty instead. */
 export const SCORE_MODIFIERS = Object.freeze([
@@ -320,6 +327,10 @@ export function computeComponents(row, extras) {
 
   const parts = {};
   const evidence = {};
+  // Values the model resolved from several providers on its way to a score.
+  // The panels read these rather than re-picking a provider themselves - the
+  // tile and the score must never name two different numbers.
+  const facts = {};
   const set = (key, value, note) => { parts[key] = value; evidence[key] = note; };
 
   // --- flow anomaly: is this busier than its own normal? ---
@@ -393,7 +404,11 @@ export function computeComponents(row, extras) {
     const g = intel.holders.growth;
     const rate = intel.holders.count ? (g.perHour / intel.holders.count) * 100 : 0;
     set('holderGrowth', to100(0.5 + rate * 5),
-      (g.perHour > 0 ? '+' : '') + g.perHour + ' holders/h on ' + intel.holders.count.toLocaleString());
+      // A growth series can exist without a current count (the series comes
+      // from the collector's memory, the count from whichever provider
+      // answered this time) - so the count is optional in the caption.
+      (g.perHour > 0 ? '+' : '') + g.perHour + ' holders/h' +
+      (Number.isFinite(intel.holders.count) ? ' on ' + intel.holders.count.toLocaleString() : ''));
   } else if (jup && jup.stats1h && Number.isFinite(jup.stats1h.holderChangePct)) {
     // Jupiter reports the delta per window, so this needs no local series.
     const pct = jup.stats1h.holderChangePct;
@@ -427,10 +442,14 @@ export function computeComponents(row, extras) {
     const topHolderSharePct = walletTop !== null ? walletTop
       : (providerTop !== null ? providerTop : jupTop);
 
+    const holderSource = walletTop !== null ? 'GoPlus, pool excluded'
+      : (providerTop !== null ? 'GoPlus' : (jupTop !== null ? 'Jupiter audit' : null));
+    facts.topHolderSharePct = topHolderSharePct;
+    facts.topHolderShareSource = holderSource;
+
     const quality = walletQualityScore(wallet, {
       topHolderSharePct,
-      holderSource: walletTop !== null ? 'GoPlus, pool excluded'
-        : (providerTop !== null ? 'GoPlus' : (jupTop !== null ? 'Jupiter audit' : null)),
+      holderSource,
       insidersDetected: cs.insidersDetected,
       creatorOtherTokens: cs.creatorOtherTokens,
       lpLockedPct: cs.lpLockedPct,
@@ -476,7 +495,7 @@ export function computeComponents(row, extras) {
   set('dataQuality', Math.round((measured.length / coverable) * 100),
     measured.length + ' of ' + coverable + ' inputs present');
 
-  return { parts, evidence };
+  return { parts, evidence, facts };
 }
 
 /* ================================================== the modifiers ======== */
@@ -487,35 +506,38 @@ export function computeComponents(row, extras) {
  * contract is table stakes, not a reason to buy.
  */
 export function computeModifiers(row, extras) {
-  const stats = extras.tradeStats;
   const intel = extras.intel;
   const jup = extras.jupiter || (row && row.jupiter) || null;
   const out = {};
 
-  // Jupiter publishes its own organic-flow score, so this no longer depends on
-  // winning the trade-sampling rotation. A local trade sample still wins.
-  if (!stats && jup && Number.isFinite(jup.organicScore)) {
-    const share = jup.stats24h ? jup.stats24h.organicSharePct : null;
-    out.organicFlow = {
-      value: Math.round(jup.organicScore),
-      evidence: 'Jupiter organic score ' + jup.organicScore.toFixed(1) +
-        (jup.organicScoreLabel ? ' (' + jup.organicScoreLabel + ')' : '') +
-        (share !== null ? ', ' + share + '% of 24h volume organic' : '') +
-        (jup.stats24h && jup.stats24h.numOrganicBuyers !== null
-          ? ', ' + jup.stats24h.numOrganicBuyers + ' organic buyers' : ''),
-    };
-  }
-  if (stats) {
-    // A real crowd looks like: many wallets trading once, no single wallet
-    // dominating, and few wallets round-tripping repeatedly.
-    const spread = clamp01((stats.oneAndDonePct || 0) / 80);
-    const concentration = clamp01(1 - (stats.top5SharePct || 0) / 70);
-    const churn = clamp01(1 - ((stats.tradesPerWallet || 1) - 1) / 5);
-    out.organicFlow = {
-      value: to100(spread * 0.4 + concentration * 0.35 + churn * 0.25),
-      evidence: stats.oneAndDonePct + '% one-and-done, top-5 hold ' + stats.top5SharePct +
-        '% of volume, ' + stats.tradesPerWallet + ' trades/wallet',
-    };
+  // Organic flow is ONE number, produced by organicFlowScore() in core.js from
+  // the same wallet intel the WALLETS tab reads. Nothing is derived here - this
+  // block only supplies Jupiter's figure as the cross-check and records what
+  // comes back, exactly as the wallet-quality block above does.
+  //
+  // The old code computed a local blend here AND fell through to Jupiter's raw
+  // score, with no marker saying which had answered, so the board averaged two
+  // different quantities. `basis` on the result now says which one it is.
+  {
+    const organic = organicFlowScore(extras.walletIntel, {
+      jupiterScore: jup ? jup.organicScore : null,
+      jupiterLabel: jup ? jup.organicScoreLabel : null,
+      sampledAt: extras.walletIntel ? extras.walletIntel.sampledAt : null,
+    });
+
+    if (organic.score !== null) {
+      out.organicFlow = {
+        value: organic.score,
+        basis: organic.basis,
+        evidence: organic.note +
+          (organic.basis === 'sample' && organic.measured < organic.total
+            ? ' (' + organic.measured + ' of ' + organic.total + ' flow checks)' : ''),
+        detail: organic,
+      };
+    } else {
+      // Kept so callers can show WHY there is no number rather than an em dash.
+      out.organicFlowDetail = organic;
+    }
   }
   if (intel && intel.contractSafety && intel.contractSafety.available) {
     const cs = intel.contractSafety;
@@ -566,9 +588,40 @@ export function assessRisk(row, modifiers, context) {
     add(safety.value < 70 ? 'HIGH' : 'MED', 'CONTRACT_CHECKS', safety.evidence,
       safety.value < 70 ? 6 : 3);
   }
+  // Ethos reputation of the project's own X account.
+  //
+  // Penalty 0, deliberately. The score is one number assembled from twelve
+  // weighted components, and quietly adding a thirteenth input through the
+  // risk penalty would move every score for a reason nobody asked for. This
+  // is raised where risk is read and costs nothing, until we can show it
+  // predicts anything.
+  //
+  // Only a 'profile' handle is the project's own account, and only a measured
+  // score below the 1200 start is held against it - a 0 means Ethos has never
+  // seen the account, which is most projects and is not a finding.
+  const ethos = context && context.ethos;
+  if (ethos && ethos.linked && ethos.isProject && ethos.state === 'flagged') {
+    add(ethos.score < 1000 ? 'MED' : 'LOW', 'ETHOS_REPUTATION',
+      '@' + ethos.handle + ' scores ' + ethos.score + ' on Ethos (' + ethos.level +
+      '), ' + Math.abs(ethos.delta) + ' below the starting score', 0);
+  }
+
   const organic = modifiers && modifiers.organicFlow;
   if (organic && organic.value < 40) {
-    add('MED', 'LOW_ORGANIC_FLOW', organic.evidence, 3);
+    // A sampled verdict is ours and carries its own evidence; a Jupiter-only
+    // one is a borrowed number we cannot decompose, so it is charged less.
+    const borrowed = organic.basis === 'jupiter';
+    add(borrowed ? 'LOW' : 'MED', 'LOW_ORGANIC_FLOW',
+      organic.evidence, borrowed ? 2 : 3);
+  }
+  // Our window and Jupiter's 24h picture disagreeing is not proof either is
+  // wrong, so it costs nothing. It is raised because it is the point at which
+  // a single organic number should stop being trusted on its own.
+  const cross = organic && organic.detail && organic.detail.crossCheck;
+  if (cross && cross.diverges) {
+    add('LOW', 'ORGANIC_DISAGREEMENT',
+      'Our sample reads ' + organic.value + ', Jupiter reads ' + cross.value +
+      ' (' + (cross.delta > 0 ? '+' : '') + cross.delta + ')', 0);
   }
 
   const penalty = Math.min(15, flags.reduce((total, f) => total + f.penalty, 0));
@@ -593,6 +646,92 @@ export function assessRisk(row, modifiers, context) {
  * score. Hydrate it at boot and snapshot it back out to whatever storage the
  * app is using.
  */
+/**
+ * The settled score.
+ *
+ * The momentary score moves on every poll, because its biggest inputs - 5m
+ * volume, the 5m buy count, their z-scores - are themselves 5-minute windows
+ * that shift every few seconds. A token flicking between 68 and 73 is not
+ * changing its character; it is showing measurement noise, and ranking a board
+ * on that noise is what made the app look indecisive.
+ *
+ * So the headline score is the MEAN of the momentary scores observed over
+ * SCORE_WINDOW_MS. The momentary value is kept and shown beside it - it is the
+ * honest "right now", and the gap between the two is itself information: a
+ * wide gap means the token is moving, a narrow one means it has settled.
+ *
+ * The stage follows the AVERAGE, not the momentary value, because the badge
+ * sits next to the average everywhere it appears and the two must never
+ * disagree.
+ */
+export const SCORE_WINDOW_MS = Number(15 * 60 * 1000);
+// At one sample per poll (~5s) a 15 minute window holds ~180; the cap is a
+// memory guard, not a policy.
+const SCORE_SAMPLES_MAX = 400;
+
+const scoreHistory = new Map();
+
+export function hydrateScoreHistory(saved) {
+  if (!saved) return;
+  const cutoff = Date.now() - SCORE_WINDOW_MS;
+  Object.keys(saved).forEach((key) => {
+    const kept = (saved[key] || []).filter((m) => m && m.t >= cutoff);
+    if (kept.length) scoreHistory.set(key, kept);
+  });
+}
+
+export function scoreHistorySnapshot() {
+  const out = {};
+  scoreHistory.forEach((series, key) => { out[key] = series; });
+  return out;
+}
+
+/**
+ * Appends this poll's momentary score and returns the window's average.
+ * Rounded to whole points, because that is how it is displayed and a stage
+ * boundary must not turn on a hundredth.
+ */
+function settledScore(chainKey, tokenAddress, momentary, now) {
+  const key = chainKey + ':' + tokenAddress;
+  const series = scoreHistory.get(key) || [];
+  series.push({ t: now, v: momentary });
+
+  const cutoff = now - SCORE_WINDOW_MS;
+  let kept = series.filter((m) => m.t >= cutoff);
+  if (kept.length > SCORE_SAMPLES_MAX) kept = kept.slice(-SCORE_SAMPLES_MAX);
+  scoreHistory.set(key, kept);
+
+  const values = kept.map((m) => m.v);
+  const sum = values.reduce((a, b) => a + b, 0);
+  return {
+    average: Math.round(sum / values.length),
+    samples: values.length,
+    // How long we have actually been watching - not the nominal window.
+    observedMs: values.length > 1 ? kept[kept.length - 1].t - kept[0].t : 0,
+    min: Math.min(...values),
+    max: Math.max(...values),
+  };
+}
+
+/**
+ * The window's readings for one token, for the detail page's sparkline.
+ *
+ * Deliberately a lookup rather than a field on every scored row: the board
+ * scores ~90 tokens a poll and none of them need their series carried along.
+ * Downsampled, because a 15 minute window at a 5s poll holds ~180 points and
+ * the chart it feeds is ~120px wide.
+ */
+export function scoreSeriesFor(chainKey, tokenAddress, maxPoints = 48) {
+  const series = scoreHistory.get(chainKey + ':' + tokenAddress) || [];
+  if (series.length <= maxPoints) return series.slice();
+  const step = series.length / maxPoints;
+  const out = [];
+  for (let i = 0; i < maxPoints; i++) out.push(series[Math.floor(i * step)]);
+  // Always keep the true latest reading - it is the one the dot marks.
+  out[out.length - 1] = series[series.length - 1];
+  return out;
+}
+
 const stageStore = new Map();
 
 export function hydrateStages(saved) {
@@ -637,7 +776,7 @@ export function stageFor(chainKey, tokenAddress, score) {
  */
 export function scoreAsset(row, extras) {
   const context = extras || {};
-  const { parts, evidence } = computeComponents(row, context);
+  const { parts, evidence, facts } = computeComponents(row, context);
   const modifiers = computeModifiers(row, context);
 
   let weighted = 0;
@@ -656,7 +795,16 @@ export function scoreAsset(row, extras) {
 
   const rawScore = weightUsed ? Math.round(weighted / weightUsed) : 0;
   const risk = assessRisk(row, modifiers, context);
-  const score = Math.max(0, Math.min(100, rawScore - risk.penalty));
+  // What this poll alone says.
+  const scoreNow = Math.max(0, Math.min(100, rawScore - risk.penalty));
+
+  // What the token has been worth over the window. A one-off evaluation
+  // (trackStage false) has no business writing to the rolling window, so it
+  // just reports the momentary value as its own average.
+  const settled = context.trackStage === false
+    ? { average: scoreNow, samples: 1, observedMs: 0, min: scoreNow, max: scoreNow }
+    : settledScore(row.chain, row.tokenAddress, scoreNow, Date.now());
+  const score = settled.average;
 
   const stage = context.trackStage === false
     ? { stage: (STAGES.find((s) => score >= s.min) || STAGES[STAGES.length - 1]).name,
@@ -667,7 +815,15 @@ export function scoreAsset(row, extras) {
     rawScore,
     riskPenalty: risk.penalty,
     riskFlags: risk.flags,
+    // The headline everywhere: the windowed average.
     score,
+    // This poll's own number, shown beside it on the detail page.
+    scoreNow,
+    scoreSamples: settled.samples,
+    scoreObservedMs: settled.observedMs,
+    scoreWindowMs: SCORE_WINDOW_MS,
+    scoreMin: settled.min,
+    scoreMax: settled.max,
     stage: stage.stage,
     stageSince: stage.since,
     stageHistory: stage.history,
@@ -682,9 +838,15 @@ export function scoreAsset(row, extras) {
     // the weighted average - so the WALLETS tab can render the breakdown it
     // produced without recomputing it and risking a different answer.
     walletQuality: evidence.walletQualityDetail || null,
+    // Same contract for organic flow: parts, basis, coverage and the Jupiter
+    // cross-check, so every tab reads the one verdict rather than deriving a
+    // second one from the bare number.
+    organicFlow: (modifiers.organicFlow && modifiers.organicFlow.detail)
+      || modifiers.organicFlowDetail || null,
+    facts,
     weightCovered: weightUsed,
     componentsPresent: breakdown.filter((b) => !b.pending).length,
-    dataQuality: round(weightUsed / 100, 2),
+    dataQuality: round(weightUsed / TOTAL_WEIGHT, 2),
   };
 }
 
@@ -707,7 +869,7 @@ export function scoreAsset(row, extras) {
  *                them yet; the score is computed on fewer inputs when we do not
  *   reference  - the quote token's price across CEX venues
  */
-export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel } = {}) {
+export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel, ethos } = {}) {
   const poolSamples = (samples && samples[row.poolAddress]) || [];
   const fromSamples = zScoresFrom(poolSamples);
   const own = walletSets && walletSets.get(row.poolAddress);
@@ -727,11 +889,16 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference, wall
     // The behavioural read on this pool, from the background wallet service.
     walletIntel: walletIntel || null,
     jupiter: row.jupiter || null,
+    ethos: ethos || null,
   };
 
   const scored = scoreAsset(row, extras);
   const organic = (scored.scoreModifiers || []).find((m) => m.key === 'organicFlow');
   const organicValue = organic && !organic.pending ? organic.value : null;
+  // Which source answered. Anything aggregating this number across tokens has
+  // to filter on it - averaging a sampled score with a borrowed Jupiter one is
+  // the exact bug this rewrite removes.
+  const organicBasis = (scored.organicFlow && scored.organicFlow.basis) || 'none';
   const stats = extras.tradeStats;
   const jup5m = row.jupiter && row.jupiter.stats5m;
 
@@ -755,6 +922,7 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference, wall
       netUsd: stats.netUsd, buyUsd: stats.buyUsd, sellUsd: stats.sellUsd,
       distinctWallets: stats.distinctWallets, windowMinutes: stats.windowMinutes,
       organicFlow: organicValue,
+      organicBasis,
       washRisk: organicValue === null ? null : 100 - organicValue,
     } : (jup5m ? {
       source: 'jupiter',
@@ -762,6 +930,7 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference, wall
       distinctWallets: jup5m.numTraders, windowMinutes: 5,
       organicSharePct: row.jupiter.stats24h ? row.jupiter.stats24h.organicSharePct : null,
       organicFlow: organicValue,
+      organicBasis,
       washRisk: organicValue === null ? null : 100 - organicValue,
     } : null),
   };

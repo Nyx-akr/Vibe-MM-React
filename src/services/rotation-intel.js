@@ -15,7 +15,7 @@
  *
  * ZERO EXTRA REQUESTS
  *
- * This service does not poll. wallet-intel already reads /api/trades once per
+ * This service does not poll. wallet-intel already reads <chain>/trades.json once per
  * chain per tick - every pool the server holds, in one response - and already
  * reduces it to the cross-pool wallet set that rotationGraph() takes as input.
  * So rotation subscribes to that same read via onSampledPools() instead of

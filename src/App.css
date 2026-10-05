@@ -285,3 +285,22 @@ a:hover {
 .h9e06f470:hover { color: #e35ff2; }
 .h7f88fc9a:hover { color: #ff4fae; }
 .h4441371b:hover { background: #0d1730; }
+
+/**
+ * Score decomposition bars.
+ *
+ * The board re-scores every 5s, so without a transition every bar jumps to its
+ * new length and the panel reads as a flicker rather than as movement. The
+ * easing matches the stage gauge marker, which moves for the same reason.
+ *
+ * Width AND background: the bar colour steps at 75 / 50, so a value crossing a
+ * threshold would otherwise snap colour while gliding in length.
+ */
+.score-bar {
+  transition: width 420ms cubic-bezier(.4, 0, .2, 1),
+              background-color 420ms cubic-bezier(.4, 0, .2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .score-bar { transition: none; }
+}

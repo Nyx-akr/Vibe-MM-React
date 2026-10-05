@@ -294,10 +294,10 @@ export function rotationVals(app, sel) {
       ...context,
       rotHasToken: false,
       rotTokenNotice: st.serverError
-        ? 'The data server is unreachable, so no trades could be sampled. Nothing is shown rather than simulated.'
+        ? 'The raw store is unreachable, so no trade samples could be read. Nothing is shown rather than simulated.'
         : chainGraph && chainGraph.poolsSampled
           ? 'The background sampler has not reached ' + ticker + '’s pool yet, so there is no wallet overlap to measure for it. ' +
-            'It samples a couple of pools per chain per cycle, so coverage arrives in order, not all at once. What is moving on this chain meanwhile:'
+            'The collector samples every board pool in turn, never-sampled pools first, so coverage arrives within minutes. What is moving on this chain meanwhile:'
           : 'No pools have been sampled on ' + (chainKey || 'this chain') + ' yet, so there is nothing to compare ' + ticker + ' against.',
     };
   }

@@ -6,6 +6,10 @@ import {
   walletIntelForPool, walletProfile, walletIntelStatus, recentClusters,
 } from '../services/wallet-intel';
 import { walletQualityScore } from '../calculations/core';
+import { rotationForPool } from '../services/rotation-intel';
+import { packBubbles } from '../utils/bubble-layout';
+import WalletBubbleMap from '../components/WalletBubbleMap';
+import { setInput } from '../services/storage/input-store';
 
 /**
  * The wallet read on ONE token.
@@ -157,13 +161,19 @@ export function walletsVals(app, sel) {
   const source = onDemand || fromStore;
 
   if (!source || !source.rows || !source.rows.length) {
+    // How far the collector's first lap has got on the board, so a queued pool
+    // reads as queued rather than stuck.
+    const board = (app.assets || []).filter((a) => a.poolAddress);
+    const covered = board.filter((a) => walletIntelForPool(a.poolAddress)).length;
     return {
       ...shell,
       walletsReady: false,
       walletsToken: ticker,
       walletsNotice: st.serverError
-        ? 'The data server is unreachable, so no trades could be sampled. Nothing is shown rather than simulated.'
-        : 'Sampling this pool’s trades… the background service has not reached this pool yet.',
+        ? 'The raw store is unreachable, so no trade samples could be read. Nothing is shown rather than simulated.'
+        : 'Waiting for this pool’s trades — the collector samples every board pool in turn, never-sampled pools first. ' +
+          covered + ' of ' + board.length + ' board pools have trades so far; GeckoTerminal allows roughly ' +
+          'ten pools a minute, so a full lap takes ~15 minutes after a fresh start (a restart keeps what it has).',
     };
   }
 
@@ -188,6 +198,10 @@ export function walletsVals(app, sel) {
     holderSource: source.holderSharePct === null ? null : 'GoPlus, pool excluded',
   });
 
+  // Turnover between this token and the others we sample. Read, not fetched:
+  // the rotation service builds its graph from the same trade sample.
+  const rot = rotationForPool(sel.poolAddress);
+
   // The pool contract trades against everybody, so it is excluded from the
   // behavioural table; it stays visible in the holder panel, labelled.
   const visible = source.rows.filter((r) => !r.isPool)
@@ -196,6 +210,205 @@ export function walletsVals(app, sel) {
   // Bars are scaled to the biggest wallet on screen, so the column stays
   // readable whether the top wallet moved $200 or $200k.
   const peak = visible.reduce((m, r) => Math.max(m, Math.abs(r.netUsd)), 0) || 1;
+
+  /* ------------------------------------------------------- bubble map -- */
+
+  // WHAT EACH CHANNEL CARRIES, and why this is a map rather than the table it
+  // replaced. Eighty rows of numbers is a record, not a picture: finding the
+  // three wallets that matter meant reading all of it. The same facts as
+  // geometry are one glance.
+  //
+  //   area      turnover - everything the wallet moved, bought plus sold.
+  //             Area, not radius, so twice the money is twice the ink.
+  //   fill      what it did with it: accumulating, exiting, churning.
+  //   ring      rotation - it trades other tokens we watch too. The more
+  //             tokens, the brighter the ring.
+  //   grouping  co-entry - wallets placed as a constellation entered together.
+  //
+  // The numbers are not lost: they are on hover, behind the NUMBERS toggle,
+  // and written to storage every time a sample moves (walletSnapshotFor).
+  const BUBBLE_W = 760;
+  const BUBBLE_H = 390;
+  /**
+   * The pool sits in the middle, and every wallet's arrow points at it.
+   *
+   * This is the one edge our data actually contains. A Bubblemaps-style graph
+   * draws wallet-to-wallet TRANSFERS; the trade feed reports `{wallet, kind,
+   * usd, at}` - who traded against the POOL, never who sent tokens to whom -
+   * so a wallet-to-wallet arrow here would be drawn from nothing. Every trade
+   * IS a wallet-pool edge, though, and all 300 of them are known, so that is
+   * the graph that gets drawn: money going out of the pool into wallets
+   * (buying) and back in (selling).
+   */
+  const POOL_R = 30;
+  /** Arrows drawn, biggest flow first. Ninety would be spaghetti. */
+  const MAX_ARROWS = 18;
+
+  // Ranked by TURNOVER, because turnover is what the area encodes. `visible`
+  // is ordered by net flow for the table, and taking its head would have cut
+  // exactly the wallets this chart exists to show: a churner that moved $40k
+  // and ended flat has a huge bubble and a net near zero, so ranking by net
+  // would have dropped it off the bottom of the list before it was drawn.
+  //
+  // Co-entry members are then added back regardless of rank. A coordinated
+  // wallet is deliberately small - that is the whole point of splitting a
+  // position across a dozen addresses - so a turnover cut slices clusters in
+  // half and draws a seven-wallet group as six. The cluster is the most
+  // interesting thing on the chart; it is never the thing that gets trimmed.
+  const BUBBLE_CAP = 90;
+  const byTurnover = [...visible].sort((a, b) => b.grossUsd - a.grossUsd);
+  const bubbleSource = (() => {
+    const head = byTurnover.slice(0, BUBBLE_CAP);
+    const chosen = new Set(head.map((r) => r.address));
+    const clustered = byTurnover.filter(
+      (r) => r.clusterIndex !== null && !chosen.has(r.address));
+    return head.concat(clustered);
+  })();
+  const packed = packBubbles(
+    bubbleSource.map((r) => ({
+      id: r.address,
+      // Turnover, not net: a wallet that bought $50k and sold $50k moved real
+      // money and is one of the most interesting things on the chart, but its
+      // net is zero and it would be invisible if net drove the size.
+      weight: r.grossUsd,
+      groupId: r.clusterIndex,
+      data: r,
+    })),
+    // The hole is bigger than the pool node itself. Reserving only the node's
+    // radius packed bubbles flush against it, leaving the arrows a two-pixel
+    // run that was invisible under the bubbles they connected. The extra ring
+    // is what the flow is actually drawn in.
+    { width: BUBBLE_W, height: BUBBLE_H, minRadius: 3, maxRadius: 38, padding: 6,
+      reserveCenter: POOL_R + 30 },
+  );
+
+  const fillFor = (r) => {
+    if (r.tags.includes('CHURN')) return { fill: '#7b52d6', edge: '#a89bff' };
+    if (r.clusterIndex !== null) return { fill: '#c0217a', edge: '#ff4fae' };
+    if (r.netUsd > 0) return { fill: '#1f8f7e', edge: '#4fd6c1' };
+    if (r.netUsd < 0) return { fill: '#a8415a', edge: '#ff8fa3' };
+    return { fill: '#3a4568', edge: '#6b7699' };
+  };
+
+  const bubbles = packed.bubbles.map((b) => {
+    const r = b.data;
+    const paint = fillFor(r);
+    const rotating = r.alsoIn.length;
+    return {
+      key: b.id,
+      cx: b.x.toFixed(1),
+      cy: b.y.toFixed(1),
+      rr: b.r.toFixed(1),
+      ...paint,
+      // A ring only where there is something to say. Its weight tracks how
+      // many other tokens the wallet is in, capped so a very busy bot does not
+      // draw a ring thicker than the bubble.
+      ringW: rotating ? Math.min(3, 1 + rotating * 0.6).toFixed(1) : '0',
+      ringC: rotating >= 3 ? '#ffbe4d' : '#4d8dff',
+      tracked: r.isTracked,
+      // Big bubbles name themselves. Requiring a hover to find out who the
+      // dominant wallet is made the most important node on the chart the one
+      // piece of information you could not read off it.
+      name: b.r >= 17 ? shortAddress(r.address) : null,
+      nameSub: b.r >= 24 ? signed(r.netUsd) : null,
+      open: () => {
+        const url = explorerAddressUrl(chainKey, r.address);
+        if (url) window.open(url, '_blank', 'noopener,noreferrer');
+      },
+      // Carried on the bubble rather than looked up on hover, so the map can
+      // own its own hover state without reaching back into the app's.
+      detail: {
+        short: shortAddress(r.address),
+        turnover: fmtUsd(r.grossUsd),
+        net: signed(r.netUsd),
+        netC: netColor(r.netUsd),
+        bought: r.buyUsd ? fmtUsd(r.buyUsd) : '—',
+        sold: r.sellUsd ? fmtUsd(r.sellUsd) : '—',
+        trades: r.buys + ' buys / ' + r.sells + ' sells',
+        supply: pctOfSupply(r.supplyPct),
+        seen: seenLine(r.lastAt, r.activeMs),
+        alsoIn: r.alsoIn.map((p) => p.symbol).join(' · ') || 'only this token',
+        tags: r.tags.filter((t) => t !== 'POOL').map((t) => ({ t, ...tagStyle(t) })),
+      },
+    };
+  });
+
+  /* --------------------------------------------------- flow arrows ----- */
+
+  // One arrow per significant wallet, between it and the pool. Direction is
+  // the wallet's NET: a net buyer is pulled out of the pool, a net seller
+  // pushes back into it. Thickness is how much, on the same square-root scale
+  // the bubbles use, so a thick arrow and a big bubble mean the same thing.
+  const byFlow = [...packed.bubbles]
+    .filter((b) => Math.abs(b.data.netUsd) > 0)
+    .sort((a, b) => Math.abs(b.data.netUsd) - Math.abs(a.data.netUsd))
+    .slice(0, MAX_ARROWS);
+  const flowPeak = byFlow.length ? Math.abs(byFlow[0].data.netUsd) : 1;
+  const poolX = BUBBLE_W / 2;
+  const poolY = BUBBLE_H / 2;
+
+  const flowArrows = byFlow.map((b) => {
+    const r = b.data;
+    const buying = r.netUsd > 0;
+    // Trim both ends to the circle edges, so the arrow touches the bubbles
+    // instead of burying its head inside them.
+    const dx = b.x - poolX;
+    const dy = b.y - poolY;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    const fromPool = { x: poolX + ux * (POOL_R + 2), y: poolY + uy * (POOL_R + 2) };
+    const atWallet = { x: b.x - ux * (b.r + 3), y: b.y - uy * (b.r + 3) };
+    const share = Math.sqrt(Math.min(1, Math.abs(r.netUsd) / flowPeak));
+    return {
+      key: b.id,
+      // Buying: pool -> wallet. Selling: wallet -> pool.
+      x1: (buying ? fromPool.x : atWallet.x).toFixed(1),
+      y1: (buying ? fromPool.y : atWallet.y).toFixed(1),
+      x2: (buying ? atWallet.x : fromPool.x).toFixed(1),
+      y2: (buying ? atWallet.y : fromPool.y).toFixed(1),
+      color: buying ? '#4fd6c1' : '#ff8fa3',
+      width: (0.6 + share * 2.6).toFixed(2),
+      opacity: (0.3 + share * 0.5).toFixed(2),
+      buying,
+    };
+  });
+
+  const poolNode = {
+    x: poolX,
+    y: poolY,
+    r: POOL_R,
+    label: ticker.slice(0, 7),
+    netC: netColor(flow.netUsd),
+    net: signed(flow.netUsd),
+  };
+
+  // A co-entry group is drawn as an enclosing HALO, not as spokes.
+  //
+  // It used to be lines from each member to the group's centre. That centre is
+  // empty space - a layout artifact - but on a zoomed map it reads exactly
+  // like a hub-and-spoke funder diagram, which is what that shape means in
+  // every other holder map. We have no funder data and could not have any: the
+  // trade feed never says who sent tokens to whom. A ring says "these belong
+  // together", which is the whole of what was actually measured, and it cannot
+  // be mistaken for a wallet that is not there.
+  const bubbleGroups = packed.groups.map((g) => {
+    const cluster = source.clusters[g.groupId] || null;
+    return {
+      key: 'g' + g.groupId,
+      cx: g.x.toFixed(1),
+      cy: g.y.toFixed(1),
+      r: (g.radius + 7).toFixed(1),
+      label: g.members.length + ' entered together',
+      // The halo carries the grade, so a weak cluster does not shout as loudly
+      // as a confident one.
+      color: cluster && cluster.confidence === 'high' ? '#ff4fae'
+        : cluster && cluster.confidence === 'medium' ? '#e35ff2' : '#a89bff',
+      dash: cluster && cluster.confidence === 'high' ? '0' : '4 3',
+    };
+  });
+
+  /* ------------------------------------------- the numbers behind them -- */
 
   const walletRows = visible.slice(0, 80).map((r) => {
     const url = explorerAddressUrl(chainKey, r.address);
@@ -362,6 +575,92 @@ export function walletsVals(app, sel) {
       };
     }),
 
+    // --- the bubble map ---
+    //
+    // The viewBox is the bubbles' own bounding box, not the canvas they were
+    // packed on. Packing spirals outward from the centre, so the result is a
+    // dense blob smaller than the box it was given, and drawing the box left
+    // the chart marooned in empty space. Fitting the view to the content makes
+    // it fill the panel at whatever width the panel happens to be.
+    bubbleView: (() => {
+      if (!bubbles.length) return '0 0 ' + BUBBLE_W + ' ' + BUBBLE_H;
+      const xs = packed.bubbles.concat([{ x: BUBBLE_W / 2, y: BUBBLE_H / 2, r: POOL_R }]);
+      const minX = Math.min(...xs.map((b) => b.x - b.r));
+      const maxX = Math.max(...xs.map((b) => b.x + b.r));
+      const minY = Math.min(...xs.map((b) => b.y - b.r));
+      const maxY = Math.max(...xs.map((b) => b.y + b.r));
+      const pad = 6;
+      return (minX - pad).toFixed(1) + ' ' + (minY - pad).toFixed(1) + ' ' +
+        (maxX - minX + pad * 2).toFixed(1) + ' ' + (maxY - minY + pad * 2).toFixed(1);
+    })(),
+    bubbles,
+    bubbleGroups,
+    flowArrows,
+    poolNode,
+
+    legend: [
+      { title: 'ARROW — TRADE FLOW', items: [
+        { shape: 'arrow', color: '#4fd6c1', label: 'out of pool = buying' },
+        { shape: 'arrow', color: '#ff8fa3', label: 'into pool = selling' },
+      ] },
+      { title: 'FILL — WHAT IT DID', items: [
+        { shape: 'dot', color: '#1f8f7e', edge: '#4fd6c1', label: 'accumulating' },
+        { shape: 'dot', color: '#a8415a', edge: '#ff8fa3', label: 'exiting' },
+        { shape: 'dot', color: '#c0217a', edge: '#ff4fae', label: 'co-entry' },
+        { shape: 'dot', color: '#7b52d6', edge: '#a89bff', label: 'churn' },
+      ] },
+      { title: 'RING — REACH', items: [
+        { shape: 'ring', color: '#4d8dff', label: 'trades 1–2 other tokens' },
+        { shape: 'ring', color: '#ffbe4d', label: '3+ other tokens' },
+        { shape: 'ring', color: '#4fe08f', label: 'tracked by you' },
+      ] },
+      { title: 'HALO — GROUP', items: [
+        { shape: 'halo', color: '#ff4fae', label: 'entered together' },
+      ] },
+    ],
+
+    // A reference for what the areas mean. Without it the sizes are only
+    // relative to each other and the reader has to hover to calibrate.
+    bubbleScale: (() => {
+      const top = bubbleSource.length
+        ? Math.max(...bubbleSource.map((r) => r.grossUsd)) : 0;
+      if (!top) return null;
+      return [1, 0.25, 0.0625].map((f) => ({
+        // Radius on the same sqrt curve the bubbles use, so the swatch is the
+        // size a wallet of that turnover would actually be drawn.
+        r: (3 + (38 - 3) * Math.sqrt(f)).toFixed(1),
+        label: fmtUsd(top * f),
+      }));
+    })(),
+    bubbleDropped: packed.dropped,
+    bubblePlotted: bubbles.length,
+    bubbleNote: 'The pool is the centre; every arrow is trade against it. Bubble ' +
+      'area is turnover over the sampled window.',
+
+    // --- token-level rotation, merged in from the rotation service ---
+    //
+    // Same sample, same tick, no extra request: rotation-intel derives its
+    // graph from the trades this tab is already looking at. The WALLETS view
+    // answers "who is in this token"; these three numbers answer "and where
+    // did their money come from, and go". The two belong on one screen.
+    rotationStrip: rot ? {
+      inUsd: fmtUsd(rot.inUsd || 0),
+      outUsd: fmtUsd(rot.outUsd || 0),
+      netUsd: signed(rot.netRotationUsd || 0),
+      netC: netColor(rot.netRotationUsd || 0),
+      connections: rot.connections || 0,
+      from: (rot.inPeers || []).slice(0, 3).map((p) => p.symbol).filter(Boolean).join(' · ') || '—',
+      to: (rot.outPeers || []).slice(0, 3).map((p) => p.symbol).filter(Boolean).join(' · ') || '—',
+      fromCount: rot.receivedFrom || 0,
+      toCount: rot.sentTo || 0,
+      note: rot.poolsCompared
+        ? 'measured against ' + rot.poolsCompared + ' other pools on ' + rot.chain
+        : 'no other pools sampled on this chain yet',
+    } : null,
+
+    // --- the numbers, kept ---
+    showNumbers: Boolean(st.walletNumbers),
+    toggleNumbers: () => app.setState({ walletNumbers: !st.walletNumbers }),
     walletRows,
     walletRowsShown: walletRows.length,
     walletRowsTotal: visible.length,
@@ -410,7 +709,7 @@ export function walletsVals(app, sel) {
 export function saveRegistry(app, reg) {
   const clean = normalizeRegistry(reg);
   app.setState({ registry: clean });
-  try { localStorage.setItem('vs_wallet_registry', JSON.stringify(clean)); } catch (e) { }
+  setInput('walletRegistry', clean);
 }
 
 /* ------------------------------------------------------------ component -- */
@@ -512,9 +811,36 @@ export default function Wallets({ v, css }) {
         ))}
       </div>
 
+      {/* Where this token's money came from and went, from the rotation
+          service - the same trade sample, read rather than refetched. */}
+      {v.rotationStrip && (
+        <div style={css(CARD + ';padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:18px;flex-wrap:wrap', { v })}>
+          <div style={css(CAP, { v })}>TURNOVER WITH OTHER TOKENS</div>
+          <div style={css('display:flex;align-items:baseline;gap:5px', { v })}>
+            <span style={css('font-size:9px;color:#6b7699', { v })}>IN</span>
+            <span style={css('font-size:14px;font-weight:700;color:#4fd6c1', { v })}>{v.rotationStrip.inUsd}</span>
+            <span style={css('font-size:8.5px;color:#6b7699', { v })}>from {v.rotationStrip.fromCount}</span>
+          </div>
+          <div style={css('display:flex;align-items:baseline;gap:5px', { v })}>
+            <span style={css('font-size:9px;color:#6b7699', { v })}>OUT</span>
+            <span style={css('font-size:14px;font-weight:700;color:#ff8fa3', { v })}>{v.rotationStrip.outUsd}</span>
+            <span style={css('font-size:8.5px;color:#6b7699', { v })}>to {v.rotationStrip.toCount}</span>
+          </div>
+          <div style={css('display:flex;align-items:baseline;gap:5px', { v })}>
+            <span style={css('font-size:9px;color:#6b7699', { v })}>NET</span>
+            <span style={css('font-size:14px;font-weight:700;color:{{ v.rotationStrip.netC }}', { v })}>{v.rotationStrip.netUsd}</span>
+          </div>
+          <div style={css('font-size:9px;color:#8b96b8;min-width:0', { v })}>
+            <span style={css('color:#6b7699', { v })}>from</span> {v.rotationStrip.from}
+            <span style={css('color:#6b7699;margin-left:8px', { v })}>to</span> {v.rotationStrip.to}
+          </div>
+          <div style={css('font-size:8.5px;color:#3a4568', { v })}>{v.rotationStrip.note}</div>
+        </div>
+      )}
+
       <div style={css('display:grid;grid-template-columns:1.85fr 1fr;gap:10px;align-items:start', { v })}>
 
-        {/* ---------------------------------------------- behaviour table */}
+        {/* ------------------------------------------------- bubble map */}
         <div style={css(CARD + ';padding:12px;min-width:0', { v })}>
           <div style={css('display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px', { v })}>
             {v.walletFilters.map((f) => (
@@ -527,12 +853,63 @@ export default function Wallets({ v, css }) {
             ))}
           </div>
 
-          <div style={css('display:grid;grid-template-columns:118px 1.25fr 74px 74px 56px 62px 1fr;gap:0 9px;padding:0 0 5px;border-bottom:1px solid #1c2a4d;' + CAP + ';letter-spacing:.8px;color:#6b7699', { v })}>
-            <div>WALLET</div><div>NET FLOW IN WINDOW</div><div>BOUGHT</div><div>SOLD</div>
-            <div>B/S</div><div>SUPPLY</div><div>ALSO TRADING</div>
+          {/* ------------------------------------------- the bubble map */}
+          <WalletBubbleMap
+            bubbles={v.bubbles}
+            groups={v.bubbleGroups}
+            scale={v.bubbleScale}
+            arrows={v.flowArrows}
+            pool={v.poolNode}
+            homeView={v.bubbleView}
+            label={'Wallets trading $' + v.walletsToken + ', sized by turnover'}
+          />
+
+          {/* The legend is grouped by CHANNEL, not by colour.
+              A flat row of eight dots lists the symbols without saying what
+              kind of thing each one encodes; grouping them under "fill",
+              "ring" and "arrow" teaches the grammar of the chart in one pass,
+              which is the difference between a key and a caption. */}
+          <div style={css('display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;padding-top:9px;border-top:1px solid #16223f', { v })}>
+            {v.legend.map((grp) => (
+              <div key={grp.title} style={css('min-width:0', { v, grp })}>
+                <div style={css('font-size:8px;letter-spacing:1px;color:#3a4568;font-weight:700;margin-bottom:4px', { v, grp })}>{grp.title}</div>
+                <div style={css('display:flex;gap:10px;flex-wrap:wrap', { v, grp })}>
+                  {grp.items.map((it) => (
+                    <span key={it.label} style={css('display:flex;align-items:center;gap:4px;font-size:9px;color:#8b96b8', { v, it })}>
+                      <svg width="11" height="11" style={{ display: 'block', flex: '0 0 auto' }}>
+                        {it.shape === 'dot' && <circle cx="5.5" cy="5.5" r="4.2" fill={it.color} fillOpacity="0.75" stroke={it.edge} strokeWidth="1" />}
+                        {it.shape === 'ring' && <circle cx="5.5" cy="5.5" r="4" fill="none" stroke={it.color} strokeWidth="2" />}
+                        {it.shape === 'halo' && <circle cx="5.5" cy="5.5" r="4.2" fill={it.color} fillOpacity="0.12" stroke={it.color} strokeWidth="1" strokeDasharray="2 1.5" />}
+                        {it.shape === 'arrow' && <path d="M0.5 5.5 H8 M5.5 2.8 L9.5 5.5 L5.5 8.2 Z" fill={it.color} stroke={it.color} strokeWidth="1.2" />}
+                      </svg>
+                      {it.label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={css('font-size:9px;color:#6b7699;margin-top:5px;line-height:1.6', { v })}>{v.bubbleNote}</div>
+
+          {/* The record behind the picture, on request. */}
+          <div style={css('display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid #16223f', { v })}>
+            <span style={css('font-size:9px;color:#6b7699', { v })}>
+              Plotting {v.bubblePlotted} of {v.walletRowsTotal} wallets, biggest turnover first{v.bubbleDropped ? '; ' + v.bubbleDropped + ' had no room left on the canvas' : ''}. {v.rotationNote}
+            </span>
+            <span
+              onClick={v.toggleNumbers}
+              style={css('cursor:pointer;font-size:9px;font-weight:700;letter-spacing:.6px;padding:4px 10px;border-radius:999px;border:1px solid ' +
+                (v.showNumbers ? '#4d8dff' : '#1c2a4d') + ';background:' + (v.showNumbers ? '#0e2a5c' : '#0d1730') +
+                ';color:' + (v.showNumbers ? '#6ea0ff' : '#6b7699'), { v })}
+            >{v.showNumbers ? 'HIDE NUMBERS' : 'NUMBERS'}</span>
           </div>
 
-          {v.walletRows.map((w) => (
+          {v.showNumbers && <div style={css('display:grid;grid-template-columns:118px 1.25fr 74px 74px 56px 62px 1fr;gap:0 9px;padding:8px 0 5px;border-bottom:1px solid #1c2a4d;' + CAP + ';letter-spacing:.8px;color:#6b7699', { v })}>
+            <div>WALLET</div><div>NET FLOW IN WINDOW</div><div>BOUGHT</div><div>SOLD</div>
+            <div>B/S</div><div>SUPPLY</div><div>ALSO TRADING</div>
+          </div>}
+
+          {v.showNumbers && v.walletRows.map((w) => (
             <div key={w.key} className="h7f88fc9a" style={css('display:grid;grid-template-columns:118px 1.25fr 74px 74px 56px 62px 1fr;gap:0 9px;align-items:center;padding:7px 0;border-bottom:1px solid #16223f;font-size:10.5px', { v, w })}>
 
               <div style={css('min-width:0', { v, w })}>
@@ -567,9 +944,11 @@ export default function Wallets({ v, css }) {
             </div>
           ))}
 
-          <div style={css('font-size:9px;color:#6b7699;margin-top:9px;line-height:1.6', { v })}>
-            Showing {v.walletRowsShown} of {v.walletRowsTotal} matching wallets, biggest absolute flow first. {v.rotationNote}
-          </div>
+          {v.showNumbers && (
+            <div style={css('font-size:9px;color:#6b7699;margin-top:9px;line-height:1.6', { v })}>
+              Showing {v.walletRowsShown} of {v.walletRowsTotal} matching wallets, biggest absolute flow first. Every sample is also written to storage, so a window can be replayed later.
+            </div>
+          )}
         </div>
 
         {/* --------------------------------------------------- side panels */}

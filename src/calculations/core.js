@@ -122,6 +122,18 @@ export function normalizeRow(raw, fetchedAt = Date.now()) {
   const jup = normalizeJupiterToken((raw.sources && raw.sources.jupiter) || null);
 
   const pick = (a, b) => (a === null || a === undefined ? (b === undefined ? null : b) : a);
+
+  // field -> the provider whose number we actually used, so a tile can name
+  // its own source without re-deciding the preference order.
+  const from = {};
+  const has = (v) => v !== null && v !== undefined;
+  const pickFrom = (key, aVal, aLabel, bVal, bLabel) => {
+    if (has(aVal)) { from[key] = aLabel; return aVal; }
+    if (has(bVal)) { from[key] = bLabel; return bVal; }
+    return null;
+  };
+  const GT = 'GeckoTerminal';
+  const DS = 'DexScreener';
   const dsVol = (ds && ds.volumeUsd) || {};
   const gtVol = gt.volumeUsd || {};
   const dsChg = (ds && ds.priceChangePct) || {};
@@ -129,14 +141,14 @@ export function normalizeRow(raw, fetchedAt = Date.now()) {
   const gtTx = gt.transactions || {};
   const dsTx = (ds && ds.transactions) || {};
 
-  const priceUsd = pick(ds && ds.priceUsd, gt.priceUsd);
-  const liquidityUsd = pick(ds && ds.liquidityUsd, gt.liquidityUsd);
-  const volume24hUsd = pick(dsVol.h24, gtVol.h24);
+  const priceUsd = pickFrom('priceUsd', ds && ds.priceUsd, DS, gt.priceUsd, GT);
+  const liquidityUsd = pickFrom('liquidityUsd', ds && ds.liquidityUsd, DS, gt.liquidityUsd, GT);
+  const volume24hUsd = pickFrom('volume24hUsd', dsVol.h24, DS, gtVol.h24, GT);
 
-  const buys24h = pick(gtTx.h24 && gtTx.h24.buys, dsTx.h24 && dsTx.h24.buys);
+  const buys24h = pickFrom('buys24h', gtTx.h24 && gtTx.h24.buys, GT, dsTx.h24 && dsTx.h24.buys, DS);
   const sells24h = pick(gtTx.h24 && gtTx.h24.sells, dsTx.h24 && dsTx.h24.sells);
 
-  const createdAt = pick(gt.poolCreatedAt, ds && ds.pairCreatedAt);
+  const createdAt = pickFrom('poolCreatedAt', gt.poolCreatedAt, GT, ds && ds.pairCreatedAt, DS);
 
   // Two providers priced it, so "confirmed by more than one source" is a fact
   // the app can check rather than a claim the server makes.
@@ -162,10 +174,10 @@ export function normalizeRow(raw, fetchedAt = Date.now()) {
     quoteTokenPriceUsd: gt.quoteTokenPriceUsd ?? null,
     liquidityUsd,
     volume24hUsd,
-    volume1hUsd: pick(dsVol.h1, gtVol.h1),
-    volume5mUsd: pick(dsVol.m5, gtVol.m5),
-    marketCapUsd: pick(ds && ds.marketCapUsd, gt.marketCapUsd),
-    fdvUsd: pick(ds && ds.fdvUsd, gt.fdvUsd),
+    volume1hUsd: pickFrom('volume1hUsd', dsVol.h1, DS, gtVol.h1, GT),
+    volume5mUsd: pickFrom('volume5mUsd', dsVol.m5, DS, gtVol.m5, GT),
+    marketCapUsd: pickFrom('marketCapUsd', ds && ds.marketCapUsd, DS, gt.marketCapUsd, GT),
+    fdvUsd: pickFrom('fdvUsd', ds && ds.fdvUsd, DS, gt.fdvUsd, GT),
 
     priceChangePct: {
       m5: pick(dsChg.m5, gtChg.m5),
@@ -183,6 +195,12 @@ export function normalizeRow(raw, fetchedAt = Date.now()) {
     // Distinct wallets, not transaction counts. GeckoTerminal alone reports these.
     traders5m: { buyers: (gtTx.m5 && gtTx.m5.buyers) ?? null, sellers: (gtTx.m5 && gtTx.m5.sellers) ?? null },
     traders24h: { buyers: (gtTx.h24 && gtTx.h24.buyers) ?? null, sellers: (gtTx.h24 && gtTx.h24.sellers) ?? null },
+    // Provenance for the fields above. Derived values (ratios, ages) are ours,
+    // so they are named at the tile rather than here.
+    fieldSource: Object.assign(from, {
+      'traders5m.buyers': (gtTx.m5 && gtTx.m5.buyers) != null ? GT : null,
+      'traders24h.buyers': (gtTx.h24 && gtTx.h24.buyers) != null ? GT : null,
+    }),
 
     buySellRatio24h: buys24h !== null && sells24h ? buys24h / sells24h : null,
     volumeToLiquidity24h: volume24hUsd !== null && liquidityUsd ? volume24hUsd / liquidityUsd : null,
@@ -1209,6 +1227,202 @@ export function walletQualityScore(intel, context = {}) {
 
 export { QUALITY_PARTS };
 
+/* ================================================= 7b. organic flow ===== */
+
+/**
+ * ORGANIC FLOW - is this volume a crowd, or is it manufactured?
+ *
+ * WHY THIS IS OURS AND NOT JUPITER'S
+ *
+ * This number used to be Jupiter's `organicScore`, forwarded raw. Three things
+ * were wrong with that:
+ *
+ *   1. UNITS. Jupiter scores a ~24h window with its own labels; the local
+ *      fallback scored a ~300-trade sample. The board averaged the two as if
+ *      they were the same quantity. They are not.
+ *   2. COVERAGE. Jupiter is Solana-only, and the board warms four chains. A
+ *      board-wide "average" built mostly from one chain is a chain average
+ *      wearing a board label.
+ *   3. EVIDENCE. Every other number here can say why. Jupiter's cannot be
+ *      decomposed, so the one figure most likely to be challenged was the one
+ *      figure we could not defend.
+ *
+ * So the score is computed here, from tokenWalletIntel(), which the wallet
+ * service already maintains for every sampled pool on every chain. Jupiter is
+ * kept - as a CROSS-CHECK carried alongside, never blended in, and as an
+ * explicit labelled fallback when we have no sample of our own. `basis` always
+ * says which of the two produced `score`, so no caller can mix them by
+ * accident the way the old code did.
+ *
+ * THE FOUR PARTS
+ *
+ * A real crowd is many wallets, each trading once or twice, none of them
+ * dominating the volume, arriving independently. Manufactured volume fails at
+ * least one of those, so each becomes a part:
+ *
+ *   crowdSpread        many wallets trading ONCE. Bots round-trip; people buy.
+ *   volumeSpread       no single wallet being most of the window.
+ *   churnFree          few wallets round-tripping to no net position - the
+ *                      shape of volume that exists to be counted, not to buy.
+ *   entryIndependence  few wallets ENTERING TOGETHER. This is the part Jupiter
+ *                      has no visible equivalent for and the hardest to fake:
+ *                      coEntryClusters() already grades a burst by how much
+ *                      corroboration it has, so the confidence weighting is
+ *                      reused here rather than re-derived.
+ *
+ * Size uniformity is deliberately NOT a fifth part - it is already inside the
+ * cluster detector's confidence grade, and counting it twice would charge the
+ * same evidence to two parts.
+ *
+ * OVERLAP WITH WALLET QUALITY - stated, not hidden
+ *
+ * walletQualityScore() reads three of these same signals. The two scores
+ * answer different questions (who HOLDS it and how they behave, versus whether
+ * this WINDOW of volume is real) and are consumed differently (a 12% weighted
+ * component, versus a modifier feeding the risk penalty), but the inputs do
+ * overlap and a token failing both is charged for it twice. That was already
+ * true before this function existed; it is written down here so the next
+ * person reading the model can see it rather than discover it.
+ */
+
+const ORGANIC_PARTS = Object.freeze([
+  { key: 'crowdSpread', label: 'Crowd spread', weight: 30 },
+  { key: 'volumeSpread', label: 'Volume spread', weight: 25 },
+  { key: 'churnFree', label: 'Churn-free', weight: 25 },
+  { key: 'entryIndependence', label: 'Entry independence', weight: 20 },
+]);
+
+/** Below this many active wallets the window is too thin to read. */
+const ORGANIC_MIN_WALLETS = 10;
+/** Ours and Jupiter's disagreeing by this much is worth surfacing. */
+const ORGANIC_DIVERGENCE = 25;
+
+/**
+ * @param intel   a tokenWalletIntel() result, or null
+ * @param context { jupiterScore, jupiterLabel, sampledAt } - Jupiter's number
+ *                is carried for comparison and used only as a labelled
+ *                fallback; it is never averaged into ours.
+ */
+export function organicFlowScore(intel, context = {}) {
+  const parts = {};
+  const notes = {};
+  const set = (key, value, note) => {
+    if (value === null || value === undefined) return;
+    parts[key] = to100(clamp01(value));
+    notes[key] = note;
+  };
+
+  const jupScore = toNumber(context.jupiterScore);
+  const hasJupiter = Number.isFinite(jupScore);
+
+  const window = (intel && intel.window) || null;
+  const active = window ? window.wallets : 0;
+
+  if (intel && active >= ORGANIC_MIN_WALLETS) {
+    const flow = intel.flow || {};
+    const counts = intel.counts || {};
+
+    // --- many wallets trading once ---
+    const once = toNumber(flow.onceOnlyPct);
+    if (Number.isFinite(once)) {
+      // 80% one-and-done is as organic as a window realistically gets, so that
+      // is full marks rather than an unreachable 100%.
+      set('crowdSpread', once / 80,
+        round(once, 1) + '% of ' + active + ' wallets traded once');
+    }
+
+    // --- nobody dominating the volume ---
+    const top = toNumber(flow.topWalletSharePct);
+    if (Number.isFinite(top)) {
+      // One large buyer is ordinary; one wallet being most of the window is
+      // not. Nothing is charged below a quarter, matching wallet quality so
+      // the two never disagree about the same concentration.
+      set('volumeSpread', 1 - clamp01((top - 25) / 50),
+        'largest wallet is ' + round(top, 1) + '% of window volume');
+    }
+
+    // --- volume that exists to be counted ---
+    const churn = counts.churn || 0;
+    set('churnFree', 1 - clamp01(churn / active) * 1.4,
+      churn
+        ? churn + ' of ' + active + ' wallets round-tripping to no position'
+        : 'no churn among ' + active + ' wallets');
+
+    // --- arriving independently ---
+    const coordinated = (intel.clusters || []).reduce(
+      (sum, c) => sum + c.wallets * (COORDINATION_WEIGHT[c.confidence] || 0.25), 0);
+    set('entryIndependence', 1 - clamp01(coordinated / active) * 1.6,
+      coordinated >= 1
+        ? Math.round(coordinated) + ' of ' + active + ' wallets entered together'
+        : 'no coordinated entry among ' + active + ' wallets');
+  }
+
+  const resolved = ORGANIC_PARTS.filter((p) => parts[p.key] !== undefined);
+  const shape = (extra) => Object.assign({
+    parts: ORGANIC_PARTS.map((p) => ({
+      ...p,
+      value: parts[p.key] === undefined ? null : parts[p.key],
+      note: notes[p.key] || null,
+    })),
+    total: ORGANIC_PARTS.length,
+    walletsSeen: active,
+    sampledAt: context.sampledAt || null,
+    crossCheck: null,
+  }, extra);
+
+  // --- nothing of our own: say so, and fall back only in the open ---
+  if (!resolved.length) {
+    if (hasJupiter) {
+      return shape({
+        score: Math.round(jupScore),
+        grade: jupScore >= 70 ? 'strong' : jupScore >= 45 ? 'fair' : 'weak',
+        basis: 'jupiter',
+        coverage: 0,
+        measured: 0,
+        note: 'Jupiter organic score ' + jupScore.toFixed(1) +
+          (context.jupiterLabel ? ' (' + context.jupiterLabel + ')' : '') +
+          ' - no trade sample of our own for this pool yet',
+      });
+    }
+    return shape({
+      score: null, grade: null, basis: 'none', coverage: 0, measured: 0,
+      note: active
+        ? 'Only ' + active + ' wallets in this sample, under the ' +
+          ORGANIC_MIN_WALLETS + ' needed to read it'
+        : 'No trade sample for this pool yet.',
+    });
+  }
+
+  const weight = resolved.reduce((s, p) => s + p.weight, 0);
+  const value = resolved.reduce((s, p) => s + parts[p.key] * p.weight, 0) / weight;
+  const score = Math.round(Math.min(100, Math.max(0, value)));
+
+  // Jupiter is compared, never mixed. A wide gap is not evidence that either
+  // is wrong - it usually means the 24h picture and this window disagree -
+  // but it IS the moment to stop trusting one number, so it is surfaced.
+  const crossCheck = hasJupiter
+    ? {
+      source: 'jupiter',
+      value: Math.round(jupScore),
+      label: context.jupiterLabel || null,
+      delta: Math.round(score - jupScore),
+      diverges: Math.abs(score - jupScore) >= ORGANIC_DIVERGENCE,
+    }
+    : null;
+
+  return shape({
+    score,
+    grade: score >= 70 ? 'strong' : score >= 45 ? 'fair' : 'weak',
+    basis: 'sample',
+    coverage: Math.round((resolved.length / ORGANIC_PARTS.length) * 100),
+    measured: resolved.length,
+    crossCheck,
+    note: resolved.map((p) => notes[p.key]).filter(Boolean).join('; '),
+  });
+}
+
+export { ORGANIC_PARTS, ORGANIC_MIN_WALLETS, ORGANIC_DIVERGENCE };
+
 /* ========================================================= 8. social ===== */
 
 /**
@@ -1420,6 +1634,134 @@ export function mentionBaseline(series, current) {
  * `observations` is { tokenAddress: [{ t, price, liquidity, symbol }] }
  * `journal`      is { tokenAddress: [{ t, score, stage, flags }] }
  */
+/**
+ * The first sample at or after `want`, but only within `toleranceMs` of it.
+ *
+ * Returns null when the record has a hole there. That null is the whole point:
+ * it is what stops an outage from being read as a price move.
+ */
+function nearestAtOrAfter(series, want, toleranceMs) {
+  const found = series.find((s) => s && s.t >= want);
+  if (!found) return null;
+  if (toleranceMs && found.t - want > toleranceMs) return null;
+  return found;
+}
+
+/**
+ * Precision@K: of the K tokens we ranked highest at a moment, how many rose?
+ *
+ * This is a different question from the per-stage precision below. That one
+ * asks "when we said EXCEPTIONAL, were we right?"; this asks "is our ORDERING
+ * any good?" - which is the question that matters when a screener's job is to
+ * put the right things at the top of a list.
+ *
+ * The method:
+ *   1. cut the window into slices, because a ranking only exists at a moment;
+ *   2. inside a slice take each token's latest mark, so a token polled twice
+ *      does not get two seats in the same top-K;
+ *   3. rank by score, keep the top K;
+ *   4. for each, find the price at the mark and at mark + horizon;
+ *   5. a pick "won" if the forward return is positive.
+ *
+ * ONLY MATURED PICKS COUNT. A mark made two hours ago has no 24h outcome yet,
+ * so it is counted as pending rather than as a loss - otherwise the number
+ * would start at zero every morning and climb through the day as an artefact
+ * of the clock rather than a change in the model.
+ *
+ * The result is deliberately NOT discounted by data coverage. Multiplying a
+ * precision by uptime produces a number that is no longer a precision - 0.70
+ * measured over half a day would read as 0.35 and look like a bad model rather
+ * than a thin sample. Coverage is returned ALONGSIDE it so a caller can label
+ * the number, withhold it, or widen the window instead.
+ */
+export function precisionAtK(observations, journal, { k = 20, horizonMs = 86400000, sliceMs = 900000, windowMs = 86400000, toleranceMs = 1800000 } = {}) {
+  const now = Date.now();
+  // THE MARK WINDOW ENDS WHERE THE HORIZON BEGINS.
+  //
+  // A mark can only be judged once a full horizon has passed, so the newest
+  // mark worth looking at is one horizon old. Running the window to `now`
+  // instead - which this did at first - makes the measurement impossible by
+  // construction: every mark inside a 24h window is younger than 24h, so with
+  // a 24h horizon all of them are pending and the precision is forever null.
+  // The window is the span of MARKS considered, ending one horizon back.
+  const until = now - horizonMs;
+  const since = until - windowMs;
+  const slices = new Map();
+
+  let wins = 0;
+  let evaluated = 0;
+  let unresolved = 0;
+  // Marks too young to judge yet. Not a fault and never a loss - just the
+  // newest end of the journal waiting for its horizon to pass.
+  let pending = 0;
+  let slicesEvaluated = 0;
+  let slicesTooThin = 0;
+  const returns = [];
+
+  // Group every mark into a slice, keeping the latest per token per slice.
+  Object.keys(journal || {}).forEach((token) => {
+    (journal[token] || []).forEach((mark) => {
+      if (!mark || !Number.isFinite(mark.t)) return;
+      if (mark.t > until) { pending += 1; return; }
+      if (mark.t < since) return;
+      if (!Number.isFinite(mark.score)) return;
+      const slice = Math.floor(mark.t / sliceMs);
+      let bySlice = slices.get(slice);
+      if (!bySlice) { bySlice = new Map(); slices.set(slice, bySlice); }
+      const held = bySlice.get(token);
+      if (!held || mark.t > held.t) bySlice.set(token, { t: mark.t, score: mark.score, stage: mark.stage });
+    });
+  });
+
+  slices.forEach((bySlice) => {
+    const ranked = Array.from(bySlice.entries())
+      .map(([token, mark]) => ({ token, ...mark }))
+      .sort((a, b) => b.score - a.score);
+    // A slice that never held K candidates cannot answer "precision@K"; it is
+    // counted so a caller can see how much of the window was too thin to rank.
+    if (ranked.length < k) slicesTooThin += 1;
+    const top = ranked.slice(0, k);
+
+    let sliceCounted = 0;
+    top.forEach((pick) => {
+      // No maturity check here: the window already ended one horizon back, so
+      // every mark that reached a slice is old enough to judge.
+      const series = (observations && observations[pick.token]) || [];
+      if (!series.length) { unresolved += 1; return; }
+      // The nearest sample at or after the moment we want - but only if it is
+      // actually NEAR it. A gap in the record means the next price could be
+      // hours away, and taking it as "the price when we scored" would invent
+      // a return out of an outage. Outside the tolerance the pick is
+      // unresolved, which is the honest answer: we did not observe it.
+      const at = nearestAtOrAfter(series, pick.t, toleranceMs);
+      const target = nearestAtOrAfter(series, pick.t + horizonMs, toleranceMs);
+      if (!at || !target || !at.price || !target.price) { unresolved += 1; return; }
+      const ret = ((target.price - at.price) / at.price) * 100;
+      returns.push(ret);
+      if (ret > 0) wins += 1;
+      evaluated += 1;
+      sliceCounted += 1;
+    });
+    if (sliceCounted) slicesEvaluated += 1;
+  });
+
+  return {
+    k, horizonMs, windowMs, sliceMs,
+    // The span of MARKS this looked at, which is not "the last windowMs" -
+    // it ends one horizon back. A caller captioning this has to say so.
+    markWindow: { since, until },
+    precision: evaluated ? round(wins / evaluated, 2) : null,
+    wins,
+    evaluated,
+    pending,
+    unresolved,
+    medianReturnPct: returns.length ? round(median(returns), 2) : null,
+    slices: slices.size,
+    slicesEvaluated,
+    slicesTooThin,
+  };
+}
+
 export function evaluationFor(observations, journal, horizonMs) {
   const buckets = {};
   const now = Date.now();
@@ -1533,25 +1875,365 @@ export function evaluationReport(observations, journal) {
   };
 }
 
+/**
+ * First sample at or after `want`, by binary search, within tolerance. The
+ * same rule as nearestAtOrAfter() - a hole in the record is null, never a
+ * price hours later - but the outcome report resolves tens of thousands of
+ * picks against 1,500-sample series, so a linear find is not affordable.
+ */
+function indexAtOrAfter(series, want, toleranceMs) {
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].t < want) lo = mid + 1; else hi = mid;
+  }
+  if (lo >= series.length) return -1;
+  if (toleranceMs && series[lo].t - want > toleranceMs) return -1;
+  return lo;
+}
+
+/** Ranks with ties averaged, for Spearman. */
+function ranksOf(values) {
+  const order = values.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+  const ranks = new Array(values.length);
+  for (let i = 0; i < order.length;) {
+    let j = i;
+    while (j + 1 < order.length && order[j + 1][0] === order[i][0]) j += 1;
+    const r = (i + j) / 2;
+    for (let x = i; x <= j; x += 1) ranks[order[x][1]] = r;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+/** Spearman rank correlation; null when either side has no spread. */
+export function spearman(xs, ys) {
+  const n = xs.length;
+  if (n < 3 || ys.length !== n) return null;
+  const rx = ranksOf(xs);
+  const ry = ranksOf(ys);
+  const mean = (n - 1) / 2;
+  let num = 0; let dx = 0; let dy = 0;
+  for (let i = 0; i < n; i += 1) {
+    const a = rx[i] - mean; const b = ry[i] - mean;
+    num += a * b; dx += a * a; dy += b * b;
+  }
+  return dx && dy ? num / Math.sqrt(dx * dy) : null;
+}
+
+// Score bands line up with the stage thresholds, so a band IS a stage.
+export const OUTCOME_SCORE_BANDS = [
+  { key: 'EXCEPTIONAL', label: '85–100', lo: 85, hi: 101 },
+  { key: 'CONFIRMED', label: '70–84', lo: 70, hi: 85 },
+  { key: 'EMERGING', label: '55–69', lo: 55, hi: 70 },
+  { key: 'WATCH', label: '0–54', lo: 0, hi: 55 },
+];
+export const OUTCOME_RANK_BANDS = [
+  { key: 'Q1', label: 'Top 20%' }, { key: 'Q2', label: '20–40%' }, { key: 'Q3', label: '40–60%' },
+  { key: 'Q4', label: '60–80%' }, { key: 'Q5', label: 'Bottom 20%' },
+];
+
+/**
+ * Did a higher score lead to a better outcome?
+ *
+ * The score is a RANKING, not a probability, so the old "predicted vs
+ * realized" bars compared a band floor (0%, 55%...) to a win rate - two
+ * numbers on different scales. This asks the questions a ranking can answer:
+ *
+ *   1. SAMPLE like precisionAtK: one mark per token per 15-min slice, so a
+ *      token scored every minute does not get sixty votes an hour.
+ *   2. RESOLVE each pick against the raw price series, with the same gap
+ *      tolerance: a hole in the record is `unresolved`, never a return.
+ *   3. STRIP THE MARKET. Memecoins move together, so "went up" mostly
+ *      measures the day. Each pick's EXCESS return is its return minus the
+ *      median return of every token we scored at the same moment - what the
+ *      score added over holding the whole board.
+ *   4. GROUP two ways: by absolute score band (does an 85 mean anything?) and
+ *      by rank quintile inside its own moment (is the ORDERING any good?).
+ *   5. RANK IC: Spearman(score, forward return) per moment, averaged - the
+ *      standard measure of a ranking signal - with its t-stat, so noise and
+ *      edge are told apart.
+ *
+ * Brier and ECE are included for the admin page but read the score as a
+ * probability of beating the board, which it was never built to be; they
+ * describe the scale, not the skill.
+ */
+export function scoreOutcomes(observations, journal, {
+  horizonMs = 3600000, sliceMs = 900000, toleranceMs = 1800000,
+  minBoard = 5, minIcBoard = 8, now = Date.now(), keepPicksFor = null,
+} = {}) {
+  const until = now - horizonMs;
+  const slices = new Map();
+  let pending = 0;
+
+  Object.keys(journal || {}).forEach((token) => {
+    (journal[token] || []).forEach((mark) => {
+      if (!mark || !Number.isFinite(mark.t) || !Number.isFinite(mark.score)) return;
+      const slice = Math.floor(mark.t / sliceMs);
+      let bySlice = slices.get(slice);
+      if (!bySlice) { bySlice = new Map(); slices.set(slice, bySlice); }
+      const held = bySlice.get(token);
+      if (!held || mark.t > held.t) bySlice.set(token, mark);
+    });
+  });
+
+  const picks = [];
+  const ics = [];
+  const icSeries = [];
+  let unresolved = 0;
+  let momentsWithBoard = 0;
+
+  slices.forEach((bySlice) => {
+    const resolved = [];
+    bySlice.forEach((mark, token) => {
+      if (mark.t > until) { pending += 1; return; }
+      const series = (observations && observations[token]) || [];
+      const i = series.length ? indexAtOrAfter(series, mark.t, toleranceMs) : -1;
+      const j = i >= 0 ? indexAtOrAfter(series, mark.t + horizonMs, toleranceMs) : -1;
+      if (i < 0 || j < 0 || !(series[i].price > 0) || !(series[j].price > 0)) { unresolved += 1; return; }
+      const entry = series[i];
+      const exit = series[j];
+      let hiP = entry.price; let loP = entry.price;
+      for (let x = i; x <= j; x += 1) {
+        const p = series[x].price;
+        if (p > hiP) hiP = p;
+        if (p > 0 && p < loP) loP = p;
+      }
+      resolved.push({
+        token, t: mark.t, score: mark.score, stage: mark.stage,
+        flags: Array.isArray(mark.flags) ? mark.flags : [],
+        ret: ((exit.price - entry.price) / entry.price) * 100,
+        mfe: ((hiP - entry.price) / entry.price) * 100,
+        mae: ((loP - entry.price) / entry.price) * 100,
+        rug: entry.liquidity > 0 && Number.isFinite(exit.liquidity)
+          ? exit.liquidity / entry.liquidity < 0.2 : false,
+      });
+    });
+    if (!resolved.length) return;
+
+    // Only a moment with a real board can say what "the market" did.
+    const hasBoard = resolved.length >= minBoard;
+    const boardMedian = hasBoard ? median(resolved.map((p) => p.ret)) : null;
+    if (hasBoard) momentsWithBoard += 1;
+    const ranked = resolved.slice().sort((a, b) => b.score - a.score);
+    ranked.forEach((p, r) => {
+      p.excess = hasBoard ? p.ret - boardMedian : null;
+      p.quintile = hasBoard ? 'Q' + (Math.floor((r * 5) / ranked.length) + 1) : null;
+      picks.push(p);
+    });
+    if (resolved.length >= minIcBoard) {
+      const ic = spearman(resolved.map((p) => p.score), resolved.map((p) => p.ret));
+      if (ic !== null) {
+        ics.push(ic);
+        icSeries.push({ t: Math.min(...resolved.map((p) => p.t)), ic: round(ic, 3), n: resolved.length });
+      }
+    }
+  });
+  icSeries.sort((a, b) => a.t - b.t);
+
+  const summarize = (list) => {
+    const withBoard = list.filter((p) => p.excess !== null);
+    return {
+      n: list.length,
+      avgScore: list.length ? round(list.reduce((s, p) => s + p.score, 0) / list.length, 1) : null,
+      winRate: list.length ? round(list.filter((p) => p.ret > 0).length / list.length, 3) : null,
+      hitRate: withBoard.length ? round(withBoard.filter((p) => p.excess > 0).length / withBoard.length, 3) : null,
+      medianRetPct: list.length ? round(median(list.map((p) => p.ret)), 2) : null,
+      medianExcessPct: withBoard.length ? round(median(withBoard.map((p) => p.excess)), 2) : null,
+      medianMfePct: list.length ? round(median(list.map((p) => p.mfe)), 2) : null,
+      medianMaePct: list.length ? round(median(list.map((p) => p.mae)), 2) : null,
+      rugRate: list.length ? round(list.filter((p) => p.rug).length / list.length, 3) : null,
+    };
+  };
+
+  const byScore = OUTCOME_SCORE_BANDS.map((b) => Object.assign({ key: b.key, label: b.label, lo: b.lo, hi: b.hi },
+    summarize(picks.filter((p) => p.score >= b.lo && p.score < b.hi))));
+  const byRank = OUTCOME_RANK_BANDS.map((b) => Object.assign({ key: b.key, label: b.label },
+    summarize(picks.filter((p) => p.quintile === b.key))));
+
+  // Rank IC: mean, spread, and a t-stat so a lucky afternoon reads as noise.
+  const icMean = ics.length ? ics.reduce((s, x) => s + x, 0) / ics.length : null;
+  const icSd = ics.length > 1
+    ? Math.sqrt(ics.reduce((s, x) => s + (x - icMean) ** 2, 0) / (ics.length - 1)) : null;
+  // An IC identical in every moment has no spread, which is the STRONGEST
+  // evidence, not none - so a zero sd caps t instead of dropping it.
+  const icT = icSd == null ? null
+    : icSd > 0 ? Math.max(-99, Math.min(99, icMean / (icSd / Math.sqrt(ics.length))))
+      : Math.sign(icMean) * 99;
+
+  // Monotonicity across the rank quintiles that hold enough picks to compare.
+  const MIN_GROUP = 10;
+  const ladder = byRank.filter((g) => g.n >= MIN_GROUP && g.medianExcessPct !== null);
+  let ordered = 0;
+  for (let i = 1; i < ladder.length; i += 1) {
+    if (ladder[i - 1].medianExcessPct >= ladder[i].medianExcessPct) ordered += 1;
+  }
+  const top = byRank[0];
+  const bottom = byRank[byRank.length - 1];
+  const spreadPct = top.n >= MIN_GROUP && bottom.n >= MIN_GROUP &&
+    top.medianExcessPct !== null && bottom.medianExcessPct !== null
+    ? round(top.medianExcessPct - bottom.medianExcessPct, 2) : null;
+
+  // Brier / ECE, reading score/100 as P(beat the board). See the doc above.
+  const judged = picks.filter((p) => p.excess !== null);
+  let brier = null; let ece = null; let brierBase = null;
+  if (judged.length) {
+    const hit = (p) => (p.excess > 0 ? 1 : 0);
+    brier = judged.reduce((s, p) => s + (p.score / 100 - hit(p)) ** 2, 0) / judged.length;
+    const base = judged.reduce((s, p) => s + hit(p), 0) / judged.length;
+    brierBase = base * (1 - base);
+    ece = 0;
+    for (let b = 0; b < 10; b += 1) {
+      const inBin = judged.filter((p) => Math.min(9, Math.floor(p.score / 10)) === b);
+      if (!inBin.length) continue;
+      const conf = inBin.reduce((s, p) => s + p.score / 100, 0) / inBin.length;
+      const acc = inBin.reduce((s, p) => s + hit(p), 0) / inBin.length;
+      ece += (inBin.length / judged.length) * Math.abs(conf - acc);
+    }
+  }
+
+  // WARNING FLAGS: which flags came before a loss MORE often than before a
+  // win. Counting flags on losers alone (the old false-positive list) mostly
+  // ranks whichever flag is common - a flag on 60% of losers and 60% of
+  // winners warns of nothing. One count per pick, not per minute.
+  const losers = judged.filter((p) => p.excess < 0);
+  const winners = judged.filter((p) => p.excess > 0);
+  const MIN_FLAG = 5;
+  const flagCounts = {};
+  judged.forEach((p) => {
+    new Set(p.flags).forEach((code) => {
+      const c = flagCounts[code] || (flagCounts[code] = { code, lost: 0, won: 0, n: 0 });
+      c.n += 1;
+      if (p.excess < 0) c.lost += 1; else if (p.excess > 0) c.won += 1;
+    });
+  });
+  const flags = Object.values(flagCounts)
+    .filter((c) => c.n >= MIN_FLAG)
+    .map((c) => {
+      const lossShare = losers.length ? c.lost / losers.length : 0;
+      const winShare = winners.length ? c.won / winners.length : 0;
+      return {
+        code: c.code, picks: c.n,
+        lossShare: round(lossShare, 3), winShare: round(winShare, 3),
+        // Of the picks carrying this flag, how many lost to the board.
+        lossRate: round(c.lost / c.n, 3),
+        gap: round(lossShare - winShare, 3),
+      };
+    })
+    .sort((a, b) => b.gap - a.gap);
+
+  const MIN_PICKS = 30;
+  const MIN_MOMENTS = 4;
+  let verdict = 'COLLECTING';
+  if (picks.length >= MIN_PICKS && ics.length >= MIN_MOMENTS) {
+    if (icMean > 0.03 && icT > 2) verdict = 'EDGE';
+    else if (icMean < -0.03 && icT < -2) verdict = 'INVERTED';
+    else verdict = 'NO CLEAR EDGE';
+  }
+
+  return {
+    horizonMs, sliceMs, toleranceMs,
+    picks: picks.length,
+    // The rows for one token, when a caller asked for them. Never the whole
+    // set - that is tens of thousands of rows the board report does not need.
+    pickRows: keepPicksFor ? picks.filter((x) => x.token === keepPicksFor) : null,
+    judged: judged.length,
+    moments: momentsWithBoard,
+    pending, unresolved,
+    board: summarize(picks),
+    byScore, byRank,
+    ic: { mean: round(icMean, 3), sd: round(icSd, 3), t: round(icT, 2), moments: ics.length,
+      positiveShare: ics.length ? round(ics.filter((x) => x > 0).length / ics.length, 2) : null },
+    icSeries,
+    flags, losers: losers.length, winners: winners.length,
+    spreadPct,
+    monotonic: { ordered, steps: Math.max(0, ladder.length - 1) },
+    brier: round(brier, 3), brierBase: round(brierBase, 3), ece: round(ece, 3),
+    verdict,
+    thresholds: { minPicks: MIN_PICKS, minMoments: MIN_MOMENTS, minGroup: MIN_GROUP, minBoard, minIcBoard, minFlag: MIN_FLAG,
+      icEdge: 0.03, tEdge: 2, rugLiquidityRatio: 0.2 },
+  };
+}
+
 /* ================================================== 10. system health ==== */
 
-/** Provider percentiles from the server's raw latency samples. */
+/** How far back "now" reaches for a provider's status. */
+export const PROVIDER_WINDOW_MIN = 15;
+/** Bars in a provider's sparkline, one per minute. */
+export const PROVIDER_SPARK_MIN = 60;
+
+/**
+ * Provider rates, percentiles and status from the server's raw counters.
+ *
+ * Status is judged on the last PROVIDER_WINDOW_MIN minutes, not on lifetime
+ * totals: a lifetime rate never recovers, so a source that failed for an hour
+ * after boot would read as failing all day. Servers that predate the minute
+ * buckets fall back to lifetime and say so (`window: 'lifetime'`).
+ *
+ * DOWN at half the calls failing, DEGRADED at a tenth. A single stray timeout
+ * is not a status - every public API drops the odd call.
+ */
 export function providerHealth(upstream) {
   if (!upstream) return [];
-  const minutes = Math.max((Date.now() - upstream.since) / 60000, 1 / 60);
+  const now = Date.now();
+  const minutes = Math.max((now - upstream.since) / 60000, 1 / 60);
   return (upstream.providers || []).map((p) => {
     const samples = (p.latencySamplesMs || []).slice().sort((a, b) => a - b);
     const errorRate = p.calls ? p.errors / p.calls : 0;
+    const buckets = Array.isArray(p.minutes) ? p.minutes : null;
+    const minuteMs = p.minuteMs || 60000;
+    const thisMinute = Math.floor(now / minuteMs) * minuteMs;
+
+    let recent = null;
+    let spark = null;
+    if (buckets) {
+      const from = thisMinute - (PROVIDER_WINDOW_MIN - 1) * minuteMs;
+      const inWindow = buckets.filter((b) => b.t >= from);
+      const kinds = {};
+      inWindow.forEach((b) => Object.keys(b.kinds || {}).forEach((k) => { kinds[k] = (kinds[k] || 0) + b.kinds[k]; }));
+      const calls = inWindow.reduce((s, b) => s + b.calls, 0);
+      const errors = inWindow.reduce((s, b) => s + b.errors, 0);
+      const ok = inWindow.reduce((s, b) => s + (b.ok || 0), 0);
+      const msSum = inWindow.reduce((s, b) => s + (b.msSum || 0), 0);
+      // The window is shorter than PROVIDER_WINDOW_MIN while the server is young.
+      const spanMin = Math.max(Math.min(PROVIDER_WINDOW_MIN, (now - upstream.since) / 60000), 1 / 60);
+      recent = {
+        minutes: round(spanMin, 1), calls, errors, kinds,
+        callsPerMinute: round(calls / spanMin, 1),
+        errorRatePct: calls ? round((errors / calls) * 100, 1) : null,
+        avgMs: ok ? Math.round(msSum / ok) : null,
+      };
+      const byT = new Map(buckets.map((b) => [b.t, b]));
+      spark = [];
+      for (let i = PROVIDER_SPARK_MIN - 1; i >= 0; i--) {
+        const b = byT.get(thisMinute - i * minuteMs);
+        spark.push(b ? { calls: b.calls, errors: b.errors } : { calls: 0, errors: 0 });
+      }
+    }
+
+    const judged = recent || { calls: p.calls, errors: p.errors };
+    const judgedRate = judged.calls ? judged.errors / judged.calls : 0;
+    const status = !judged.calls ? 'IDLE'
+      : judgedRate >= 0.5 ? 'DOWN'
+        : judgedRate >= 0.1 ? 'DEGRADED' : 'OK';
+
     return {
       provider: p.provider,
       calls: p.calls,
       callsPerMinute: round(p.calls / minutes, 1),
       errors: p.errors,
       errorRatePct: round(errorRate * 100, 1),
+      errorKinds: p.errorKinds || null,
       lastError: p.lastError,
+      lastErrorAt: p.lastErrorAt || null,
+      lastOkAt: p.lastOkAt || null,
       p50Ms: samples.length ? samples[samples.length >> 1] : null,
       p95Ms: samples.length ? samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))] : null,
-      status: errorRate > 0.25 ? 'DEGRADED' : errorRate > 0 ? 'PARTIAL' : 'OK',
+      window: recent ? 'recent' : 'lifetime',
+      recent,
+      spark,
+      status,
     };
   }).sort((a, b) => b.calls - a.calls);
 }

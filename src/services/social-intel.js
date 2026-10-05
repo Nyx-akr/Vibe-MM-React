@@ -20,10 +20,11 @@
  * nothing, so the work is split by what is actually expensive:
  *
  *   SAMPLING  (upstream, slow)  each feed refreshes every 5-15 minutes. The
- *                               server stamps the corpus with `corpusAt`.
- *   READING   (cheap)           the poll sends `?since=<corpusAt>`; when the
- *                               corpus has not moved the server omits the
- *                               posts and answers in ~11KB instead of ~1.2MB.
+ *                               collector writes the corpus to social.json,
+ *                               stamped with `corpusAt`, when it moves.
+ *   READING   (cheap)           an unchanged file revalidates as a 304 and is
+ *                               not re-parsed (storage/raw-store.js), so a tick
+ *                               that learns nothing does not move ~1.2MB.
  *   PROCESSING(free, local)     every board symbol is re-measured every tick
  *                               against the corpus already in memory.
  *   MEMORY    (free, local)     each tick's counts are folded into a per-token
@@ -40,42 +41,34 @@
  */
 
 import { mentionsFor, mentionBaseline } from '../calculations/core';
+import * as historyStore from './storage/history-store';
+import { readRaw } from './storage/raw-store';
 
 /* -------------------------------------------------------------- storage -- */
 
-const STORAGE_KEY = 'vs_social_memory';
+const STORAGE_KEY = 'social-memory';
 
 /**
- * Same deal as the wallet memory and the score journal: one interface,
- * localStorage behind it for now. Swap this object to move the memory
- * somewhere shared.
+ * The fast history store (IndexedDB), not localStorage - same move as the
+ * wallet memory. 600 tokens x 240 baseline samples is well past what a
+ * synchronous 5MB store should be asked to hold, and it shared that quota
+ * with the user's watchlist.
+ *
+ * Reads stay synchronous because the store is hydrated into RAM at boot,
+ * before the poller starts - see storage/history-store.js.
  */
-const localStorageBackend = {
-  name: 'localStorage',
-  describe: () => 'this browser only',
-  load(key) {
-    try {
-      const raw = window.localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) {
-      return null;
-    }
-  },
-  save(key, data) {
-    try {
-      window.localStorage.setItem(key, JSON.stringify(data));
-      return true;
-    } catch (e) {
-      return false;
-    }
-  },
+const historyBackend = {
+  name: 'history-store',
+  describe: () => historyStore.describe(),
+  load(key) { return historyStore.get(key); },
+  save(key, data) { return historyStore.put(key, data); },
 };
 
-const ACTIVE_BACKEND = localStorageBackend;
+const ACTIVE_BACKEND = historyBackend;
 
 export const socialMemoryBackend = {
   name: ACTIVE_BACKEND.name,
-  describe: ACTIVE_BACKEND.describe(),
+  get describe() { return ACTIVE_BACKEND.describe(); },
 };
 
 /* --------------------------------------------------------------- limits -- */
@@ -121,7 +114,6 @@ let running = false;
  */
 let polling = false;
 let lastPersistAt = 0;
-let baseUrl = '';
 let chainList = [];
 let chainCursor = 0;
 let symbolProvider = () => [];
@@ -257,36 +249,35 @@ function remember(symbol, mention, now) {
 /* ----------------------------------------------------------------- poll -- */
 
 /**
- * One request per tick, for one chain at a time.
+ * Two raw-store reads per tick: the corpus, and one chain's promotion rows.
  *
  * The corpus is chain-independent - 4chan and Reddit do not know what a chain
- * is - so a single poll updates the posts for every token on every chain. Only
- * the DexScreener promotion rows are per-chain, and those are what the
- * rotation is for: each chain's promotion refreshes every few ticks, which is
- * far more often than the 2-minute cache behind it.
+ * is - so one file updates the posts for every token on every chain. Only the
+ * DexScreener promotion rows are per-chain, and those are what the rotation is
+ * for: each chain's file is re-read every few ticks, far more often than the
+ * collector rewrites it.
  */
 async function poll() {
   const chain = chainList[chainCursor % chainList.length] || 'solana';
   chainCursor = (chainCursor + 1) % Math.max(1, chainList.length);
 
-  const url = baseUrl + '/api/social?chain=' + encodeURIComponent(chain) +
-    (corpusAt ? '&since=' + corpusAt : '');
-  const response = await fetch(url);
-  if (!response.ok) throw new Error('HTTP ' + response.status + ' from /api/social');
-  const text = await response.text();
-  status.bytesLastTick = text.length;
-  const data = JSON.parse(text);
-  if (!data || data.server !== 'ok') throw new Error('social endpoint not ok');
+  const [data, promotion] = await Promise.all([
+    readRaw('social.json'),
+    readRaw(chain + '/promotion.json').catch(() => null),
+  ]);
+  if (!data) throw new Error('social.json not written yet');
 
-  if (Array.isArray(data.posts)) {
+  // readRaw hands back the same object for an unchanged file, so a new
+  // corpusAt is the signal that the posts actually moved.
+  if (Array.isArray(data.posts) && data.corpusAt !== corpusAt) {
     corpus = data.posts;
     status.corpusRefreshes += 1;
   }
   if (data.corpusAt) corpusAt = data.corpusAt;
   if (Array.isArray(data.sources)) sources = data.sources;
   if (data.absent) absentNote = data.absent;
-  if (data.promotion && Array.isArray(data.promotion.rows)) {
-    promotionByChain.set(chain, data.promotion.rows);
+  if (promotion && Array.isArray(promotion.rows)) {
+    promotionByChain.set(chain, promotion.rows);
   }
   status.lastPolledChain = chain;
   return chain;
@@ -357,9 +348,8 @@ async function tick() {
 
 /* ------------------------------------------------------------ lifecycle -- */
 
-export function startSocialIntel({ baseUrl: baseUrlIn, chains, getSymbols } = {}) {
+export function startSocialIntel({ chains, getSymbols } = {}) {
   if (running) return;
-  baseUrl = String(baseUrlIn || '').replace(/\/+$/, '');
   chainList = (chains || []).slice();
   if (typeof getSymbols === 'function') symbolProvider = getSymbols;
 
