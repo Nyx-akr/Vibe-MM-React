@@ -399,7 +399,12 @@ export const SIZES = {
   step: { w: 230, h: 34 },
 };
 
-export const sizeOf = (n) => (n.kind === 'field' && n.flat ? SIZES.step : SIZES[n.kind]);
+// An engine sizes itself (its height follows its port count); a boundary port is a slim box.
+export const sizeOf = (n) => {
+  if (n.kind === 'engine') return { w: n.w, h: n.h };
+  if (n.kind === 'port') return { w: 200, h: 28 };
+  return n.kind === 'field' && n.flat ? SIZES.step : SIZES[n.kind];
+};
 
 const COL_GAP = 110;
 const ROW_GAP = 14;
@@ -469,6 +474,10 @@ export function layout(graph) {
   // The BLOCK a box belongs to: one per pipeline step, plus sources, files,
   // display panels and stores.
   const blockOf = (n) => {
+    // Inside an engine: its inlets are the left edge, its outlets the right.
+    if (n.kind === 'port') return n.side === 'in' ? -1 : 9;
+    // An engine sits in the column of the earliest step it holds.
+    if (n.kind === 'engine') return n.block;
     if (n.kind === 'provider') return 0;
     if (n.kind === 'file') return 1;
     if (n.kind === 'store') return 8;
@@ -597,6 +606,8 @@ export function layout(graph) {
 
   // One header per BLOCK, spanning all of its sub-columns.
   const head = (b) => {
+    if (b === -1) return { text: 'INLETS', sub: 'data coming into this engine', color: '#e7edff' };
+    if (b === 9) return { text: 'OUTLETS', sub: 'data this engine hands on', color: '#e7edff' };
     if (b === 0) return { text: 'SOURCES', sub: 'what the server fetches', color: KIND_COLORS.provider };
     if (b === 1) return { text: 'RAW STORE', sub: 'files the app reads every 5s', color: KIND_COLORS.file };
     if (b >= 2 && b <= 6) {
@@ -612,6 +623,9 @@ export function layout(graph) {
     const h = head(b);
     if (!h) return;
     const inBlock = keys.filter((c) => Math.floor(c / 10) === b);
+    // A column of engines only is named by the engines themselves; a step
+    // header over it would claim the engine IS that step.
+    if (inBlock.every((c) => columns.get(c).every((n) => n.kind === 'engine'))) return;
     const last = inBlock[inBlock.length - 1];
     captions.push({ kind: 'stage', x: colX.get(k), y: 8, w: colX.get(last) + colW.get(last) - colX.get(k), ...h });
   });

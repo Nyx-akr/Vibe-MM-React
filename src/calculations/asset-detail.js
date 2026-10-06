@@ -18,6 +18,7 @@
  * it costs to look dangerous).
  */
 
+import { evaluateGates } from './gates.js';
 import {
   toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
   zScoresFrom, bucketBaselines, rotationFor, walletQualityScore, organicFlowScore,
@@ -795,8 +796,15 @@ export function scoreAsset(row, extras) {
 
   const rawScore = weightUsed ? Math.round(weighted / weightUsed) : 0;
   const risk = assessRisk(row, modifiers, context);
+  // The hard gates (calculations/gates.js). A token that fails any of them
+  // is vetoed: its score is 0 whatever it trades like. A gate with no data
+  // yet is not a fail.
+  const gates = evaluateGates(row, {
+    intel: context.intel,
+    organicFlow: modifiers.organicFlow ? modifiers.organicFlow.value : null,
+  });
   // What this poll alone says.
-  const scoreNow = Math.max(0, Math.min(100, rawScore - risk.penalty));
+  const scoreNow = gates.vetoed ? 0 : Math.max(0, Math.min(100, rawScore - risk.penalty));
 
   // What the token has been worth over the window. A one-off evaluation
   // (trackStage false) has no business writing to the rolling window, so it
@@ -804,7 +812,9 @@ export function scoreAsset(row, extras) {
   const settled = context.trackStage === false
     ? { average: scoreNow, samples: 1, observedMs: 0, min: scoreNow, max: scoreNow }
     : settledScore(row.chain, row.tokenAddress, scoreNow, Date.now());
-  const score = settled.average;
+  // A veto is immediate: the 15-minute average would otherwise take a
+  // quarter of an hour to admit the token failed a gate.
+  const score = gates.vetoed ? 0 : settled.average;
 
   const stage = context.trackStage === false
     ? { stage: (STAGES.find((s) => score >= s.min) || STAGES[STAGES.length - 1]).name,
@@ -813,6 +823,8 @@ export function scoreAsset(row, extras) {
 
   return {
     rawScore,
+    gates,
+    vetoed: gates.vetoed,
     riskPenalty: risk.penalty,
     riskFlags: risk.flags,
     // The headline everywhere: the windowed average.

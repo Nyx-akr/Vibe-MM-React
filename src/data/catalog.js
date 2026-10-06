@@ -69,6 +69,30 @@ export const SOURCES = [
       "1200 is the starting score. Raises a risk flag and never a score penalty.",
     chains: "all (by handle); addresses are EVM only - Solana addresses are rejected",
   },
+  // Perp venues - which tickers already have a futures market. One request
+  // each, every 30 min, into perps.json (Vibe-mm-server/lib/perps.js).
+  {
+    id: "hyperliquid", url: "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint", label: "Hyperliquid", keyless: true,
+    endpoints: ['POST /info {"type":"meta"}'], provides: "every perp market listed, by ticker",
+  },
+  {
+    id: "binance", url: "https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Exchange-Information", label: "Binance USD-M", keyless: true,
+    endpoints: ["/fapi/v1/exchangeInfo"], provides: "every USD-M perp market listed, by ticker",
+  },
+  {
+    id: "aster", url: "https://docs.asterdex.com", label: "Aster", keyless: true,
+    endpoints: ["/fapi/v1/exchangeInfo"], provides: "every perp market listed, by ticker",
+  },
+  {
+    id: "okx", url: "https://www.okx.com/docs-v5/en/", label: "OKX", keyless: true,
+    endpoints: ["/api/v5/public/instruments?instType=SWAP"], provides: "every perp swap listed, by ticker",
+    chains: "refuses calls from some regions - reported as unreachable, never as 'no perp'",
+  },
+  {
+    id: "bybit", url: "https://bybit-exchange.github.io/docs/v5/market/instrument", label: "Bybit", keyless: true,
+    endpoints: ["/v5/market/instruments-info?category=linear"], provides: "every linear perp listed, by ticker",
+    chains: "refuses calls from some regions - reported as unreachable, never as 'no perp'",
+  },
   {
     id: "cex", url: "https://www.coingecko.com/en/api/documentation", label: "Binance + Coinbase + CoinGecko", keyless: true,
     endpoints: ["spot price"],

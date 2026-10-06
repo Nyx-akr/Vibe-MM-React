@@ -286,13 +286,15 @@ export default class AdminPanel extends App {
     if (fresh || this.rawLoading === key) return;
     this.rawLoading = key;
     try {
-      const [market, trades, history, intel, reference, ethos] = await Promise.all([
+      const [market, trades, history, intel, reference, ethos, perps, promotion] = await Promise.all([
         readRawQuiet(s.chain + '/market.json', null),
         readRawQuiet(s.chain + '/trades.json', null),
         readRawQuiet(s.chain + '/history.json', null),
         readRawQuiet(s.chain + '/intel.json', null),
         readRawQuiet('reference.json', null),
         readRawQuiet('ethos.json', null),
+        readRawQuiet('perps.json', null),
+        readRawQuiet(s.chain + '/promotion.json', null),
       ]);
       const ethosToken = ethos && ethos.tokens && ethos.tokens[s.chain]
         ? ethos.tokens[s.chain][s.tokenAddress] || null : null;
@@ -309,6 +311,21 @@ export default class AdminPanel extends App {
         ethos: ethosToken ? {
           token: ethosToken,
           profile: (ethos.handles || {})[ethosToken.handle] || null,
+        } : null,
+        // Perp venues match by TICKER (venues list symbols, not contracts), so
+        // this token's record is its symbol's entry plus every venue's status -
+        // "no perp" only means something next to how many venues answered.
+        perps: perps ? {
+          symbol: String(s.symbol || '').toUpperCase(),
+          listedOn: (perps.symbols || {})[String(s.symbol || '').toUpperCase()] || [],
+          venues: perps.venues || {},
+          checked: perps.venuesReachable, total: perps.venuesTotal,
+        } : null,
+        // DexScreener's paid boosts and profiles on this chain, this token's rows.
+        promotion: promotion ? {
+          rows: (promotion.rows || []).filter((r) =>
+            String(r.tokenAddress || '').toLowerCase() === String(s.tokenAddress || '').toLowerCase()),
+          feedRows: (promotion.rows || []).length,
         } : null,
         // What the file says its per-token record looks like, so a card with
         // no record for this token can still draw the format it expects.

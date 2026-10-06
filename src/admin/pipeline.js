@@ -28,6 +28,7 @@ import { SHOWN_PAGES } from './pipeline-shown';
 import { showsForPanel } from './shows';
 import { multipleScore, logScore, to100, Z_MIN_SAMPLES } from '../calculations/core.js';
 import { TOTAL_WEIGHT, SCORE_MODEL, STAGES } from '../calculations/asset-detail.js';
+import { GATES, GATE_RULES } from '../calculations/gates.js';
 
 /* ------------------------------------------------------------ readers -- */
 
@@ -64,6 +65,23 @@ const weightOf = (key) => (SCORE_MODEL.find((c) => c.key === key) || {}).weight;
 const said = (c) => (valueOf(c) === null ? 'pending - no input yet' : '· score used ' + c.value);
 
 const minutes = (ms) => (fin(ms) ? Math.round(ms / 60000) + ' min' : null);
+
+/* -------------------------------------------------------------- gates -- */
+
+/**
+ * The gates are READ from the score, never recomputed: scoreAsset() runs
+ * calculations/gates.js and keeps its verdict on the row (`row.gates`), so a
+ * gate box can only ever say what the score acted on. A test is {ok, detail}:
+ * ok true = pass, false = VETO, null (no answer) = not checked yet.
+ */
+const G = GATE_RULES;
+const WASH_FLOOR = GATE_RULES.minOrganicFlow;
+const GATE_TESTS = Object.fromEntries(GATES.map((g) => [g.label, (v) => {
+  const c = (((S(v) || {}).gates || {}).checks || []).find((x) => x.label === g.label);
+  return c && c.ok !== null ? { ok: c.ok, detail: c.detail + (c.ok ? ' → pass' : ' → VETO') } : null;
+}]));
+const gateOf = (v, label) => (S(v) && GATE_TESTS[label] ? GATE_TESTS[label](v) : null);
+const verdict = (r) => (r ? (r.ok ? 'pass' : 'VETO') : null);
 
 /* ------------------------------------------------------------- shared -- */
 
@@ -290,12 +308,7 @@ PAGES.pipe = {
       fields: [
         {
           label: 'SELLABLE', status: 'live',
-          value: (v) => {
-            const cs = (IN(v) || {}).contractSafety;
-            if (!cs || !cs.available) return null;
-            const hit = (cs.checks || []).find((c) => /honeypot|sell/i.test(c.label || ''));
-            return hit ? (hit.ok ? 'pass' : 'FAIL') : null;
-          },
+          value: (v) => verdict(gateOf(v, 'SELLABLE')),
           calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- a simulated buy AND sell must both succeed')],
           equation: (v) => {
             const cs = (IN(v) || {}).contractSafety;
@@ -308,12 +321,7 @@ PAGES.pipe = {
         },
         {
           label: 'TAX IN RANGE', status: 'live',
-          value: (v) => {
-            const cs = (IN(v) || {}).contractSafety;
-            if (!cs || !cs.available) return null;
-            const hit = (cs.checks || []).find((c) => /tax/i.test(c.label || ''));
-            return hit ? (hit.ok ? 'pass' : 'FAIL') : null;
-          },
+          value: (v) => verdict(gateOf(v, 'TAX IN RANGE')),
           calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- buy, sell and transfer tax each at or under'), num('5%')],
           equation: (v) => {
             const cs = (IN(v) || {}).contractSafety;
@@ -325,10 +333,7 @@ PAGES.pipe = {
         },
         {
           label: 'NOT A MAJOR', status: 'live',
-          value: (v) => {
-            const mc = (S(v) || {}).marketCapUsd;
-            return fin(mc) ? (mc < 1e9 ? 'pass' : 'FAIL') : null;
-          },
+          value: (v) => verdict(gateOf(v, 'NOT A MAJOR')),
           calc: [ext('dexscreener', 'marketCapUsd'), op('else'), ext('geckoterminal', 'marketCapUsd'),
             op('under'), num('$1B'), op('- the cap band, applied as a gate rather than a weight')],
           via: api('/raw/<chain>/market.json'),
@@ -351,41 +356,64 @@ PAGES.pipe = {
           },
           where: 'calculations/core.js screenRows()',
         },
+        // The three floors that separate a market from a listing: old enough
+        // to be past the rug window, deep enough to price a perp against, and
+        // traded enough that anyone would use one.
+        {
+          label: 'AGE FLOOR', status: 'live',
+          value: (v) => verdict(gateOf(v, 'AGE FLOOR')),
+          calc: [api('/raw/<chain>/market.json', 'POOL AGE'), op('at or over'), num(G.minAgeHours / 24 + ' days')],
+          equation: (v) => { const r = gateOf(v, 'AGE FLOOR'); return r ? r.detail : (S(v) ? 'no pool creation time - not checked' : null); },
+          note: 'Most rugs happen in the first week. Under 14 days a token belongs to the new-launch ' +
+            'lane, which has its own gates - until that lane exists, it is vetoed: score 0.',
+          where: 'calculations/gates.js evaluateGates()',
+        },
+        {
+          label: 'LIQUIDITY FLOOR', status: 'live',
+          value: (v) => verdict(gateOf(v, 'LIQUIDITY FLOOR')),
+          calc: [api('/raw/<chain>/market.json', 'LIQUIDITY'), op('at or over'), num(usd(G.minLiquidityUsd))],
+          equation: (v) => { const r = gateOf(v, 'LIQUIDITY FLOOR'); return r ? r.detail : (S(v) ? 'no liquidity reported - not checked' : null); },
+          note: 'The pool a perp is priced against. Too shallow and one trader moves the index.',
+          where: 'calculations/gates.js evaluateGates()',
+        },
+        {
+          label: 'VOLUME FLOOR', status: 'live',
+          value: (v) => verdict(gateOf(v, 'VOLUME FLOOR')),
+          calc: [api('/raw/<chain>/market.json', 'VOLUME 24H'), op('at or over'), num(usd(G.minVolume24hUsd))],
+          equation: (v) => { const r = gateOf(v, 'VOLUME FLOOR'); return r ? r.detail : (S(v) ? 'no 24h volume reported - not checked' : null); },
+          note: 'The spec asks for the 7-day MEDIAN of daily volume. The files hold only the last 24h, ' +
+            'so one hot day can pass a token that is quiet the other six.',
+          where: 'calculations/gates.js evaluateGates()',
+        },
         {
           label: 'NOT WASH-FLAGGED', status: 'live',
-          value: (v) => {
-            const val = valueOf(modOf(v, 'organicFlow'));
-            return val === null ? null : (val >= 40 ? 'pass' : 'FAIL');
-          },
-          calc: [ref('pipe', 'Organic flow'), op('under'), num(40), op('= the flow is mostly not real')],
-          equation: (v) => {
-            const val = valueOf(modOf(v, 'organicFlow'));
-            if (val === null) return 'no trade sample for this pool yet - not checked';
-            return 'organic ' + val + ' against the 40 floor' + (val < 40 ? ' - would be vetoed' : '');
-          },
-          note: 'Today this costs points rather than vetoing. It is drawn here because it IS a veto in ' +
-            'the qualifier, and the map should show where it belongs before the behaviour follows.',
-          where: WHERE_MODEL,
+          value: (v) => verdict(gateOf(v, 'NOT WASH-FLAGGED')),
+          calc: [ref('pipe', 'Organic flow'), op('at or over'), num(WASH_FLOOR)],
+          equation: (v) => { const r = gateOf(v, 'NOT WASH-FLAGGED'); return r ? r.detail : (S(v) ? 'no trade sample for this pool yet - not checked' : null); },
+          note: 'Under 40 the volume is mostly the same wallets trading with themselves, and a perp ' +
+            'on fake volume has no real traders. A veto: the score goes to 0.',
+          where: 'calculations/gates.js evaluateGates()',
         },
         {
           label: 'VETO LOG', status: 'live',
           value: (v) => {
-            const cs = (IN(v) || {}).contractSafety;
-            const failed = cs && cs.available ? (cs.checks || []).filter((c) => !c.ok).length : 0;
-            return failed ? failed + ' failed' : 'clean';
+            const g = (S(v) || {}).gates;
+            if (!g) return null;
+            return g.vetoed ? 'VETO · ' + g.vetoes.length + ' failed' : 'clean';
           },
-          calc: [ref('pipe', 'SELLABLE'), op('+'), ref('pipe', 'TAX IN RANGE'), op('+'),
-            ref('pipe', 'NOT A MAJOR'), op('+'), ref('pipe', 'REAL TICKER'), op('+'), ref('pipe', 'NOT WASH-FLAGGED')],
+          calc: Object.keys(GATE_TESTS).reduce((a, k, i) => a.concat(i ? [op('+'), ref('pipe', k)] : [ref('pipe', k)]), []),
           equation: (v) => {
-            const cs = (IN(v) || {}).contractSafety;
-            if (!cs || !cs.available) return 'nothing to log - no contract data for this token yet';
-            const failed = (cs.checks || []).filter((c) => !c.ok);
-            return failed.length ? failed.map((c) => c.label + ': ' + (c.detail || 'failed')).join('   ')
-              : 'every gate this token could be checked against passed';
+            if (!S(v)) return null;
+            const rows = Object.keys(GATE_TESTS).map((k) => [k, gateOf(v, k)]);
+            const failed = rows.filter(([, r]) => r && !r.ok);
+            const unknown = rows.filter(([, r]) => !r).map(([k]) => k);
+            const tail = unknown.length ? '   (not checked yet: ' + unknown.join(', ') + ')' : '';
+            return (failed.length ? failed.map(([k, r]) => k + ': ' + r.detail).join('   ')
+              : 'every gate this token could be checked against passed') + tail;
           },
-          note: 'The gates output, not an engine. A vetoed token is logged with its reason, which is ' +
-            'what makes the log a reject list you can read rather than an absence you have to infer.',
-          where: WHERE_MODEL,
+          note: 'The gates output. One failed gate vetoes the token: RIGHT NOW and FINAL become 0. ' +
+            'Each veto is logged with its reason, so the log is a reject list you can read.',
+          where: 'calculations/gates.js evaluateGates() → asset-detail.js scoreAsset()',
         },
       ],
     },
@@ -588,6 +616,41 @@ PAGES.pipe = {
       ],
     },
     {
+      group: 'WHITESPACE', stage: 4,
+      note: 'Is the perp still up for grabs. A token another venue already lists has a perp, so ' +
+        'there is nothing for Vibe to offer it. Measured and shown, carrying no weight yet.',
+      fields: [
+        {
+          label: 'NO PERP ELSEWHERE', status: 'partial',
+          value: (v) => {
+            const p = (P(v).raw || {}).perps;
+            if (!p || !S(v)) return null;
+            if (p.listedOn.length) return 'taken · ' + p.listedOn.length + ' venue' + (p.listedOn.length > 1 ? 's' : '');
+            return p.checked ? 'open · ' + p.checked + '/' + p.total + ' checked' : 'unknown';
+          },
+          fetch: [ext('hyperliquid', 'perp markets'), ext('binance', 'USD-M perps'), ext('aster', 'perps'),
+            ext('okx', 'swaps'), ext('bybit', 'linear perps')],
+          calc: [api('/raw/perps.json', 'PERP VENUES'), op('symbols[ ticker ] - empty = whitespace, any venue = taken')],
+          equation: (v) => {
+            const p = (P(v).raw || {}).perps;
+            if (!S(v)) return null;
+            if (!p) return 'perps.json not written yet';
+            const down = Object.keys(p.venues).filter((k) => !p.venues[k].ok).map((k) => p.venues[k].label);
+            const ask = p.symbol + ' on ' + p.checked + ' of ' + p.total + ' venues';
+            if (p.listedOn.length) {
+              return ask + ' → listed on ' + p.listedOn.map((k) => (p.venues[k] || {}).label || k).join(', ') + ' → whitespace 0';
+            }
+            if (!p.checked) return 'no venue answered (' + down.join(', ') + ') - unknown, not open';
+            return ask + ' → none list it → open' + (down.length ? '   (unreachable: ' + down.join(', ') + ')' : '');
+          },
+          note: 'Matched by TICKER - venues list symbols, not contracts - so a memecoin sharing a ticker ' +
+            'with a listed coin shows as taken. A strong hint, not proof. An unreachable venue counts as ' +
+            'unknown, never as "no perp there".',
+          where: 'admin/AdminPanel.jsx loadRawBundle() perps; server lib/perps.js',
+        },
+      ],
+    },
+    {
       group: 'REACHABILITY & INTENT', stage: 4,
       note: 'Is there a project behind the token, and is it spending on being found. Measured ' +
         'today and shown here, but carrying no weight in the score yet - which is why its boxes ' +
@@ -625,6 +688,30 @@ PAGES.pipe = {
           },
           note: 'A project with no way to reach it cannot be pitched, however well it trades.',
           where: WHERE_NORM,
+        },
+        {
+          label: 'BOOSTED', status: 'partial',
+          value: (v) => {
+            const pr = (P(v).raw || {}).promotion;
+            if (!pr || !S(v)) return null;
+            const boost = pr.rows.some((r) => r.kind === 'BOOST');
+            const profile = pr.rows.some((r) => r.kind === 'PROFILE');
+            if (!boost && !profile) return 'not paying';
+            return [boost ? 'boost' : null, profile ? 'profile' : null].filter(Boolean).join(' + ');
+          },
+          fetch: [ext('dexscreener', 'token-boosts/top, token-profiles/latest')],
+          calc: [api('/raw/<chain>/promotion.json', 'PROMOTION'), op('rows[ this token ] - a BOOST or PROFILE row = paying for attention')],
+          equation: (v) => {
+            const pr = (P(v).raw || {}).promotion;
+            if (!S(v)) return null;
+            if (!pr) return 'promotion.json not written yet';
+            if (!pr.rows.length) return 'not among the ' + pr.feedRows + ' boosted / profiled tokens on this chain';
+            return pr.rows.map((r) => r.kind + (fin(r.totalAmount) ? ' ×' + r.totalAmount : '')).join(' + ');
+          },
+          note: 'DexScreener boosts and profiles are paid. A team that bought one is spending on growth ' +
+            'right now - the warmest moment to pitch, and the first daily trigger in the listing spec. The ' +
+            'feed is DexScreener\'s top list, so "not paying" can also mean "paid less than the top".',
+          where: 'admin/AdminPanel.jsx loadRawBundle() promotion; server lib/providers.js fetchPromotion()',
         },
       ],
     },
@@ -714,16 +801,23 @@ PAGES.pipe = {
         {
           label: 'RIGHT NOW', status: 'live',
           value: (v) => { const s = S(v); return s && fin(s.scoreNow) ? s.scoreNow : null; },
-          calc: [op('clamp('), ref('pipe', 'RAW'), op('−'), ref('pipe', 'RISK PENALTY'), op(', 0, 100 )')],
-          equation: (v) => { const s = S(v); return s ? s.rawScore + ' − ' + s.riskPenalty + ' = ' + s.scoreNow : null; },
+          calc: [op('if'), ref('pipe', 'VETO LOG'), op('has a veto → 0, else clamp('), ref('pipe', 'RAW'),
+            op('−'), ref('pipe', 'RISK PENALTY'), op(', 0, 100 )')],
+          equation: (v) => {
+            const s = S(v); if (!s) return null;
+            if (s.vetoed) return 'vetoed (' + s.gates.vetoes.map((c) => c.label).join(', ') + ') → 0';
+            return s.rawScore + ' − ' + s.riskPenalty + ' = ' + s.scoreNow;
+          },
           where: 'scoreAsset()',
         },
         {
           label: 'FINAL', status: 'live',
           value: (v) => { const s = S(v); return s && fin(s.score) ? s.score : null; },
-          calc: [op('mean of every'), ref('pipe', 'RIGHT NOW'), op('reading over the last'), num(15), op('minutes')],
+          calc: [op('if'), ref('pipe', 'VETO LOG'), op('has a veto → 0, else mean of every'), ref('pipe', 'RIGHT NOW'),
+            op('reading over the last'), num(15), op('minutes')],
           equation: (v) => {
             const s = S(v); if (!s) return null;
+            if (s.vetoed) return 'vetoed → 0, at once rather than averaged down over 15 minutes';
             return 'mean of ' + s.scoreSamples + ' readings over ' + (minutes(s.scoreObservedMs) || '0 min') +
               ' (range ' + s.scoreMin + '–' + s.scoreMax + ') = ' + s.score;
           },
@@ -791,13 +885,16 @@ const JUP = 'sources.jupiter.';
  * the right place.
  */
 export const RELAY_CONSUMERS = {
-  'LIQUIDITY': ['Liquidity / executability', 'RISK FLAGS'],
+  'LIQUIDITY': ['Liquidity / executability', 'RISK FLAGS', 'LIQUIDITY FLOOR'],
+  'VOLUME 24H': ['VOLUME FLOOR'],
+  'PERP VENUES': ['NO PERP ELSEWHERE'],
+  'PROMOTION': ['BOOSTED'],
   'BUYERS 24H': ['Buyer breadth'],
   'BUY/SELL 24H': ['Net demand'],
   'PRICE, 2 SOURCES': ['Price confirmation', 'Cross-venue confirm', 'RISK FLAGS'],
   'VENUES': ['Cross-venue confirm'],
   'QUOTE TOKEN PRICE': ['QUOTE DEVIATION'],
-  'POOL AGE': ['SURVIVAL', 'RISK FLAGS'],
+  'POOL AGE': ['SURVIVAL', 'RISK FLAGS', 'AGE FLOOR'],
   'VOLUME / LIQUIDITY': ['RISK FLAGS'],
   'JUPITER STATS': ['Net demand', 'Holder growth', 'Organic flow'],
   'POOL SAMPLES': ['SURVIVAL'],
@@ -961,6 +1058,24 @@ export const RAW = {
     from: 'reference',
     picks: [{ path: 'quotes', to: 'MEDIAN' }, { path: 'quotes[].price', to: 'MEDIAN' }],
     outs: [{ label: 'MEDIAN', value: (v) => { const r = (S(v) || {}).usdReference; return r && fin(r.median) ? '$' + r.median.toFixed(4) : null; } }],
+  },
+  'VOLUME 24H': {
+    from: 'market',
+    picks: [{ path: DS + 'volumeUsd.h24', to: 'VOLUME 24H' }, { path: GT + 'volumeUsd.h24', to: 'VOLUME 24H', alt: true }],
+    outs: [{ label: 'VOLUME 24H', value: (v) => usd((S(v) || {}).volume24hUsd) }],
+  },
+  'PERP VENUES': {
+    from: 'perps',
+    picks: [{ path: 'listedOn', to: 'LISTED ON' }, { path: 'checked', to: 'VENUES ANSWERED' }, { path: 'total', to: 'VENUES ANSWERED' }],
+    outs: [
+      { label: 'LISTED ON', value: (v) => { const p = (P(v).raw || {}).perps; return p ? (p.listedOn.join(', ') || 'none') : null; } },
+      { label: 'VENUES ANSWERED', value: (v) => { const p = (P(v).raw || {}).perps; return p ? p.checked + ' / ' + p.total : null; } },
+    ],
+  },
+  'PROMOTION': {
+    from: 'promotion',
+    picks: [{ path: 'rows[].kind', to: 'PAID FOR' }, { path: 'rows[].totalAmount', to: 'PAID FOR' }],
+    outs: [{ label: 'PAID FOR', value: (v) => { const pr = (P(v).raw || {}).promotion; return pr ? (pr.rows.map((r) => r.kind).join(' + ') || 'nothing') : null; } }],
   },
   'ETHOS (PROJECT X)': {
     from: 'ethos',

@@ -292,6 +292,8 @@ export const RAW_RECORD = {
   intel: '/raw/<chain>/intel.json → tokens[ this token ]',
   reference: '/raw/reference.json → symbols[ quote token ]',
   ethos: '/raw/ethos.json → tokens + handles',
+  perps: '/raw/perps.json → symbols[ this ticker ] + venues',
+  promotion: '/raw/<chain>/promotion.json → rows[ this token ]',
 };
 
 /** This field's raw record for the selected token, or null. */

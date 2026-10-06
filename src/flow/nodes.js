@@ -36,6 +36,7 @@
  */
 
 import { readRaw } from '../services/storage/raw-store';
+import { GATE_RULES } from '../calculations/gates.js';
 
 /* ------------------------------------------------------------- helpers -- */
 
@@ -84,13 +85,8 @@ const source = (rel) => async (_inputs, ctx) => {
  * so the page can print the threshold next to the value it judged.
  */
 export const RULES = {
-  gates: {
-    maxTaxPct: 5,
-    minLiquidityUsd: 50000,
-    minVolume24hUsd: 25000,
-    minAgeHours: 24 * 14,
-    majorMarketCapUsd: 1e9,
-  },
+  // One table for both: the board's gates and this flow's (calculations/gates.js).
+  gates: GATE_RULES,
   supplySweetSpot: { lo: 5, hi: 40, falloff: 30 },
   pillars: {
     demand: 25, supply: 20, whitespace: 15, durability: 15, momentum: 15, reach: 10,

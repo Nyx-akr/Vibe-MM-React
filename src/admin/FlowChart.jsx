@@ -6,6 +6,9 @@ import { showsForPanel, showsForField } from './shows';
 import { SOURCE_BY_ID, fieldValues, MAP_ONLY_PAGES } from './provenance';
 import { RAW as RAW_PORTS, RELAY_CONSUMERS } from './pipeline';
 import { API_ORIGIN } from '../services/api';
+import {
+  ROOT, ENGINE, loadConfig, saveConfig, emptyConfig, hierarchy, viewGraph, orderPortsLikeInside, portPoint, sketchEdges,
+} from './engines';
 
 /**
  * The whole system on one canvas: what we fetch, where it lands, which panel
@@ -49,14 +52,19 @@ const EDGE_STYLE = {
   // Not a data flow - it says which box this field belongs to, and only
   // appears while its panel is open.
   contains: { dash: '1 3', label: 'inside this panel' },
+  // The user's own line, drawn by dragging from an outlet. A plan, not the
+  // code: long dashes in one fixed colour so it is never read as real flow.
+  sketch: { dash: '7 4', label: 'your sketch wire — not in the code' },
 };
+
+/** Every sketch wire is this colour, whatever box it leaves. */
+const SKETCH_COLOR = '#f5f5f5';
 
 /** One arrowhead per colour in use; SVG markers cannot inherit a stroke. */
 const markerId = (color) => 'ar' + String(color).replace(/[^a-zA-Z0-9]/g, '');
 
-// Low enough that FIT can actually fit the whole map on a narrow window - it
-// was clamping at 0.18, which silently left a third of the diagram off-screen
-// and made the button look broken.
+// Low enough that the opening fit can take in the whole map on a narrow
+// window - it was clamping at 0.18, which left a third of it off-screen.
 const ZOOM_MIN = 0.07;
 
 
@@ -90,6 +98,9 @@ function edgePath(p1, p2) {
 // A pipeline step wears its STEP's colour, so inputs, measures, components
 // and the score read as four bands rather than one yellow wall.
 const nodeColor = (n) => {
+  // An engine wears its own colour; a boundary port wears its source's.
+  if (n.kind === 'engine') return n.color || '#e7edff';
+  if (n.kind === 'port') return n.srcNode ? nodeColor(n.srcNode) : '#e7edff';
   if ((n.flat || n.page === 'pipe') && STAGES[n.stage]) return STAGES[n.stage].color;
   return n.kind === 'field' || n.kind === 'panel'
     ? (PAGE_COLORS[n.page] || C.dim)
@@ -101,7 +112,8 @@ const nodeColor = (n) => {
  * own value(v) - the call its card makes - so the box and the card agree.
  */
 const boxValue = (n, v) => {
-  if (n.kind !== 'field' || !n.field || !n.field.value) return null;
+  // A boundary port shows the value of the data it carries in or out.
+  if ((n.kind !== 'field' && n.kind !== 'port') || !n.field || !n.field.value) return null;
   let val;
   try { val = n.field.value(v); } catch (e) { return null; }
   if (val === null || val === undefined || val === '') return null;
@@ -127,8 +139,16 @@ const ICON_PATHS = {
   panel: 'M3 4.5h18v15H3z M3 8.5h18 M6 13h5 M6 16h8',
   field: 'M4 6.5h16v11H4z M8 12h8',
   step: 'M17.5 5H6.5l6 7-6 7h11',
+  // Two stacked modules with a link: a box that holds boxes.
+  engine: 'M4 4h16v6H4z M4 14h16v6H4z M9 10v4 M15 10v4',
+  // Into a bar / out of a bar: data crossing an engine's edge.
+  'port-in': 'M3 12h11 M10 8l4 4-4 4 M19 4v16',
+  'port-out': 'M5 4v16 M8 12h11 M15 8l4 4-4 4',
 };
-const iconKind = (n) => (n.kind === 'field' && n.flat ? 'step' : n.kind);
+const iconKind = (n) => {
+  if (n.kind === 'port') return n.side === 'in' ? 'port-in' : 'port-out';
+  return n.kind === 'field' && n.flat ? 'step' : n.kind;
+};
 
 function KindGlyph({ kind, color, size }) {
   const s = size || 14;
@@ -167,6 +187,8 @@ const boxLabelStyle = (n) => ({
 
 /** What KIND of box this is, in words - shown when you hover its icon. */
 function subOf(n) {
+  if (n.kind === 'engine') return 'engine · ' + n.count + ' boxes inside · double-click to open';
+  if (n.kind === 'port') return n.side === 'in' ? 'inlet · comes in from outside this engine' : 'outlet · leaves this engine';
   if (n.kind === 'provider') return 'provider we fetch from';
   if (n.kind === 'file') return 'file in the raw store';
   if (n.kind === 'store') return (STORES[n.id] || {}).backend || 'browser storage';
@@ -322,6 +344,7 @@ function Legend() {
         ['store', KIND_COLORS.store, 'browser storage'],
         ['step', '#e7edff', 'calculation step'],
         ['panel', '#e7edff', 'dashboard panel'],
+        ['engine', '#e7edff', 'engine (double-click to open)'],
       ].map(([kind, color, label]) => (
         <span key={kind} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 8.5, color: C.dim }}>
           <KindGlyph kind={kind} color={color} size={12} />{label}
@@ -953,6 +976,8 @@ const FILE_CLOCK = [
   [/bars15\//, 'one pool every 20s, each every 2h'],
   [/observations/, 'a mark per token every 60s'],
   [/social\.json$/, 'every 30s'],
+  [/perps\.json$/, 'every 30 min'],
+  [/promotion\.json$/, 'every 2 min'],
 ];
 const clockOf = (path) => (FILE_CLOCK.find(([re]) => re.test(path)) || [null, null])[1];
 
@@ -960,6 +985,7 @@ const clockOf = (path) => (FILE_CLOCK.find(([re]) => re.test(path)) || [null, nu
 const FILE_SLOT = [
   [/market\.json$/, 'market'], [/trades\.json$/, 'trades'], [/history\.json$/, 'history'],
   [/intel\.json$/, 'intel'], [/reference\.json$/, 'reference'], [/ethos\.json$/, 'ethos'],
+  [/perps\.json$/, 'perps'], [/promotion\.json$/, 'promotion'],
 ];
 const slotOfPath = (path) => (FILE_SLOT.find(([re]) => re.test(path)) || [null, null])[1];
 
@@ -969,7 +995,12 @@ const slotOfPath = (path) => (FILE_SLOT.find(([re]) => re.test(path)) || [null, 
  * keys the collector files each provider's payload under.
  */
 const PROVIDER_PARTS = {
-  dexscreener: [['market', 'sources.dexscreener']],
+  dexscreener: [['market', 'sources.dexscreener'], ['promotion', 'rows']],
+  hyperliquid: [['perps', 'venues.hyperliquid']],
+  binance: [['perps', 'venues.binance']],
+  aster: [['perps', 'venues.aster']],
+  okx: [['perps', 'venues.okx']],
+  bybit: [['perps', 'venues.bybit']],
   geckoterminal: [['market', 'sources.geckoterminal'], ['trades', 'trades'], ['history', '[]']],
   jupiter: [['market', 'sources.jupiter'], ['intel', 'jupiterQuote'], ['intel', 'jupiterToken']],
   kyberswap: [['intel', 'kyberQuote']],
@@ -1057,6 +1088,116 @@ function recordReaders(allFields, slot, prefix) {
 
 /* --------------------------------------------------------------- view --- */
 
+/* ------------------------------------------------------------ engines --- */
+
+/** A box's outlet dot, on its right edge: press and drag to draw a sketch wire. */
+function Outlet({ col, onMouseDown, style }) {
+  return (
+    <span
+      onMouseDown={onMouseDown}
+      onClick={(e) => e.stopPropagation()}
+      title="drag to another box to draw a sketch wire"
+      style={{
+        position: 'absolute', right: -5, top: '50%', width: 9, height: 9, marginTop: -4.5,
+        borderRadius: '50%', background: C.bg, border: `1.5px solid ${col}`, cursor: 'crosshair',
+        boxSizing: 'border-box', ...(style || {}),
+      }} />
+  );
+}
+
+/**
+ * An ENGINE: a box of boxes, shown from outside as its ports.
+ *
+ * Inlets down the left edge, outlets down the right, one row each, named by
+ * the data that crosses there - so the wires between engines read as which
+ * VALUE goes where, the way a Max/MSP subpatcher reads. Double-click to dive
+ * in. Drop a box onto it to move that box inside. Drag from an outlet to draw
+ * a sketch wire from that value.
+ */
+function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClick, onDoubleClick,
+  onHover, onStartWire, v, nodeById }) {
+  const rows = Math.max(n.inPorts.length, n.outPorts.length, 1);
+  const valueOf = (key) => {
+    const src = nodeById && nodeById.get(key);
+    return src ? boxValue(src, v) : null;
+  };
+  const portLabel = (p, side) => {
+    const val = valueOf(p.key);
+    return (
+      <span style={{
+        display: 'flex', alignItems: 'baseline', gap: 4, minWidth: 0, maxWidth: '100%',
+        justifyContent: side === 'in' ? 'flex-start' : 'flex-end',
+      }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, color: C.dim }}>
+          {p.label}
+        </span>
+        {val !== null && <span style={{ color: C.white, fontWeight: 700, flexShrink: 0 }}>{val}</span>}
+      </span>
+    );
+  };
+  return (
+    <div
+      data-node-id={n.id}
+      data-drop={n.id}
+      onMouseDown={onMouseDown}
+      onClick={onClick}
+      onDoubleClick={onDoubleClick}
+      onMouseEnter={() => onHover(true)}
+      onMouseLeave={() => onHover(false)}
+      style={{
+        position: 'absolute', left: pos.x, top: pos.y, width: n.w, height: n.h, boxSizing: 'border-box',
+        borderRadius: 8, background: '#0a1430', cursor: 'grab', opacity: dim ? 0.3 : 1,
+        border: `${isSel ? 2 : 1.5}px ${inGroup ? 'dashed' : 'solid'} ${inGroup ? '#ffffff' : col}`,
+        boxShadow: isSel ? `0 0 0 1px ${col}, 0 0 20px ${col}99` : (isNear ? `0 0 0 1px ${col}` : '0 6px 18px rgba(0,0,0,.55)'),
+      }}
+    >
+      <div style={{
+        height: ENGINE.HEAD, display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px',
+        background: col + '26', borderBottom: `1px solid ${col}55`, borderRadius: '6px 6px 0 0',
+      }}>
+        <KindIcon node={n} color={col} />
+        <span style={{ flex: 1, minWidth: 0, fontSize: 9.5, fontWeight: 800, letterSpacing: 0.6, color: '#e7edff',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.label}</span>
+        <span title="boxes inside" style={{ fontSize: 8, color: col, padding: '1px 5px', borderRadius: 7,
+          border: `1px solid ${col}66` }}>{n.count}</span>
+      </div>
+      {Array.from({ length: rows }).map((_, i) => {
+        const pin = n.inPorts[i];
+        const pout = n.outPorts[i];
+        return (
+          <div key={i} style={{
+            position: 'absolute', left: 0, right: 0, top: ENGINE.HEAD + i * ENGINE.ROW, height: ENGINE.ROW,
+            display: 'flex', alignItems: 'center', fontSize: 8, fontFamily: MONO_STACK,
+          }}>
+            <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
+              {pin && (
+                <>
+                  <span style={{ position: 'absolute', left: -4.5, top: '50%', marginTop: -4, width: 8, height: 8,
+                    borderRadius: '50%', background: col, boxShadow: `0 0 0 2px ${C.bg}` }} />
+                  {portLabel(pin, 'in')}
+                </>
+              )}
+            </div>
+            <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingRight: 9, paddingLeft: 3, textAlign: 'right' }}>
+              {pout && (
+                <>
+                  {portLabel(pout, 'out')}
+                  <Outlet col={col} onMouseDown={onStartWire(pout.key)} style={{ right: -5 }} />
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })}
+      {!n.inPorts.length && !n.outPorts.length && (
+        <div style={{ position: 'absolute', left: 9, top: ENGINE.HEAD + 2, fontSize: 8, color: C.grey }}>
+          {n.count ? 'no wires cross its edge' : 'empty — drop boxes here'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function FlowChart({ v, onJumpToMirror }) {
   const wrapRef = React.useRef(null);
   const liveV = React.useRef(v);
@@ -1102,10 +1243,46 @@ export default function FlowChart({ v, onJumpToMirror }) {
     return () => clearInterval(t);
   }, [rebuild]);
 
-  const laid = React.useMemo(
-    () => (full ? layout(collapse(full, expanded)) : null),
-    [full, expanded],
-  );
+  /* ---- engines: the map as nested subpatchers ------------------------- */
+
+  // The user's layer - their engines, moves, renames and sketch wires - saved
+  // in this browser on every change.
+  const [cfg, setCfgState] = React.useState(loadConfig);
+  const setCfg = React.useCallback((update) => {
+    setCfgState((cur) => {
+      const next = typeof update === 'function' ? update(cur) : update;
+      saveConfig(next);
+      return next;
+    });
+  }, []);
+  // Where we are: ROOT, then each engine dived into.
+  const [path, setPath] = React.useState([ROOT]);
+  // Shift-clicked boxes, waiting to be grouped into an engine.
+  const [groupSet, setGroupSet] = React.useState(() => new Set());
+  const [groupName, setGroupName] = React.useState('');
+  const [rename, setRename] = React.useState('');
+  // A sketch wire being drawn, and the sketch wire clicked for deletion.
+  const [wireDrag, setWireDrag] = React.useState(null);
+  const [pickedWire, setPickedWire] = React.useState(null);
+
+  // The folded graph (panels collapsed) plus the user's sketch wires.
+  const base = React.useMemo(() => {
+    if (!full) return null;
+    const g = collapse(full, expanded);
+    return { nodes: g.nodes, edges: g.edges.concat(sketchEdges(cfg)) };
+  }, [full, expanded, cfg]);
+  const H = React.useMemo(() => (base ? hierarchy(cfg, base.nodes) : null), [base, cfg]);
+  // A level that stopped existing (its engine was ungrouped) falls back up.
+  const level = (() => {
+    const l = path[path.length - 1];
+    return l === ROOT || (H && H.engines.has(l)) ? l : ROOT;
+  })();
+
+  const laid = React.useMemo(() => {
+    if (!base || !H) return null;
+    // Port rows in the order each engine's own inside lists them.
+    return orderPortsLikeInside(layout(viewGraph(base, H, level)), base, H, layout);
+  }, [base, H, level]);
 
   const byId = React.useMemo(
     () => new Map((laid ? laid.nodes : []).map((n) => [n.id, n])),
@@ -1274,7 +1451,65 @@ export default function FlowChart({ v, onJumpToMirror }) {
     drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
   };
 
+  /** A screen point, in map coordinates. */
+  const toMap = (cx, cy) => {
+    const el = wrapRef.current;
+    const r = el ? el.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (cx - r.left - view.x) / view.k, y: (cy - r.top - view.y) / view.k };
+  };
+
+  /**
+   * What is under the pointer that a dragged box can be DROPPED into: an
+   * engine box, or a breadcrumb level. `elementsFromPoint` sees through the
+   * dragged box itself, which is on top of whatever it is being dropped onto.
+   */
+  const dropTargetAt = (cx, cy, dragId) => {
+    const els = document.elementsFromPoint ? document.elementsFromPoint(cx, cy) : [];
+    for (let i = 0; i < els.length; i += 1) {
+      const t = els[i].closest && els[i].closest('[data-drop]');
+      if (t) {
+        const id = t.getAttribute('data-drop');
+        if (id && id !== dragId) return id;
+      }
+    }
+    return null;
+  };
+
+  /** The box under the pointer, for the end of a sketch wire. */
+  const nodeAt = (cx, cy) => {
+    const els = document.elementsFromPoint ? document.elementsFromPoint(cx, cy) : [];
+    for (let i = 0; i < els.length; i += 1) {
+      const t = els[i].closest && els[i].closest('[data-node-id]');
+      if (t) return t.getAttribute('data-node-id');
+    }
+    return null;
+  };
+
+  /** Move a box or an engine into another engine (or up to a level). */
+  const moveInto = (id, target) => {
+    if (!H || String(id).indexOf('port:') === 0) return;
+    if (H.parentOf(id) === target || !H.canMove(id, target)) return;
+    setCfg((cur) => ({ ...cur, assign: { ...cur.assign, [id]: target } }));
+    // Its position and open card belonged to the level it just left.
+    setMoved((cur) => { const next = new Map(cur); next.delete(id); return next; });
+    setCards((cur) => { const next = new Set(cur); next.delete(id); return next; });
+  };
+
+  /** Start drawing a sketch wire from an outlet. `from` is the data's source box. */
+  const startWire = (from) => (e) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const p = toMap(e.clientX, e.clientY);
+    setWireDrag({ from, x0: p.x, y0: p.y, x: p.x, y: p.y });
+  };
+
   const onMouseMove = (e) => {
+    if (wireDrag) {
+      const p = toMap(e.clientX, e.clientY);
+      setWireDrag((cur) => (cur ? { ...cur, x: p.x, y: p.y } : cur));
+      return;
+    }
     const nd = nodeDrag.current;
     if (nd) {
       // Screen pixels divided by the zoom, or a box would run away from the
@@ -1300,25 +1535,32 @@ export default function FlowChart({ v, onJumpToMirror }) {
     setView((cur) => ({ ...cur, x, y }));
   };
 
-  const endDrag = () => {
-    if (nodeDrag.current) draggedFar.current = nodeDrag.current.far >= 4;
+  const endDrag = (e) => {
+    const at = e && Number.isFinite(e.clientX) && e.type === 'mouseup' ? e : null;
+    // A sketch wire ends on whatever box it is let go over.
+    if (wireDrag) {
+      const to = at ? nodeAt(at.clientX, at.clientY) : null;
+      // A boundary inlet stands for the box its data comes from.
+      const resolved = to && to.indexOf('port:in:') === 0 ? to.slice(8) : to;
+      if (resolved && resolved !== wireDrag.from && resolved.indexOf('port:') !== 0) {
+        const s = { id: Date.now().toString(36), from: wireDrag.from, to: resolved };
+        setCfg((cur) => ({ ...cur, sketch: (cur.sketch || []).concat([s]) }));
+      }
+      setWireDrag(null);
+    }
+    const nd = nodeDrag.current;
+    if (nd) {
+      draggedFar.current = nd.far >= 4;
+      // Let go over an engine or a breadcrumb: the box moves in there.
+      if (nd.far >= 4 && at) {
+        const target = dropTargetAt(at.clientX, at.clientY, nd.id);
+        if (target) moveInto(nd.id, target);
+      }
+    }
     nodeDrag.current = null;
     drag.current = null;
   };
 
-  /**
-   * The buttons zoom about the middle of the canvas, the way the wheel zooms
-   * about the pointer. Scaling `k` on its own leaves x and y where they were,
-   * so every click walked the diagram further off the screen.
-   */
-  const zoomBy = React.useCallback((factor) => setView((cur) => {
-    const el = wrapRef.current;
-    const r = el ? el.getBoundingClientRect() : { width: 900, height: 600 };
-    const px = r.width / 2;
-    const py = r.height / 2;
-    const k = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, cur.k * factor));
-    return { k, x: px - ((px - cur.x) / cur.k) * k, y: py - ((py - cur.y) / cur.k) * k };
-  }), []);
 
   const fit = React.useCallback(() => {
     const el = wrapRef.current;
@@ -1386,6 +1628,23 @@ export default function FlowChart({ v, onJumpToMirror }) {
    * screen - so this one does centre, and lifts the zoom enough to read it.
    */
   const goTo = (id) => {
+    // Inside another engine: dive to the level where it is a box of its own,
+    // and finish the jump once that level has been laid out.
+    if (!byId.has(id) && H) {
+      const chain = H.ancestors(id).slice().reverse();
+      if (chain.length && chain[0] === ROOT) {
+        pendingGo.current = id;
+        setPath(chain);
+        return;
+      }
+    }
+    // Engines and boundary ports have no card to open.
+    const n = byId.get(id);
+    if (n && (n.kind === 'engine' || n.kind === 'port')) {
+      setSelected(id);
+      requestAnimationFrame(() => centreOn(id));
+      return;
+    }
     setCards((cur) => (cur.has(id) ? cur : new Set(cur).add(id)));
     // Going to a box selects it too, so its wiring lights up on arrival.
     setSelected(id);
@@ -1395,16 +1654,93 @@ export default function FlowChart({ v, onJumpToMirror }) {
   };
 
 
+  // A jump waiting for its level to be laid out, and the level change itself:
+  // a new level starts with nothing open and fits itself to the canvas -
+  // unless a jump is about to centre on one box, which then wins.
+  const pendingGo = React.useRef(null);
+  React.useEffect(() => {
+    setCards(new Set());
+    setAnchors(new Map());
+    setHoverEdge(null);
+    if (!pendingGo.current) fitted.current = false;
+  }, [level]);
+  React.useEffect(() => {
+    const id = pendingGo.current;
+    if (id && byId.has(id)) { pendingGo.current = null; goTo(id); }
+  });
+
+  /** Dive into an engine (double-click), or climb to a level (breadcrumb). */
+  const dive = (id) => { setSelected(null); setPath((cur) => cur.concat([id])); };
+  const climbTo = (i) => { setSelected(null); setPath((cur) => cur.slice(0, i + 1)); };
+
+  /** GROUP: the shift-selected boxes become one new engine at this level. */
+  const groupIntoEngine = () => {
+    if (!H || !groupSet.size) return;
+    const id = 'eng:u:' + Date.now().toString(36);
+    const label = (groupName.trim() || 'ENGINE ' + (Object.keys(cfg.engines).length + 1)).toUpperCase();
+    setCfg((cur) => {
+      const assign = { ...cur.assign };
+      groupSet.forEach((m) => { if (String(m).indexOf('port:') !== 0) assign[m] = id; });
+      return { ...cur, engines: { ...cur.engines, [id]: { label, parent: level } }, assign };
+    });
+    setGroupSet(new Set());
+    setGroupName('');
+    setSelected(id);
+  };
+
+  /** UNGROUP: an engine's contents move up to its parent and the engine goes. */
+  const ungroup = (id) => {
+    if (!H || !H.engines.has(id)) return;
+    const parent = H.parentOf(id);
+    const kids = base.nodes.map((n) => n.id).concat(Array.from(H.engines.keys()))
+      .filter((x) => x !== id && H.parentOf(x) === id);
+    setCfg((cur) => {
+      const assign = { ...cur.assign };
+      kids.forEach((k) => { assign[k] = parent; });
+      delete assign[id];
+      const engines = { ...cur.engines };
+      const removed = { ...cur.removed };
+      if (engines[id]) delete engines[id]; else removed[id] = true;
+      const renamed = { ...cur.renamed };
+      delete renamed[id];
+      return { ...cur, assign, engines, removed, renamed };
+    });
+    setSelected(null);
+  };
+
+  const renameEngine = (id, name) => {
+    const label = String(name || '').trim().toUpperCase();
+    if (!label) return;
+    setCfg((cur) => ({ ...cur, renamed: { ...cur.renamed, [id]: label } }));
+    setRename('');
+  };
+
+  const deleteWire = (sid) => {
+    setCfg((cur) => ({ ...cur, sketch: (cur.sketch || []).filter((s) => s.id !== sid) }));
+    setPickedWire(null);
+  };
+  // Delete / Backspace removes a picked sketch wire.
+  React.useEffect(() => {
+    if (!pickedWire) return undefined;
+    const onKey = (e) => {
+      const tag = e.target && e.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key === 'Delete' || e.key === 'Backspace') deleteWire(pickedWire);
+      if (e.key === 'Escape') setPickedWire(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+  const [confirmReset, setConfirmReset] = React.useState(false);
+  const cfgTouched = Object.keys(cfg.engines).length + Object.keys(cfg.assign).length +
+    Object.keys(cfg.renamed).length + Object.keys(cfg.removed).length + (cfg.sketch || []).length > 0;
+
   const togglePanel = (id) => setExpanded((cur) => {
     const next = new Set(cur);
     if (next.has(id)) next.delete(id); else next.add(id);
     return next;
   });
 
-  const allPanels = React.useMemo(
-    () => (full ? full.nodes.filter((n) => n.kind === 'panel').map((n) => n.id) : []),
-    [full],
-  );
 
   if (!laid) {
     return <div style={{ padding: 20, color: C.dim, fontSize: 11 }}>Building the map&hellip;</div>;
@@ -1495,10 +1831,66 @@ export default function FlowChart({ v, onJumpToMirror }) {
         display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', flexWrap: 'wrap',
         borderBottom: `1px solid ${C.border}`, background: C.panel, flexShrink: 0,
       }}>
-        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: C.pink }}>DATA FLOW</div>
-        <span style={{ fontSize: 9, color: C.grey }}>
-          {laid.nodes.length} boxes &middot; {laid.edges.length} arrows
-        </span>
+        {/* Where we are. Each crumb climbs back up, and is also a DROP target:
+            let a dragged box go over one and it moves up to that level. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {path.map((id, i) => {
+              const here = i === path.length - 1;
+              const label = id === ROOT ? 'MAP' : (H && H.engines.has(id) ? H.engines.get(id).label : '?');
+              return (
+                <React.Fragment key={id + i}>
+                  {i > 0 && <span style={{ color: C.grey, fontSize: 10 }}>&rsaquo;</span>}
+                  <span data-drop={id}
+                    onClick={() => !here && climbTo(i)}
+                    title={here ? 'you are here' : 'go up to ' + label + ' (or drop a box here to move it up)'}
+                    style={{
+                      fontSize: 9, fontWeight: 700, letterSpacing: 0.6, padding: '3px 8px', borderRadius: 999,
+                      cursor: here ? 'default' : 'pointer',
+                      border: `1px solid ${here ? C.pink : C.border}`,
+                      color: here ? C.pink : C.dim, background: here ? 'rgba(227,95,242,0.08)' : 'transparent',
+                    }}>{label}</span>
+                </React.Fragment>
+              );
+            })}
+          </div>
+        {/* GROUP: shift-click boxes, name them, make them one engine. */}
+        {groupSet.size > 0 && (
+          <>
+            <input value={groupName} onChange={(e) => setGroupName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') groupIntoEngine(); if (e.key === 'Escape') setGroupSet(new Set()); }}
+              placeholder={'name for ' + groupSet.size + ' boxes'} spellCheck={false}
+              style={{ background: '#0d1730', border: `1px solid ${C.pink}`, borderRadius: 999, color: C.text,
+                fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
+            <Button onClick={groupIntoEngine} active>GROUP {groupSet.size} INTO ENGINE</Button>
+            <Button onClick={() => setGroupSet(new Set())}>CLEAR</Button>
+          </>
+        )}
+        {/* The selected engine: open it, rename it, or take it apart. */}
+        {selected && H && H.engines.has(selected) && groupSet.size === 0 && (
+          <>
+            <Button onClick={() => dive(selected)} active>OPEN</Button>
+            <input value={rename} onChange={(e) => setRename(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') renameEngine(selected, rename); }}
+              placeholder={'rename ' + H.engines.get(selected).label.toLowerCase()} spellCheck={false}
+              style={{ background: '#0d1730', border: `1px solid ${C.border}`, borderRadius: 999, color: C.text,
+                fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
+            {rename.trim() && <Button onClick={() => renameEngine(selected, rename)}>RENAME</Button>}
+            <Button onClick={() => ungroup(selected)} title="move everything inside it up one level and remove the engine">
+              UNGROUP
+            </Button>
+          </>
+        )}
+        {pickedWire && (
+          <Button onClick={() => deleteWire(pickedWire)} active title="or press Delete">DELETE WIRE</Button>
+        )}
+        {cfgTouched && (
+          <Button onClick={() => {
+            if (!confirmReset) { setConfirmReset(true); return; }
+            setCfg(emptyConfig()); setPath([ROOT]); setConfirmReset(false);
+          }} title="drop your engines, moves, renames and sketch wires">
+            {confirmReset ? 'CLICK AGAIN TO RESET' : 'RESET ENGINES'}
+          </Button>
+        )}
         {cards.size > 0 && (
           <Button onClick={() => setCards(new Set())} title="close every open box">
             CLOSE {cards.size} OPEN
@@ -1509,23 +1901,21 @@ export default function FlowChart({ v, onJumpToMirror }) {
             RESET {moved.size} MOVED
           </Button>
         )}
-        <div style={{ width: 1, height: 16, background: C.border }} />
-        <Button onClick={() => zoomBy(1.25)} title="zoom in">+</Button>
-        <Button onClick={() => zoomBy(1 / 1.25)} title="zoom out">&minus;</Button>
-        <Button onClick={fit} title="fit the whole map">FIT</Button>
-        <span title="scroll to zoom, drag to pan"
-          style={{ fontSize: 8.5, color: C.grey, width: 34 }}>{Math.round(view.k * 100)}%</span>
-        <div style={{ width: 1, height: 16, background: C.border }} />
-        <Button onClick={() => setExpanded(new Set(allPanels))} active={expanded.size === allPanels.length && allPanels.length > 0}>
-          EXPAND ALL
-        </Button>
-        <Button onClick={() => setExpanded(new Set())} active={expanded.size === 0}>COLLAPSE ALL</Button>
-        <div style={{ width: 1, height: 16, background: C.border }} />
+        {/* Navigation on the left, search pushed to the right. */}
+        <div style={{ flex: 1 }} />
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && matches && matches.size) goTo(Array.from(matches)[0]);
+            if (e.key === 'Enter') {
+              if (matches && matches.size) goTo(Array.from(matches)[0]);
+              else if (q && base && H) {
+                // Not at this level: find it inside an engine and dive there.
+                const hit = base.nodes.find((n) => String(n.label).toLowerCase().indexOf(q) !== -1);
+                const eng = !hit && Array.from(H.engines.values()).find((x) => x.label.toLowerCase().indexOf(q) !== -1);
+                if (hit) goTo(hit.id); else if (eng) goTo(eng.id);
+              }
+            }
             if (e.key === 'Escape') setQuery('');
           }}
           placeholder="find a panel, file or provider"
@@ -1536,7 +1926,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
           }}
         />
         {matches && <span style={{ fontSize: 9, color: C.faint }}>{matches.size} match</span>}
-        <div style={{ flex: 1 }} />
         <Legend />
       </div>
 
@@ -1580,7 +1969,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
               {Array.from(new Set(laid.edges.map((e) => {
                 const a = byId.get(e.from);
                 return a ? nodeColor(a) : C.dim;
-              }))).map((color) => (
+              }).concat([SKETCH_COLOR]))).map((color) => (
                 <marker key={color} id={markerId(color)} viewBox="0 0 8 8" refX="7" refY="4"
                   markerWidth="5" markerHeight="5" orient="auto-start-reverse">
                   <path d="M 0 1 L 8 4 L 0 7 z" fill={color} />
@@ -1592,8 +1981,10 @@ export default function FlowChart({ v, onJumpToMirror }) {
               const b = byId.get(e.to);
               if (!a || !b) return null;
               const s = EDGE_STYLE[e.kind] || EDGE_STYLE.field;
-              // The box it comes OUT of decides the colour.
-              const color = nodeColor(a);
+              // The box it comes OUT of decides the colour - except a sketch
+              // wire, which is always the user's own colour.
+              const isSketch = e.kind === 'sketch';
+              const color = isSketch ? SKETCH_COLOR : nodeColor(a);
               // When either end is open, the line goes to the ROW that names
               // the other end rather than to the middle of the box.
               const pa = posOf(a);
@@ -1608,12 +1999,15 @@ export default function FlowChart({ v, onJumpToMirror }) {
               // An open card is wider than its box: leave from the card's edge.
               const ca = { x: pa.x + a.w + (Math.max(a.w, CARD_W) - a.w) * ga, y: pa.y + a.h / 2 };
               const cb = { x: pb.x, y: pb.y + b.h / 2 };
-              const p1 = outA
+              let p1 = outA
                 ? { x: ca.x + (outA.edgeX - ca.x) * ga, y: ca.y + (outA.y - ca.y) * ga }
                 : ca;
-              const p2 = inB
+              let p2 = inB
                 ? { x: cb.x + (inB.edgeX - cb.x) * gb, y: cb.y + (inB.y - cb.y) * gb }
                 : cb;
+              // An engine's line leaves from / arrives at its own PORT row.
+              if (e.fromPort && a.kind === 'engine') p1 = portPoint(a, pa, 'out', e.fromPort);
+              if (e.toPort && b.kind === 'engine') p2 = portPoint(b, pb, 'in', e.toPort);
               // Hovering BRIGHTENS the path it belongs to. It used to fade
               // everything else to near-invisible, which answered the question
               // by hiding the diagram rather than by pointing at part of it.
@@ -1621,7 +2015,8 @@ export default function FlowChart({ v, onJumpToMirror }) {
               const hot = hoverEdge && hoverEdge.id === e.id;
               // A line of the SELECTED box: lit and streaming, like a hovered one.
               const sel = Boolean(selected && (e.from === selected || e.to === selected));
-              const lit = hot || sel;
+              const picked = isSketch && pickedWire && e.sketchId === pickedWire;
+              const lit = hot || sel || picked;
               const d = edgePath(p1, p2);
               const track = (ev) => {
                 if (drag.current || nodeDrag.current) return;
@@ -1654,7 +2049,10 @@ export default function FlowChart({ v, onJumpToMirror }) {
                     stroke="transparent"
                     strokeWidth={10 / view.k}
                     pointerEvents="stroke"
-                    style={{ cursor: 'help' }}
+                    style={{ cursor: isSketch ? 'pointer' : 'help' }}
+                    // A sketch wire is picked by clicking it, then deleted.
+                    onClick={isSketch ? (ev) => { ev.stopPropagation(); setPickedWire(e.sketchId); } : undefined}
+                    onMouseDown={isSketch ? (ev) => ev.stopPropagation() : undefined}
                     onMouseEnter={track}
                     onMouseMove={track}
                     onMouseLeave={() => setHoverEdge((cur) => (cur && cur.id === e.id ? null : cur))}
@@ -1663,11 +2061,26 @@ export default function FlowChart({ v, onJumpToMirror }) {
               );
             })}
 
+            {/* The wire being drawn, from the outlet to the pointer. */}
+            {wireDrag && (
+              <path d={edgePath({ x: wireDrag.x0, y: wireDrag.y0 }, { x: wireDrag.x, y: wireDrag.y })}
+                fill="none" stroke={SKETCH_COLOR} strokeWidth={1.8} strokeDasharray="7 4" opacity={0.95} />
+            )}
+
             {/* The outlines, over the arrows and under the labels. One path
                 per box, drawn from posOf like everything else. */}
             <g>
               {laid.nodes.map((n) => {
                 if (cards.has(n.id) || growOf(n.id) > 0.01) return null;
+                // An engine draws its own frame (it has port rows inside it).
+                if (n.kind === 'engine') return null;
+                if (groupSet.has(n.id)) {
+                  const gp = posOf(n);
+                  return (
+                    <path key={n.id} d={roundedPath(gp.x - 3, gp.y - 3, n.w + 6, n.h + 6, BOX_RADIUS + 2)}
+                      fill={nodeColor(n) + BOX_FILL} stroke="#ffffff" strokeWidth={1.6} strokeDasharray="4 3" />
+                  );
+                }
                 const col = nodeColor(n);
                 const dim = Boolean(matches && !matches.has(n.id));
                 const pos = posOf(n);
@@ -1697,20 +2110,45 @@ export default function FlowChart({ v, onJumpToMirror }) {
             const dim = Boolean(matches && !matches.has(n.id));
             const open = n.kind === 'panel' && expanded.has(n.id);
             const pos = posOf(n);
+            // Shift-click collects boxes to GROUP; a plain click selects (and
+            // opens a box's card - an engine or a port has none).
+            const onBoxClick = (e) => {
+              e.stopPropagation();
+              // Letting go after a drag must not also open the box.
+              if (draggedFar.current) { draggedFar.current = false; return; }
+              if (e.shiftKey && n.kind !== 'port') {
+                setGroupSet((cur) => { const next = new Set(cur); if (next.has(n.id)) next.delete(n.id); else next.add(n.id); return next; });
+                return;
+              }
+              if (n.kind !== 'engine' && n.kind !== 'port') pick(n.id);
+              setSelected(n.id);
+              setPickedWire(null);
+            };
+            if (n.kind === 'engine') {
+              return (
+                <EngineBox key={n.id} n={n} pos={pos} col={col} dim={dim}
+                  isSel={n.id === selected} isNear={Boolean(selNear && selNear.has(n.id))}
+                  inGroup={groupSet.has(n.id)}
+                  onMouseDown={startNodeDrag(n.id)} onClick={onBoxClick}
+                  onDoubleClick={(e) => { e.stopPropagation(); dive(n.id); }}
+                  onHover={(on) => setHover(on ? n.id : null)}
+                  onStartWire={startWire} v={liveV.current} nodeById={H ? H.nodeById : null} />
+              );
+            }
             return (
               <div
                 key={n.id}
+                data-node-id={n.id}
                 onMouseEnter={() => setHover(n.id)}
                 onMouseLeave={() => setHover(null)}
                 onMouseDown={startNodeDrag(n.id)}
-                onClick={(e) => {
+                onClick={onBoxClick}
+                onDoubleClick={(e) => {
                   e.stopPropagation();
-                  // Letting go after a drag must not also open the box.
-                  if (draggedFar.current) { draggedFar.current = false; return; }
-                  pick(n.id);
-                  setSelected(n.id);
+                  if (n.kind === 'panel') togglePanel(n.id);
+                  // A boundary port: go to where its data comes from / goes.
+                  if (n.kind === 'port') goTo(n.src);
                 }}
-                onDoubleClick={(e) => { e.stopPropagation(); if (n.kind === 'panel') togglePanel(n.id); }}
                 style={{
                   // The outline is drawn in the SVG above; this layer is only
                   // the label and the hit area, so it carries no border of
@@ -1756,6 +2194,11 @@ export default function FlowChart({ v, onJumpToMirror }) {
                     background: n.status === 'placeholder' ? C.hot : C.amber,
                   }} />
                 )}
+                {/* The outlet: drag from it to draw a sketch wire. On a panel
+                    it sits at the bottom corner, clear of the output count
+                    that rides the middle of its right edge. */}
+                <Outlet col={col} onMouseDown={startWire(n.kind === 'port' ? n.src : n.id)}
+                  style={n.kind === 'panel' ? { top: 'auto', bottom: -4.5, marginTop: 0 } : undefined} />
               </div>
             );
           })}
@@ -1783,7 +2226,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
             {openCards.map((node) => (
               // Capture phase: the card stops its own clicks from reaching the
               // map, so selecting it has to happen on the way IN.
-              <div key={node.id} style={{ display: 'contents' }}
+              <div key={node.id} style={{ display: 'contents' }} data-node-id={node.id}
                 onClickCapture={() => setSelected(node.id)}>
                 <NodeCard
                   node={node}
