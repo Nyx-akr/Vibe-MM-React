@@ -310,6 +310,9 @@ export default class AdminPanel extends App {
           token: ethosToken,
           profile: (ethos.handles || {})[ethosToken.handle] || null,
         } : null,
+        // What the file says its per-token record looks like, so a card with
+        // no record for this token can still draw the format it expects.
+        shapes: { ethos: (ethos && ethos.shape) || null },
       };
       this.forceUpdate();
     } finally {

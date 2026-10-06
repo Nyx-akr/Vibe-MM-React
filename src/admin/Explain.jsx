@@ -388,7 +388,22 @@ export function RawData({ field, v, accent, anchor, outAnchor }) {
  * lands on the line naming the file, right above the data it delivered, and a
  * stub carries that arrow in from the card's left edge.
  */
-export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAnchor }) {
+/**
+ * `perLine`: the record IS the outputs.
+ *
+ * A raw file does not compute anything - it holds values, and different boxes
+ * read different keys out of it. Drawing that as a list of READER NAMES at the
+ * bottom, wired back up the gutter to the keys, said "two fields" and made you
+ * trace a wire to find out which. With `perLine` every leaf of the record
+ * carries its own output node instead, so the key IS the port and an arrow
+ * leaves the line it belongs to.
+ *
+ * A leaf nothing reads still gets a dot, hollow and dim: the file does hold
+ * that value, and the card should not imply it is absent just because no box
+ * takes it yet. Only a leaf something reads is given an anchor, so only those
+ * grow a real arrow.
+ */
+export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAnchor, perLine, waiting }) {
   const wrapRef = React.useRef(null);
   const [geo, setGeo] = React.useState(null);
   const col = accent || C.teal;
@@ -397,6 +412,43 @@ export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAn
   const picks = (spec.picks || []);
   const lines = rec ? recordLines(rec, picks, spec.last, spec.plain) : [];
   const drawn = new Set(lines.filter((l) => l.pick).map((l) => l.path));
+
+  /**
+   * Which ROW carries each pick's output port.
+   *
+   * A pick names a leaf like `sources.dexscreener.volumeUsd.h24`, but the
+   * record is trimmed - that leaf may be folded into a `volumeUsd: {…}` line,
+   * or not drawn at all. A port registered against a path with no row leaves
+   * its arrow with nothing to anchor to, and the line then falls back to the
+   * middle of the card, which is what made some arrows point at no value.
+   *
+   * So each pick is hosted by the DEEPEST row that is its own path or an
+   * ancestor of it. Every pick gets a real row; a folded branch carries the
+   * ports of everything inside it.
+   */
+  const rowPaths = perLine ? lines.map((l) => l.path).filter(Boolean) : [];
+  const hostOf = (path) => {
+    if (!perLine) return null;
+    let best = null;
+    rowPaths.forEach((rp) => {
+      if (rp === path || path.startsWith(rp + '.') || path.startsWith(rp + '[')) {
+        if (!best || rp.length > best.length) best = rp;
+      }
+    });
+    return best;
+  };
+  // row path -> the anchor keys it carries
+  const portsByRow = {};
+  if (perLine) {
+    picks.forEach((p) => {
+      if (!p.toId) return;
+      const host = hostOf(p.path);
+      if (!host) return;
+      const key = p.path + '>' + p.toId;
+      if (!portsByRow[host]) portsByRow[host] = new Set();
+      portsByRow[host].add(key);
+    });
+  }
   const outs = (spec.outs || []).map((o) => {
     let val = null;
     try { val = o.value(v, rec); } catch (e) { val = null; }
@@ -441,7 +493,8 @@ export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAn
     );
   }
 
-  const GUTTER = 22;
+  // No wires to route when each line carries its own port.
+  const GUTTER = perLine ? 13 : 22;
   return (
     <div ref={wrapRef} style={{ position: 'relative', paddingRight: GUTTER }}>
       <div
@@ -467,20 +520,70 @@ export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAn
       <div style={{
         fontFamily: MONO, fontSize: 8.5, lineHeight: 1.55, background: '#070e22',
         border: `1px solid ${C.line}`, borderRadius: 5, padding: '4px 5px',
+        // The shape with no values in it yet: same card, dimmer.
+        opacity: waiting ? 0.72 : 1,
       }}>
-        {lines.map((l, i) => (
-          <div key={i} data-pick={l.pick ? l.path : undefined} style={{
-            paddingLeft: l.depth * 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-            background: l.pick ? col + '2e' : 'transparent', borderRadius: 3,
-            color: l.dim ? C.grey : C.dim, fontWeight: l.pick ? 700 : 400,
-          }}>
-            {l.key !== null && <span style={{ color: l.pick ? col : (l.dim ? C.grey : '#8ab6ff') }}>{l.key}</span>}
-            {l.key !== null && <span style={{ color: C.grey }}>: </span>}
-            <span style={{ color: l.pick ? C.white : undefined }}>{l.text}</span>
-          </div>
-        ))}
+        {lines.map((l, i) => {
+          // A leaf is a line with a key AND a value; an object or array header
+          // is a title, and a title is not a port.
+          // A row shows a port when it has a key AND either a value of its
+          // own or ports folded inside it.
+          const isLeaf = perLine && l.key !== null &&
+            (l.text !== '' || Boolean(l.path && portsByRow[l.path]));
+          // One anchor per KEY→READER link, not per reader. Several keys of
+          // this record feed the same box; anchoring them all on that box's
+          // id made them fight over one anchor point and only the last won,
+          // which is why the lines appeared to leave from nowhere in
+          // particular. The key names the link, so each line leaves its key.
+          //
+          // A row that folds a branch away carries the ports of what is inside
+          // it, so no arrow is left without a row to land on.
+          const readers = perLine && l.path && portsByRow[l.path]
+            ? Array.from(portsByRow[l.path]) : [];
+          return (
+            <div key={i} data-pick={l.pick ? l.path : undefined} style={{
+              position: isLeaf ? 'relative' : undefined,
+              paddingLeft: l.depth * 8, paddingRight: isLeaf ? 10 : 0,
+              whiteSpace: 'nowrap', overflow: isLeaf ? 'visible' : 'hidden', textOverflow: 'ellipsis',
+              background: l.pick ? col + '2e' : 'transparent', borderRadius: 3,
+              color: l.dim ? C.grey : C.dim, fontWeight: l.pick ? 700 : 400,
+            }}>
+              {l.key !== null && <span style={{ color: l.pick ? col : (l.dim ? C.grey : '#8ab6ff') }}>{l.key}</span>}
+              {l.key !== null && <span style={{ color: C.grey }}>: </span>}
+              <span style={{ color: l.pick ? C.white : undefined }}>{l.text}</span>
+              {isLeaf && (
+                <span
+                  data-anchor={readers.length ? readers.join(',') : undefined}
+                  data-side={readers.length ? 'out' : undefined}
+                  title={readers.length ? 'read by ' + picks.filter((p) => p.path === l.path).map((p) => p.to).join(', ')
+                    : 'in the file, read by nothing yet'}
+                  style={{
+                    position: 'absolute', right: -6, top: '50%',
+                    transform: 'translate(50%, -50%)',
+                    width: 7, height: 7, borderRadius: '50%', boxSizing: 'border-box',
+                    background: readers.length ? col : 'transparent',
+                    border: '1px solid ' + (readers.length ? col : C.grey),
+                    boxShadow: readers.length ? '0 0 0 2px #070e22' : undefined,
+                  }}>
+                  {/* The arrow stops at the card's edge, because the card is
+                      opaque and the arrow layer is beneath it. This carries
+                      the line the rest of the way in, so it arrives AT the
+                      dot: the record's gutter (13) plus the card body's
+                      padding (9), less the dot's own radius. */}
+                  {readers.length ? (
+                    <span style={{
+                      position: 'absolute', left: '100%', top: '50%',
+                      width: 19, height: 1.5, marginTop: -0.75,
+                      background: col, opacity: 0.85,
+                    }} />
+                  ) : null}
+                </span>
+              )}
+            </div>
+          );
+        })}
       </div>
-      <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <div style={{ marginTop: 6, display: perLine ? 'none' : 'flex', flexDirection: 'column', gap: 3 }}>
         {outs.map((o) => (
           <div key={o.label} data-out={o.label}
             // The single output row IS the card's output node when asked to be:
@@ -509,7 +612,7 @@ export function RecordView({ rec, spec, v, accent, caption, empty, anchor, outAn
       </div>
       {/* The wires: out of a highlighted key, down the right gutter, into the
           output it becomes. One lane per wire so they do not sit on each other. */}
-      {geo && (
+      {geo && !perLine && (
         <svg width={geo.w} height={geo.h} style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', overflow: 'visible' }}>
           {geo.segs.map((s, i) => {
             const x0 = geo.w - GUTTER;

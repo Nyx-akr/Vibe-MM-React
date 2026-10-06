@@ -139,7 +139,7 @@ export const SHOWN_PAGES = {
           {
             label: 'LIQUIDITY', status: 'live',
             value: (v) => (sampleRow(v) || {}).liq,
-            calc: [ref('pipe', 'LIQUIDITY'), op('as read')],
+            calc: [api('/raw/<chain>/market.json', 'LIQUIDITY'), op('as read')],
             feeds: [ref('detail', 'Liquidity / executability'), ref('detail', 'RISK FLAGS')],
             where: 'calculations/core.js normalizeRow()',
           },
@@ -165,8 +165,8 @@ export const SHOWN_PAGES = {
             label: 'NET FLOW', status: 'live',
             value: (v) => (sampleRow(v) || {}).netflow,
             // row.flow.netUsd: the pool's trade sample, else Jupiter's 5m split.
-            calc: [op('buy USD − sell USD of'), ref('pipe', 'TRADE SAMPLE'), op('; with no trade sample: Jupiter 5m buy − sell from'),
-              ref('pipe', 'JUPITER STATS')],
+            calc: [op('buy USD − sell USD of'), api('/raw/<chain>/trades.json', 'TRADE SAMPLE'), op('; with no trade sample: Jupiter 5m buy − sell from'),
+              api('/raw/<chain>/market.json', 'JUPITER STATS')],
             note: 'Source order: Jupiter first where it indexes the token, then our own trade ' +
               'sample, then raw txn counts - which cannot weigh a trade, only count it.',
             feeds: [ref('detail', 'Net demand')],
@@ -195,7 +195,7 @@ export const SHOWN_PAGES = {
           {
             label: 'AGE', status: 'live',
             value: (v) => (sampleRow(v) || {}).age,
-            calc: [ref('pipe', 'POOL AGE'), op('in seconds')],
+            calc: [api('/raw/<chain>/market.json', 'POOL AGE'), op('in seconds')],
             feeds: [ref('detail', 'RISK FLAGS')],
             where: 'services/api.js mapServerRowToAsset()',
           },
@@ -368,7 +368,7 @@ export const SHOWN_PAGES = {
           label: c.label,
           status: 'live',
           value: () => (c.ok ? 'PASS' : 'FAIL'),
-          calc: [ref('pipe', 'CONTRACT CHECKS'), op('- one of the checks')],
+          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- one of the checks')],
           evidence: c.detail || '',
           feeds: [ref('detail', 'Contract safety'), ref('detail', 'FINAL')],
           where: 'calculations/asset-detail.js deriveIntel(), contractSafety',

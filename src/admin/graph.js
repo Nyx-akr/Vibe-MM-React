@@ -151,10 +151,10 @@ export const PAGE_COLORS = {
  */
 export const STAGES = {
   1: { title: '1 · TOKEN LIST', color: '#e2e8f0' },
-  2: { title: '2 · TOKEN INPUTS', color: '#e2e8f0' },
-  3: { title: '3 · MEASURES', color: '#94a3b8' },
-  4: { title: '4 · SCORE DECOMPOSITION', color: '#f43f5e' },
-  5: { title: '5 · SCORE', color: '#ffd60a' },
+  2: { title: '2 · READINGS', color: '#e2e8f0' },
+  3: { title: '3 · GATES', color: '#94a3b8' },
+  4: { title: '4 · ENGINES', color: '#f43f5e' },
+  5: { title: '5 · COMBINE', color: '#ffd60a' },
 };
 
 export const KIND_COLORS = {
@@ -167,6 +167,8 @@ export const KIND_COLORS = {
 /* ------------------------------------------------------- graph building -- */
 
 const fieldId = (page, label) => 'f:' + page + ':' + label;
+/** The box that names the token every per-token card is showing. */
+const TOKEN_PICKER = 'f:pipe:THIS TOKEN';
 const panelId = (page, group) => 'p:' + page + ':' + group;
 const fileId = (path) => 'file:' + path;
 const extId = (source) => 'ext:' + source;
@@ -270,6 +272,12 @@ export function buildGraph(v) {
           }
           if (t.t === 'api') {
             add({ id: fileId(t.path), kind: 'file', label: t.path, path: t.path });
+            // Which RECORD a file card shows is decided by the token picker,
+            // so the picker is an input to every file. It points back up the
+            // map because that is what it does: the list is built from the
+            // files, and the selection then reaches back to choose a row in
+            // them. Drawn dashed, as a selection rather than a data flow.
+            link(TOKEN_PICKER, fileId(t.path), 'selects');
             // Only ever INTO the app. A card that names a file under `feeds`
             // means the same value is also recorded there - by the server's
             // collector, from the same upstream - not that the app wrote it.

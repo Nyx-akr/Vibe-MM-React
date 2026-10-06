@@ -4,6 +4,7 @@ import { buildGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, ST
 import { C, Expression, Badge, RawData, rawRecordOf, RecordView, RAW_RECORD, WorkedSteps } from './Explain';
 import { showsForPanel, showsForField } from './shows';
 import { SOURCE_BY_ID, fieldValues, MAP_ONLY_PAGES } from './provenance';
+import { RAW as RAW_PORTS, RELAY_CONSUMERS } from './pipeline';
 import { API_ORIGIN } from '../services/api';
 
 /**
@@ -44,6 +45,7 @@ const EDGE_STYLE = {
   'store-write': { dash: '5 3', label: 'persisted' },
   'store-read': { dash: '5 3', label: 'restored' },
   origin: { dash: '2 4', label: 'origin' },
+  selects: { dash: '2 3', label: 'picks which record is shown' },
   // Not a data flow - it says which box this field belongs to, and only
   // appears while its panel is open.
   contains: { dash: '1 3', label: 'inside this panel' },
@@ -147,6 +149,14 @@ function KindGlyph({ kind, color, size }) {
 const BOX_FILL = '22';    // alpha suffix on the box colour, collapsed and open
 const BOX_STROKE = 'cc';
 const BOX_RADIUS = 6;
+/**
+ * Clear space kept to the RIGHT of a calculation block, so a result pill can
+ * sit astride its edge without the card body clipping the outer half. The body
+ * scrolls, so its overflow-x cannot be visible.
+ */
+const PILL_ROOM = 26;
+/** The box that names the token every per-token card is showing. */
+const TOKEN_PICKER_ID = 'f:pipe:THIS TOKEN';
 const boxLabelStyle = (n) => ({
   flex: 1, minWidth: 0, fontSize: n.kind === 'file' ? 8.5 : 9.5,
   fontWeight: n.kind === 'panel' ? 700 : 500,
@@ -546,17 +556,28 @@ function CardShell({ node, at, grow, onDragStart, onAnchors, title, accent, onCl
       const side = el.getAttribute('data-side');
       // One element can anchor SEVERAL neighbours (comma-separated): a step's
       // single result is where every one of its outgoing arrows leaves from.
+      // Where the PORT itself is, in map pixels. A row chip sits a few pixels
+      // inside the card and a nub carried the line the rest of the way; a dot
+      // on a record block is ~19px in, which is too far for a nub and is what
+      // made a line stop at the card's border and never reach its circle. The
+      // arrow layer is drawn above the cards, so it can simply go there.
+      const ownX = side === 'in'
+        ? left + (r.left - rootBox.left) / (k || 1)
+        : left + (r.right - rootBox.left) / (k || 1);
       String(el.getAttribute('data-anchor')).split(',').filter(Boolean).forEach((id) => {
         out.push({
           id, side,
           y: top + Math.max(8, Math.min(h - 8, mid)),
           edgeX: side === 'in' ? left : left + w,
+          // Clamped inside the card, so a mis-measured row cannot throw the
+          // endpoint out onto the canvas.
+          portX: Math.max(left, Math.min(left + w, ownX)),
         });
       });
     });
     // Only report a real change, or setting state from a layout effect would
     // render, measure, and report for ever.
-    const sig = out.map((a) => a.id + a.side + Math.round(a.y)).join('|');
+    const sig = out.map((a) => a.id + a.side + Math.round(a.y) + ':' + Math.round(a.portX || 0)).join('|');
     if (sig === lastSig.current) return;
     lastSig.current = sig;
     onAnchors(node.id, out);
@@ -747,15 +768,15 @@ function FlowRows({ side, rows, accent, onPick, title }) {
         );
         const chip = (
           <span
-            data-anchor={r.node.id}
+            data-anchor={r.anchorKey || r.node.id}
             data-side={side}
             onClick={() => onPick(r.node.id)}
-            title={r.node.label}
+            title={r.label ? r.label + ' \u2014 from ' + r.node.label : r.node.label}
             style={{
               cursor: 'pointer', fontSize: 9, padding: '2px 6px', borderRadius: 6, flexShrink: 1,
               border: `1px solid ${col}55`, background: col + '14', color: col, minWidth: 0,
               maxWidth: '62%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-            }}>{r.node.label}</span>
+            }}>{r.label || r.node.label}</span>
         );
         // What travels along this arrow, written ON the arrow.
         const carried = r.carries ? (
@@ -782,6 +803,18 @@ function FlowRows({ side, rows, accent, onPick, title }) {
   );
 }
 
+/**
+ * The key a SPLIT line is anchored by, at both ends.
+ *
+ * A collapsed arrow between two boxes can stand for several field-to-field
+ * links. While either end is open those links are drawn as separate lines, and
+ * each needs its own anchor - keying them by the neighbour's id alone would
+ * make three rows feeding RAW fight over one anchor and only the last would
+ * win. The key names the LINK, so a line leaves the formula that produced it
+ * and lands on the row that consumes it.
+ */
+const partKey = (fromId, toId) => fromId + '>' + toId;
+
 /** A down arrow between two parts of the flow, optionally carrying a value. */
 function FlowDown({ align, accent, label, outIds }) {
   // As the box's OUTPUT node: the result carries every outgoing arrow, with a
@@ -790,17 +823,23 @@ function FlowDown({ align, accent, label, outIds }) {
   // The output node sits on the RIGHT, beside the edge its arrows leave from,
   // with a short connecting line to that edge.
   if (isOut) {
+    // The result sits ASTRIDE the card's right edge - half in, half out - the
+    // same way a collapsed box wears its output count, so a box's output reads
+    // as leaving it rather than as a number parked inside it. -9px clears the
+    // body padding and translateX(50%) centres the pill on the edge, which is
+    // also where its arrows leave, so the old stub line to the edge is gone.
     return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 5, margin: '3px 0 1px' }}>
+      <div style={{ position: 'relative', height: 18, margin: '5px 0 3px' }}>
         <span
           data-anchor={outIds.join(',')}
           data-side="out"
           style={{
+            position: 'absolute', right: -9, top: '50%',
+            transform: 'translate(50%, -50%)',
             fontSize: 12, fontWeight: 800, color: C.white, padding: '1px 7px', borderRadius: 6,
-            background: accent + '22', border: `1px solid ${accent}66`, flexShrink: 0,
+            background: C.bg, border: `1px solid ${accent}aa`, flexShrink: 0,
+            whiteSpace: 'nowrap', boxShadow: `0 0 0 2px ${C.bg}`,
           }}>{label}</span>
-        {/* Through the body padding (9px) to the card edge. */}
-        <span style={{ width: 16, height: 1.5, background: accent, opacity: 0.8, marginLeft: -5, marginRight: -9, flexShrink: 0 }} />
       </div>
     );
   }
@@ -846,6 +885,30 @@ function Machine({ title, accent, right, children }) {
  */
 function FlowBody({ ins, outs, accent, onPick, inTitle, outTitle, machine, result, single }) {
   const asOutput = single && result;
+  // A result straddling the CALCULATION block's edge needs half its width of
+  // clear space to the right of that block, because the card body clips
+  // horizontally (overflowX hidden, which a scrollable body cannot avoid).
+  // Without it the pill is cut in half and reads as "=" with no number.
+  if (asOutput && machine) {
+    return (
+      <div>
+        <FlowRows side="in" rows={ins} accent={accent} onPick={onPick} title={inTitle || 'IN'} />
+        <div style={{ position: 'relative', paddingRight: PILL_ROOM }}>
+          {machine}
+          <span
+            data-anchor={outs.map((r) => r.node.id).join(',')}
+            data-side="out"
+            style={{
+              position: 'absolute', right: PILL_ROOM, top: '50%',
+              transform: 'translate(50%, -50%)',
+              fontSize: 12, fontWeight: 800, color: C.white, padding: '1px 7px', borderRadius: 6,
+              background: C.bg, border: `1px solid ${accent}aa`, whiteSpace: 'nowrap',
+              boxShadow: `0 0 0 2px ${C.bg}`,
+            }}>{result}</span>
+        </div>
+      </div>
+    );
+  }
   return (
     <div>
       <FlowRows side="in" rows={ins} accent={accent} onPick={onPick} title={inTitle || 'IN'} />
@@ -923,16 +986,70 @@ const PROVIDER_PARTS = {
  * The union of the input steps' own `raw.picks`, so a file box and a provider
  * box can never claim a key no step reads.
  */
+/**
+ * The record a card draws when the selected token has none.
+ *
+ * Every leaf becomes "-". The shape comes from the FILE when it declares one
+ * (ethos.json carries `shape`), because only the file knows the keys nothing
+ * currently reads; otherwise it is rebuilt from the paths the pipeline picks
+ * out of it, which is at least every key that matters to a score.
+ *
+ * Drawing the empty shape rather than falling back to a list of readers is
+ * the point: the card then looks the same whether or not the data arrived,
+ * and the gap reads as "no value yet" instead of as a different card.
+ */
+function skeletonOf(shape, picks) {
+  const blank = (v) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const out = {};
+      Object.keys(v).forEach((k) => { out[k] = blank(v[k]); });
+      return out;
+    }
+    return '-';
+  };
+  if (shape && typeof shape === 'object') return blank(shape);
+  if (!picks || !picks.length) return null;
+  const out = {};
+  picks.forEach((p) => {
+    // 'profile.score' -> out.profile.score; array steps are left alone.
+    const parts = String(p.path).split('.');
+    let at = out;
+    parts.forEach((key, i) => {
+      if (i === parts.length - 1) { at[key] = '-'; return; }
+      if (!at[key] || typeof at[key] !== 'object') at[key] = {};
+      at = at[key];
+    });
+  });
+  return Object.keys(out).length ? out : null;
+}
+
 function recordReaders(allFields, slot, prefix) {
   const under = (p) => !prefix || p === prefix || p.startsWith(prefix + '.') || p.startsWith(prefix + '[');
   const picks = [];
   const outs = [];
+  const idOf = {};
+  (allFields || []).forEach((fn) => { if (!idOf[fn.label]) idOf[fn.label] = fn.id; });
+
+  // The ports a FILE has are a property of the file, not of some box standing
+  // in front of it. RAW says which keys are read out of each file; RELAY_
+  // CONSUMERS says which box reads each one.
+  Object.keys(RAW_PORTS || {}).forEach((label) => {
+    const r = RAW_PORTS[label];
+    if (!r || r.from !== slot) return;
+    const readers = RELAY_CONSUMERS[label] || [label];
+    (r.picks || []).filter((p) => under(p.path)).forEach((p) => {
+      readers.forEach((to) => {
+        if (!idOf[to]) return;
+        picks.push({ path: p.path, to, toId: idOf[to], alt: p.alt });
+      });
+    });
+  });
+
+  // A box that still declares its own record (the token list, the identity
+  // step) keeps its outputs listed, because its card draws them.
   (allFields || []).forEach((fn) => {
     const r = fn.field && fn.field.raw;
     if (!r || r.from !== slot) return;
-    const ps = (r.picks || []).filter((p) => under(p.path));
-    if (!ps.length) return;
-    ps.forEach((p) => picks.push({ path: p.path, to: fn.label, alt: p.alt }));
     outs.push({ label: fn.label, value: (vv) => (fn.field.value ? fn.field.value(vv) : null) });
   });
   return { picks, outs, last: slot === 'history' };
@@ -1299,10 +1416,77 @@ export default function FlowChart({ v, onJumpToMirror }) {
   const edgesOf = (id) => laid.edges.filter((e) => e.from === id || e.to === id);
 
   /** The row inside an open card that this edge belongs to, if there is one. */
-  const anchorFor = (cardId, otherId, side) => {
+  const anchorFor = (cardId, otherId, side, key) => {
     const m = anchors.get(cardId);
-    return (m && m.get(otherId + ':' + side)) || null;
+    if (!m) return null;
+    // A split line looks for its own link first; a whole arrow, and a split
+    // one whose card has not reported that row yet, fall back to the box.
+    return (key && m.get(key + ':' + side)) || m.get(otherId + ':' + side) || null;
   };
+
+  /**
+   * The lines to draw. While either end of an arrow is open, an arrow standing
+   * for several field-to-field links becomes one line per link - so four
+   * components send four values to RAW instead of one line carrying "4
+   * fields", and each line can be named by the DATA it carries rather than by
+   * the box it came from. Closed, they collapse back to one.
+   */
+  /**
+   * Which KEYS of a raw file each box reads out of it.
+   *
+   * A file-to-field arrow is one edge however many keys travel along it, so
+   * the parts that split a panel's arrow do not exist here. The record's own
+   * picks are that list, and they are what lets an open file card send one
+   * line per key from the dot beside it.
+   */
+  // Not a hook: this sits past an early return, and a conditional useMemo is
+  // "rendered more hooks than during the previous render". It walks ten file
+  // nodes, so there is nothing to memoise anyway.
+  const filePicks = (() => {
+    const out = new Map();
+    laid.nodes.forEach((n) => {
+      if (n.kind !== 'file') return;
+      const slot = slotOfPath(n.path);
+      if (!slot) return;
+      const r = recordReaders(allFields, slot, null);
+      if (r && r.picks.length) out.set(n.id, r.picks.filter((p) => p.toId));
+    });
+    return out;
+  })();
+
+  const drawEdges = [];
+  laid.edges.forEach((e) => {
+    const parts = e.parts || [];
+    const openEnd = growOf(e.from) > 0.01 || growOf(e.to) > 0.01;
+
+    // An OPEN file card: one line per key the target reads out of it.
+    if (growOf(e.from) > 0.01 && filePicks.has(e.from)) {
+      const mine = filePicks.get(e.from).filter((p) => p.toId === e.to);
+      if (mine.length) {
+        const seen = new Set();
+        mine.forEach((p) => {
+          const key = p.path + '>' + p.toId;
+          if (seen.has(key)) return;
+          seen.add(key);
+          drawEdges.push(Object.assign({}, e, {
+            id: e.id + '#' + key, anchorKey: key, keyPath: p.path, split: true,
+          }));
+        });
+        return;
+      }
+    }
+
+    if (!openEnd || parts.length < 2 || e.kind === 'contains') { drawEdges.push(e); return; }
+    const seen = new Set();
+    parts.forEach((part) => {
+      const key = partKey(part.from, part.to);
+      if (seen.has(key)) return;
+      seen.add(key);
+      drawEdges.push(Object.assign({}, e, {
+        id: e.id + '#' + key, anchorKey: key, parts: [part], split: true,
+      }));
+    });
+  });
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>
@@ -1382,6 +1566,11 @@ export default function FlowChart({ v, onJumpToMirror }) {
           transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`,
           transformOrigin: '0 0',
         }}>
+          {/* UNDER the cards. Putting it above did make a line reach its dot,
+              but every line that merely passes BEHIND a card was then painted
+              across its face and the card read as transparent. A card is
+              opaque; the line is carried the last few pixels by a nub drawn
+              inside it, the same way the row chips have always done it. */}
           <svg
             width={laid.width + 40} height={laid.height + 40}
             style={{ position: 'absolute', left: 0, top: 0, overflow: 'visible', pointerEvents: 'none' }}
@@ -1398,7 +1587,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
                 </marker>
               ))}
             </defs>
-            {laid.edges.map((e) => {
+            {drawEdges.map((e) => {
               const a = byId.get(e.from);
               const b = byId.get(e.to);
               if (!a || !b) return null;
@@ -1409,8 +1598,8 @@ export default function FlowChart({ v, onJumpToMirror }) {
               // the other end rather than to the middle of the box.
               const pa = posOf(a);
               const pb = posOf(b);
-              const outA = anchorFor(a.id, b.id, 'out');
-              const inB = anchorFor(b.id, a.id, 'in');
+              const outA = anchorFor(a.id, b.id, 'out', e.anchorKey);
+              const inB = anchorFor(b.id, a.id, 'in', e.anchorKey);
               // Eased from the box’s own centre to its row as the card opens,
               // rather than switched over at the end: a gate made every arrow
               // jump at once the moment the growth finished.
@@ -1548,9 +1737,17 @@ export default function FlowChart({ v, onJumpToMirror }) {
                   );
                 })()}
                 {n.kind === 'panel' && (
+                  /* How many values LEAVE this box, sitting astride its right
+                     edge - half in, half out - so it reads as the box's output
+                     rather than as a label inside it. Opaque, because the half
+                     hanging over the canvas would otherwise have arrows
+                     showing through it. */
                   <span style={{
+                    position: 'absolute', right: 0, top: '50%',
+                    transform: 'translate(50%, -50%)',
                     fontSize: 8, color: col, flexShrink: 0, padding: '1px 5px', borderRadius: 7,
-                    border: `1px solid ${col}44`,
+                    border: `1px solid ${col}88`, background: C.bg,
+                    boxShadow: `0 0 0 2px ${C.bg}`,
                   }}>{open ? 'open' : n.count}</span>
                 )}
                 {n.kind === 'field' && n.status && n.status !== 'live' && (
@@ -1594,6 +1791,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
                   grow={growOf(node.id)}
                   onDragStart={startNodeDrag(node.id)}
                   onAnchors={reportAnchors}
+                  fullById={fullById}
                   edges={edgesOf(node.id)}
                   byId={byId}
                   allFields={allFields}
@@ -1707,7 +1905,14 @@ function EdgeTip({ edge, at, byId, fullById, v }) {
   );
 }
 
-function Working({ fields, v, onPick, page, bare, names, accent }) {
+/**
+ * `anchors` maps a field's label to the ids of the boxes that read it, and the
+ * row's VALUE carries them. That is what lets an arrow leave the formula that
+ * produced it instead of a "USED BY" list underneath the card: on a panel of
+ * several formulas, one shared list could only say that something downstream
+ * reads something inside, never which number went where.
+ */
+function Working({ fields, v, onPick, page, bare, names, accent, anchors }) {
   if (!fields || !fields.length) return null;
   const jump = (p, label) => onPick('f:' + p + ':' + label);
   return (
@@ -1730,7 +1935,13 @@ function Working({ fields, v, onPick, page, bare, names, accent }) {
             marginBottom: 7, paddingBottom: 6,
             borderBottom: i === fields.length - 1 ? 'none' : `1px solid ${C.line}`,
           }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+            <div style={{
+              display: 'flex', alignItems: 'baseline', gap: 6,
+              // An output pill straddles the FORMULA block's edge, so the row
+              // needs somewhere to hang it from and room not to run under it.
+              position: 'relative',
+              paddingRight: anchors && anchors[f.label] ? 20 : 0,
+            }}>
               <span
                 onClick={() => jump(page, f.label)}
                 title="open this number on the map"
@@ -1739,7 +1950,26 @@ function Working({ fields, v, onPick, page, bare, names, accent }) {
                   color: C.dim, flex: 1, minWidth: 0,
                 }}>{f.label}</span>
               {f.weight && <span style={{ fontSize: 8.5, color: C.faint }}>{f.weight}</span>}
-              <span style={{ fontSize: 11, fontWeight: 800, color: C.white }}>
+              <span
+                data-anchor={(anchors && anchors[f.label]) || undefined}
+                data-side={anchors && anchors[f.label] ? 'out' : undefined}
+                style={{
+                  fontSize: 11, fontWeight: 800, color: C.white,
+                  // Only a row something actually reads is drawn as an output
+                  // node; the rest stay plain numbers.
+                  //
+                  // An output sits ASTRIDE the formula block's right edge -
+                  // half in, half out - the same way the collapsed box wears
+                  // its count. -8px clears the block's 7px padding and 1px
+                  // border, and translateX(50%) centres the pill on it.
+                  ...(anchors && anchors[f.label] ? {
+                    position: 'absolute', right: -8, top: '50%',
+                    transform: 'translate(50%, -50%)',
+                    padding: '1px 7px', borderRadius: 6, flexShrink: 0,
+                    background: C.bg, border: `1px solid ${accent}aa`,
+                    boxShadow: `0 0 0 2px ${C.bg}`, whiteSpace: 'nowrap',
+                  } : null),
+                }}>
                 {value === null || value === undefined || value === '' ? '\u2014' : String(value)}
               </span>
             </div>
@@ -1770,7 +2000,7 @@ function Working({ fields, v, onPick, page, bare, names, accent }) {
 
 /* -------------------------------------------------------- opened box --- */
 
-function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, allFields, v, onClose, onPick, isOpen, onJumpToMirror }) {
+function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, fullById, allFields, v, onClose, onPick, isOpen, onJumpToMirror }) {
   const upstream = edges.filter((e) => e.to === node.id).map((e) => byId.get(e.from)).filter(Boolean);
   const downstream = edges.filter((e) => e.from === node.id).map((e) => byId.get(e.to)).filter(Boolean);
   const accent = nodeColor(node);
@@ -1847,7 +2077,37 @@ function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, allFiel
     ) : null;
 
     const toks = inTokens(f);
-    const ins = upstream.map((u) => {
+    // One row per LINK, not per box. An arrow from a panel of four formulas
+    // is four values arriving, and a single row saying "DEMAND ENGINE · 4
+    // fields" cannot say which of them this box actually reads. Each row
+    // carries the link's own anchor, so its line lands on that row.
+    const splitIn = (u) => {
+      const e = edgeTo(u.id, node.id);
+      const ps = (e && e.parts) || [];
+      if (u.kind !== 'panel' || !ps.length) return null;
+      const seen = new Set();
+      const rows = [];
+      ps.forEach((pt) => {
+        const key = partKey(pt.from, pt.to);
+        if (seen.has(key)) return;
+        seen.add(key);
+        const src = (fullById && fullById.get(pt.from)) || byId.get(pt.from);
+        const label = src && src.label ? src.label : partLabel(pt.from);
+        rows.push({
+          node: u, label,
+          // Only a SPLIT line has a key to be found by. A single link is still
+          // one arrow, anchored the ordinary way - it just gets to be named
+          // after the value it carries rather than after the box it left.
+          anchorKey: ps.length > 1 ? key : undefined,
+          carries: src && src.kind === 'field' ? vals.get(src.page + '|' + src.label) : null,
+        });
+      });
+      return rows.length ? rows : null;
+    };
+
+    const ins = [].concat(...upstream.map((u) => {
+      const split = splitIn(u);
+      if (split) return split;
       let carries = null;
       if (u.kind === 'field') carries = valOf(u);
       else if (u.kind === 'provider') {
@@ -1857,8 +2117,8 @@ function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, allFiel
         carries = (t && t.field) || 'read';
       } else if (u.kind === 'panel') carries = partsSummary(edgeTo(u.id, node.id), (p) => p.from);
       else if (u.kind === 'store') carries = 'restored';
-      return { node: u, carries };
-    });
+      return [{ node: u, carries }];
+    }));
 
     const direct = Boolean(f.fetch) && !f.calc;
     // The same card as the SCORE PIPELINE tab's: the formula, then the DATA -
@@ -1945,19 +2205,42 @@ function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, allFiel
     // components); a dashboard panel only SHOWS what the pipeline computed.
     const computes = node.page === 'pipe';
     const dataCol = accent === '#e2e8f0' ? C.teal : accent;
+
+    // Which boxes read WHICH formula in here. A collapsed arrow keeps the
+    // field-level links it stands for as `parts`, so the panel can hand each
+    // row the ids of its own readers and the arrow leaves that row's value.
+    const anchors = {};
+    downstream.forEach((d) => {
+      const e = edgeTo(node.id, d.id);
+      ((e && e.parts) || []).forEach((part) => {
+        const src = byId.get(part.from);
+        const label = src && src.label ? src.label : partLabel(part.from);
+        if (!label) return;
+        const key = partKey(part.from, part.to);
+        anchors[label] = anchors[label] ? anchors[label] + ',' + key : key;
+      });
+    });
+
+    const hasOutPills = Object.keys(anchors).length > 0;
     const machine = node.fields && node.fields.length ? (
+      <div style={{ paddingRight: hasOutPills ? PILL_ROOM : 0 }}>
       <Machine accent={accent}
         title={(computes ? 'COMPUTES · ' : 'SHOWS · ') + node.fields.length + (computes ? ' COMPONENTS' : ' FIELDS')}>
         <Working fields={node.fields} v={v} onPick={onPick} page={node.page} bare
-          names={computes && ins.length > 0} accent={dataCol} />
+          names={computes && ins.length > 0} accent={dataCol} anchors={anchors} />
       </Machine>
+      </div>
     ) : null;
     return (
       <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors}
         title={node.label} accent={accent} onClose={onClose}
         info={shows ? <ShowsList shows={shows} accent={accent} /> : null}>
-        <FlowBody ins={ins} outs={downstream.map(outRow)} accent={accent} onPick={onPick}
-          inTitle="READS" outTitle="USED BY" machine={machine} />
+        {/* No USED BY list: every outgoing arrow leaves the value of the
+            formula that produced it, anchored on its own row above. A reader
+            no row claimed (a panel-level link with no field behind it) falls
+            back to the card's edge, as it did before. */}
+        <FlowBody ins={ins} outs={[]} accent={accent} onPick={onPick}
+          inTitle="READS" machine={machine} />
         {isOpen && <Neighbours accent={accent} title="FIELDS" side="out" list={inner} onPick={onPick} />}
         {tabLink}
       </CardShell>
@@ -2059,20 +2342,64 @@ function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, allFiel
     const slot = slotOfPath(node.path);
     const readers = slot ? recordReaders(allFields, slot, null) : null;
     const rec = slot && v && v.pipe && v.pipe.raw ? v.pipe.raw[slot] : null;
-    const machine = (
-      <Machine accent={accent} title={readers && readers.picks.length ? 'THIS TOKEN IN THE FILE → READ BY' : 'ON THE SERVER’S DISK'}>
-        {clock && <div style={{ fontSize: 8.5, color: C.dim, marginBottom: 4 }}>written {clock}</div>}
-        {readers && readers.picks.length ? (
-          <RecordView rec={rec} spec={readers} v={v} accent={accent} caption={RAW_RECORD[slot]} />
-        ) : (
-          <div style={{ fontSize: 9, fontFamily: MONO_STACK, color: C.text, wordBreak: 'break-all' }}>{node.path}</div>
-        )}
-      </Machine>
-    );
+    // No record for this token yet is not a reason to show a different card.
+    const declaredShape = v && v.pipe && v.pipe.raw && v.pipe.raw.shapes
+      ? v.pipe.raw.shapes[slot] : null;
+    const skeleton = readers && readers.picks.length
+      ? skeletonOf(declaredShape, readers.picks) : null;
+    const record = rec || skeleton;
+    const shows = Boolean(readers && readers.picks.length && record);
+    // A file holds values; it computes nothing. So the card is the record and
+    // its ports, with no COMPUTED block around it: what comes in names the
+    // collector and the selection, and every key in the record is its own
+    // output. The old READ BY list said "2 fields" and left you tracing a
+    // wire to find out which.
+    const token = v && v.pipe && v.pipe.s ? (v.pipe.s.symbol || null) : null;
+    // The token picker is a real input here - it decides WHICH record this
+    // card shows - so it arrives through `ins` like any other upstream. It is
+    // named for what it carries, the symbol, rather than for its box.
+    const portRows = ins.map((r) => (r.node.id === TOKEN_PICKER_ID
+      ? { key: 'Selected token', value: token || r.node.label, id: r.node.id, color: nodeColor(r.node) }
+      : { key: 'Source', value: r.node.label, id: r.node.id, color: nodeColor(r.node) }));
     return (
       <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors} title={node.label} accent={accent} onClose={onClose} info={info}>
-        <FlowBody ins={ins} outs={outs} accent={accent} onPick={onPick}
-          inTitle="COLLECTED FROM" outTitle="READ BY" machine={machine} />
+        {portRows.map((r) => (
+          <div key={r.id + r.key} style={{
+            position: 'relative', margin: '0 0 4px', padding: '2px 6px', borderRadius: 4,
+            background: r.color + '14', border: '1px solid ' + r.color + '33',
+            fontSize: 8.5, fontFamily: MONO_STACK, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>
+            <span style={{ color: r.color }}>{r.key}</span>
+            <span style={{ color: C.grey }}>: </span>
+            <span style={{ color: C.white }}>&ldquo;{r.value}&rdquo;</span>
+            {/* The port, astride the card's left edge where its arrow lands. */}
+            <span
+              data-anchor={r.id}
+              data-side="in"
+              onClick={() => onPick(r.id)}
+              title={r.value}
+              style={{
+                position: 'absolute', left: -9, top: '50%',
+                transform: 'translate(-50%, -50%)', cursor: 'pointer',
+                width: 7, height: 7, borderRadius: '50%', boxSizing: 'border-box',
+                background: r.color, border: '1px solid ' + r.color,
+                boxShadow: '0 0 0 2px ' + C.panel,
+              }} />
+          </div>
+        ))}
+        {clock && (
+          <div style={{ fontSize: 8, color: C.grey, margin: '2px 0 5px' }}>written {clock}</div>
+        )}
+        {shows ? (
+          <RecordView rec={record} spec={readers} v={v} accent={accent} caption={null} perLine
+            waiting={!rec} />
+        ) : (
+          <>
+            <div style={{ fontSize: 9, fontFamily: MONO_STACK, color: C.text, wordBreak: 'break-all', marginBottom: 6 }}>{node.path}</div>
+            <FlowRows side="out" rows={outs} accent={accent} onPick={onPick} title="READ BY" />
+          </>
+        )}
       </CardShell>
     );
   }

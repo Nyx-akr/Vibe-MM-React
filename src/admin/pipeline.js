@@ -180,214 +180,11 @@ PAGES.pipe = {
     },
 
     /* -------------------------------------------------- 2 TOKEN INPUTS -- */
-    {
-      group: 'TOKEN INPUTS', stage: 2, flat: true,
-      fields: [
-        // --- market.json: GeckoTerminal + DexScreener, normalised -------------
-        {
-          label: 'LIQUIDITY', status: 'live',
-          value: (v) => usd((S(v) || {}).liquidityUsd),
-          fetch: [ext('dexscreener', 'liquidity.usd'), op('else'), ext('geckoterminal', 'reserve_in_usd')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const s = S(v); if (!s) return null;
-            const src = s.sources || {};
-            return 'DexScreener ' + (usd((src.dexscreener || {}).liquidityUsd) || '—') +
-              ' · GeckoTerminal ' + (usd((src.geckoterminal || {}).liquidityUsd) || '—');
-          },
-          where: WHERE_NORM,
-        },
-        {
-          label: 'BUYERS 24H', status: 'live',
-          value: (v) => count(((S(v) || {}).traders24h || {}).buyers),
-          fetch: [ext('geckoterminal', 'transactions.h24.buyers (distinct wallets)')],
-          via: api('/raw/<chain>/market.json'),
-          where: WHERE_NORM,
-        },
-        {
-          label: 'BUY/SELL 24H', status: 'live',
-          value: (v) => rnd((S(v) || {}).buySellRatio24h, 2),
-          fetch: [ext('geckoterminal', 'transactions.h24 buys / sells'), op('else'), ext('dexscreener', 'txns.h24')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const t = (S(v) || {}).txns24h; if (!t || !fin(t.buys) || !t.sells) return null;
-            return count(t.buys) + ' buys ÷ ' + count(t.sells) + ' sells = ' + rnd(t.buys / t.sells, 2);
-          },
-          where: WHERE_NORM,
-        },
-        {
-          label: 'PRICE, 2 SOURCES', status: 'live',
-          value: (v) => { const x = (S(v) || {}).crossSource; return x && fin(x.priceDeltaPct) ? pct(x.priceDeltaPct) + ' apart' : (x ? x.sourcesAgreeing + ' source' : null); },
-          fetch: [ext('dexscreener', 'priceUsd'), op('vs'), ext('geckoterminal', 'base_token_price_usd')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const s = S(v); if (!s) return null;
-            const ds = (s.sources && s.sources.dexscreener || {}).priceUsd;
-            const gt = (s.sources && s.sources.geckoterminal || {}).priceUsd;
-            if (!fin(ds) || !fin(gt)) return 'only ' + ((s.crossSource || {}).sourcesAgreeing || 0) + ' of 2 sources priced it';
-            return '( DexScreener ' + usd(ds) + ' − GeckoTerminal ' + usd(gt) + ' ) ÷ ' + usd(gt) +
-              ' = ' + pct((s.crossSource || {}).priceDeltaPct);
-          },
-          where: WHERE_NORM + ', crossSource',
-        },
-        {
-          label: 'VENUES', status: 'live',
-          value: (v) => count((((S(v) || {}).sources || {}).dexscreener || {}).pairs),
-          fetch: [ext('dexscreener', 'pairs listed for this token')],
-          via: api('/raw/<chain>/market.json'),
-          where: WHERE_NORM,
-        },
-        {
-          label: 'QUOTE TOKEN PRICE', status: 'live',
-          value: (v) => { const s = S(v); return s && fin(s.quoteTokenPriceUsd) ? (s.quoteSymbol || '') + ' $' + s.quoteTokenPriceUsd.toFixed(4) : null; },
-          fetch: [ext('geckoterminal', 'quote_token_price_usd')],
-          via: api('/raw/<chain>/market.json'),
-          where: WHERE_NORM,
-        },
-        {
-          label: 'POOL AGE', status: 'live',
-          value: (v) => { const h = (S(v) || {}).poolAgeHours; return fin(h) ? (h < 48 ? rnd(h, 1) + 'h' : rnd(h / 24, 1) + 'd') : null; },
-          fetch: [ext('geckoterminal', 'pool_created_at'), op('else'), ext('dexscreener', 'pairCreatedAt')],
-          via: api('/raw/<chain>/market.json'),
-          where: WHERE_NORM,
-        },
-        {
-          label: 'VOLUME / LIQUIDITY', status: 'live',
-          value: (v) => { const x = (S(v) || {}).volumeToLiquidity24h; return fin(x) ? rnd(x, 1) + 'x' : null; },
-          fetch: [ext('dexscreener', 'volume.h24'), op('else'), ext('geckoterminal', 'volume_usd.h24'), op('÷ liquidity')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const s = S(v); if (!s || !fin(s.volume24hUsd) || !s.liquidityUsd) return null;
-            return usd(s.volume24hUsd) + ' 24h volume ÷ ' + usd(s.liquidityUsd) + ' = ' + rnd(s.volumeToLiquidity24h, 1) + 'x';
-          },
-          where: WHERE_NORM,
-        },
-        {
-          label: 'JUPITER STATS', status: 'live',
-          value: (v) => { const j = (S(v) || {}).jupiter; return j && fin(j.organicScore) ? 'organic ' + rnd(j.organicScore, 0) : (j ? 'present' : null); },
-          fetch: [ext('jupiter', 'tokens v2: stats 5m/1h/24h, organicScore, holderCount')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const s = S(v); if (!s) return null;
-            const j = s.jupiter;
-            if (!j) return 'Solana only - none for ' + s.chain;
-            const h1 = j.stats1h || {};
-            return 'holders 1h ' + (signed(h1.holderChangePct, 2) || '—') + '% · net 1h ' +
-              (usd(h1.netUsd) || '—') + ' · organic ' + (rnd(j.organicScore, 1) || '—');
-          },
-          where: 'core.js normalizeJupiterToken()',
-        },
-        // --- history.json: our own 15s samples of the same pool --------------
-        {
-          label: 'POOL SAMPLES', status: 'live',
-          value: (v) => { const z = (S(v) || {}).zScores; return z && fin(z.samples) ? z.samples + ' samples' : null; },
-          fetch: [ext('geckoterminal', 'm5 volume, buys, buyers - re-read every 15s'), op('+'), ext('dexscreener', 'm5 volume')],
-          via: api('/raw/<chain>/history.json', 'samples per pool'),
-          equation: (v) => {
-            const z = (S(v) || {}).zScores; if (!z) return null;
-            return z.samples + ' samples over ' + (minutes(z.windowMs) || '0 min') +
-              (z.source ? ' (fallback: ' + z.source + ')' : '') +
-              (z.samples < Z_MIN_SAMPLES ? ' - a baseline needs ' + Z_MIN_SAMPLES : '');
-          },
-          where: 'server memory.samplesFor() → ' + WHERE_API + ' rawInputsFor()',
-        },
-        // --- trades.json: one trade sample per pool ---------------------------
-        {
-          label: 'TRADE SAMPLE', status: 'live',
-          value: (v) => { const t = TS(v); return t ? count(t.trades) + ' trades' : null; },
-          fetch: [ext('geckoterminal', 'pools/{pool}/trades')],
-          via: api('/raw/<chain>/trades.json'),
-          equation: (v) => {
-            const t = TS(v); if (!t) return 'no trade sample for this pool yet';
-            return count(t.trades) + ' trades by ' + count(t.distinctWallets) + ' wallets over ' +
-              (rnd(t.windowMinutes, 1) || '?') + ' min · buys ' + usd(t.buyUsd) + ' · sells ' + usd(t.sellUsd);
-          },
-          where: 'core.js buildWalletSets() + tradeStatsFrom()',
-        },
-        // --- intel.json: contract, holders, routed impact ---------------------
-        {
-          label: '$10K ROUTE QUOTE', status: 'live',
-          value: (v) => { const i = (IN(v) || {}).impact; return i ? (i.source || 'no router') : null; },
-          fetch: [ext('jupiter', 'quote for $10k (Solana)'), op('else'), ext('kyberswap', 'route for $10k (EVM)')],
-          via: api('/raw/<chain>/intel.json'),
-          equation: (v) => {
-            const i = (IN(v) || {}).impact; if (!i) return null;
-            if (!i.source) return i.note || 'no keyless router for this chain';
-            return usd(i.tradeUsd) + ' via ' + i.source + (fin(i.routes) ? ', ' + i.routes + ' routes' : '') +
-              (fin(i.gasUsd) ? ', gas ' + usd(i.gasUsd) : '');
-          },
-          where: 'calculations/asset-detail.js deriveIntel(), impact',
-        },
-        {
-          label: 'HOLDERS', status: 'live',
-          value: (v) => count(((IN(v) || {}).holders || {}).count),
-          fetch: [ext('goplus', 'holder_count'), op('else'), ext('rugcheck', 'totalHolders'), op('else'), ext('jupiter', 'holderCount')],
-          via: api('/raw/<chain>/intel.json', 'count + holder series'),
-          equation: (v) => {
-            const h = (IN(v) || {}).holders; if (!h) return null;
-            return 'GoPlus ' + (count(h.goplusCount) || '—') + ' · RugCheck ' + (count(h.rugcheckCount) || '—') +
-              ' · Jupiter ' + (count(h.jupiterCount) || '—') + ' · series ' + ((h.growth || {}).samples || 0) + ' points';
-          },
-          where: 'deriveIntel(), holders',
-        },
-        {
-          label: 'TOP HOLDERS SHARE', status: 'live',
-          value: (v) => pct(((S(v) || {}).facts || {}).topHolderSharePct),
-          fetch: [ext('goplus', 'holders[].percent, pool excluded'), op('else'), ext('jupiter', 'audit.topHoldersPercentage')],
-          via: api('/raw/<chain>/intel.json'),
-          equation: (v) => { const f = (S(v) || {}).facts; return f && f.topHolderShareSource ? 'source: ' + f.topHolderShareSource : null; },
-          where: 'computeComponents(), facts.topHolderSharePct',
-        },
-        {
-          label: 'CONTRACT CHECKS', status: 'live',
-          value: (v) => { const cs = (IN(v) || {}).contractSafety; if (!cs || !cs.available) return null; const n = (cs.checks || []).length; return (n - cs.failedCount) + '/' + n + ' pass'; },
-          fetch: [ext('goplus', 'token_security'), op('+'), ext('rugcheck', 'report'), op('+'), ext('honeypot', 'buy/sell simulation')],
-          via: api('/raw/<chain>/intel.json'),
-          equation: (v) => {
-            const cs = (IN(v) || {}).contractSafety; if (!cs || !cs.available) return null;
-            const failed = (cs.checks || []).filter((c) => !c.ok);
-            return failed.length ? 'failed: ' + failed.map((c) => c.label).join(', ') : 'every check passes';
-          },
-          where: 'deriveIntel() goPlusChecks() + honeypot checks',
-        },
-        {
-          label: 'LP / CREATOR / INSIDERS', status: 'live',
-          value: (v) => { const cs = (IN(v) || {}).contractSafety; return cs && fin(cs.lpLockedPct) ? 'LP ' + rnd(cs.lpLockedPct, 0) + '% locked' : (cs ? 'no LP data' : null); },
-          fetch: [ext('rugcheck', 'markets[].lpLockedPct, creator tokens, insider graph')],
-          via: api('/raw/<chain>/intel.json'),
-          equation: (v) => {
-            const cs = (IN(v) || {}).contractSafety; if (!cs) return null;
-            return 'creator other tokens ' + (cs.creatorOtherTokens ?? '—') + ' · insiders ' +
-              (cs.insidersDetected == null ? '—' : cs.insidersDetected ? 'detected' : 'none');
-          },
-          where: 'deriveIntel(), contractSafety',
-        },
-        // --- reference.json / ethos.json -------------------------------------
-        {
-          label: 'USD REFERENCE', status: 'live',
-          value: (v) => { const r = (S(v) || {}).usdReference; return r && fin(r.median) ? r.symbol + ' $' + r.median.toFixed(4) : null; },
-          fetch: [ext('cex', 'spot price of the quote token')],
-          via: api('/raw/reference.json'),
-          equation: (v) => {
-            const r = (S(v) || {}).usdReference; if (!r) return 'no reference quotes for this quote token';
-            return 'median of ' + (r.quotes || []).length + ' venues: ' +
-              (r.quotes || []).map((q) => (q.venue || q.source || '?') + ' ' + (fin(q.price) ? q.price.toFixed(4) : '—')).join(', ');
-          },
-          where: 'asset-detail.js usdReferenceMedian()',
-        },
-        {
-          label: 'ETHOS (PROJECT X)', status: 'live',
-          value: (v) => (v && v.ethosLabel) || null,
-          fetch: [ext('ethos', 'score of the X account the token lists')],
-          via: api('/raw/ethos.json'),
-          where: 'services/ethos-intel.js ethosFor()',
-        },
-      ],
-    },
+
 
     /* ------------------------------------------------------ 3 MEASURES -- */
     {
-      group: 'MEASURES', stage: 3, flat: true,
+      group: 'MEASURES', stage: 2, flat: true,
       fields: [
         ...[
           ['VOLUME 5M vs BASELINE', 'volume5mUsd', usd],
@@ -396,7 +193,7 @@ PAGES.pipe = {
         ].map(([label, metric, fmt]) => ({
           label, status: 'live',
           value: (v) => { const m = Z(v)[metric]; return m && fin(m.multiple) ? m.multiple + 'x' : null; },
-          calc: [op('latest ' + metric + ' ÷ mean of the earlier'), ref('pipe', 'POOL SAMPLES')],
+          calc: [op('latest ' + metric + ' ÷ mean of the earlier'), api('/raw/<chain>/history.json', 'POOL SAMPLES')],
           equation: (v) => {
             const m = Z(v)[metric];
             const z = (S(v) || {}).zScores;
@@ -409,7 +206,7 @@ PAGES.pipe = {
         {
           label: 'NET FLOW RATIO', status: 'live',
           value: (v) => rnd((TS(v) || {}).netRatio, 3),
-          calc: [op('( buy USD − sell USD ) ÷ ( buy USD + sell USD ) over'), ref('pipe', 'TRADE SAMPLE')],
+          calc: [op('( buy USD − sell USD ) ÷ ( buy USD + sell USD ) over'), api('/raw/<chain>/trades.json', 'TRADE SAMPLE')],
           equation: (v) => {
             const t = TS(v); if (!t || t.netRatio === null) return null;
             return '( ' + usd(t.buyUsd) + ' − ' + usd(t.sellUsd) + ' ) ÷ ' + usd(t.buyUsd + t.sellUsd) + ' = ' + t.netRatio;
@@ -419,19 +216,19 @@ PAGES.pipe = {
         {
           label: 'TOP-5 WALLET SHARE', status: 'live',
           value: (v) => pct((TS(v) || {}).top5SharePct, 1),
-          calc: [op('USD of the 5 biggest wallets ÷ all USD in'), ref('pipe', 'TRADE SAMPLE')],
+          calc: [op('USD of the 5 biggest wallets ÷ all USD in'), api('/raw/<chain>/trades.json', 'TRADE SAMPLE')],
           where: 'core.js tradeStatsFrom()',
         },
         {
           label: 'PRICE IMPACT $10K', status: 'live',
           value: (v) => pct(((IN(v) || {}).impact || {}).priceImpactPct, 3),
-          calc: [ref('pipe', '$10K ROUTE QUOTE'), op('→ Jupiter priceImpactPct × 100, or KyberSwap ( USD in − USD out ) ÷ USD in × 100')],
+          calc: [api('/raw/<chain>/intel.json', '$10K ROUTE QUOTE'), op('→ Jupiter priceImpactPct × 100, or KyberSwap ( USD in − USD out ) ÷ USD in × 100')],
           where: 'deriveIntel(), impact',
         },
         {
           label: 'HOLDER GROWTH RATE', status: 'live',
           value: (v) => { const g = (((IN(v) || {}).holders) || {}).growth; return g && fin(g.perHour) ? signed(g.perHour) + '/h' : null; },
-          calc: [op('( last − first ) count ÷ hours, over the series in'), ref('pipe', 'HOLDERS')],
+          calc: [op('( last − first ) count ÷ hours, over the series in'), api('/raw/<chain>/intel.json', 'HOLDERS')],
           equation: (v) => {
             const h = (IN(v) || {}).holders; const g = h && h.growth; if (!g || !fin(g.perHour)) return null;
             const rate = h.count ? (g.perHour / h.count) * 100 : null;
@@ -443,7 +240,7 @@ PAGES.pipe = {
         {
           label: 'SHARED WALLETS', status: 'live',
           value: (v) => pct(((S(v) || {}).rotation || {}).sharedWalletPct, 1),
-          calc: [op('wallets of'), ref('pipe', 'TRADE SAMPLE'), op('also in another sampled pool ÷ all its wallets')],
+          calc: [op('wallets of'), api('/raw/<chain>/trades.json', 'TRADE SAMPLE'), op('also in another sampled pool ÷ all its wallets')],
           equation: (v) => {
             const r = (S(v) || {}).rotation; if (!r) return null;
             const top = r.peers && r.peers[0];
@@ -459,13 +256,13 @@ PAGES.pipe = {
             if (!r || !r.median || !fin(s.quoteTokenPriceUsd)) return null;
             return pct(Math.abs(s.quoteTokenPriceUsd - r.median) / r.median * 100, 3);
           },
-          calc: [op('|'), ref('pipe', 'QUOTE TOKEN PRICE'), op('−'), ref('pipe', 'USD REFERENCE'), op('| ÷ median × 100')],
+          calc: [op('|'), api('/raw/<chain>/market.json', 'QUOTE TOKEN PRICE'), op('−'), api('/raw/reference.json', 'USD REFERENCE'), op('| ÷ median × 100')],
           where: 'computeComponents(), usdReference',
         },
         {
           label: 'WALLET SAMPLE', status: 'live',
           value: (v) => { const o = (S(v) || {}).organicFlow; return o && fin(o.walletsSeen) ? o.walletsSeen + ' wallets' : null; },
-          calc: [ref('pipe', 'TRADE SAMPLE'), op('→ background wallet service: who traded once, who churned, who entered together')],
+          calc: [api('/raw/<chain>/trades.json', 'TRADE SAMPLE'), op('→ background wallet service: who traded once, who churned, who entered together')],
           equation: (v) => {
             const q = (S(v) || {}).walletQuality;
             return q && q.note ? q.note : null;
@@ -477,7 +274,122 @@ PAGES.pipe = {
       ],
     },
 
-    /* ------------------------------------------- 4 SCORE DECOMPOSITION -- */
+    /* --------------------------------------------------------- 3 GATES -- */
+    //
+    // Hard pass/fail, run BEFORE any engine. A failed gate ends the token's
+    // run: nothing downstream is scored, and the reason is what the veto log
+    // lists. Gates answer 'should this be scored at all'; engines answer 'how
+    // well does it score'. Keeping them apart is what stops a honeypot from
+    // being rescued by good volume.
+    //
+    // A gate may only fail on EVIDENCE. Missing data is 'not checked', never a
+    // failure - otherwise every token the intel collector has not reached yet
+    // would be vetoed for being new rather than for being bad.
+    {
+      group: 'GATES', stage: 3, flat: true,
+      fields: [
+        {
+          label: 'SELLABLE', status: 'live',
+          value: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            if (!cs || !cs.available) return null;
+            const hit = (cs.checks || []).find((c) => /honeypot|sell/i.test(c.label || ''));
+            return hit ? (hit.ok ? 'pass' : 'FAIL') : null;
+          },
+          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- a simulated buy AND sell must both succeed')],
+          equation: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            if (!cs || !cs.available) return 'not checked yet - the intel collector has not reached this token';
+            const hit = (cs.checks || []).find((c) => /honeypot|sell/i.test(c.label || ''));
+            return hit ? hit.label + ': ' + (hit.detail || (hit.ok ? 'ok' : 'failed')) : 'no sell simulation for this chain';
+          },
+          note: 'The one gate nothing can outweigh. A token that cannot be sold is not a trade at any score.',
+          where: 'calculations/asset-detail.js deriveIntel()',
+        },
+        {
+          label: 'TAX IN RANGE', status: 'live',
+          value: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            if (!cs || !cs.available) return null;
+            const hit = (cs.checks || []).find((c) => /tax/i.test(c.label || ''));
+            return hit ? (hit.ok ? 'pass' : 'FAIL') : null;
+          },
+          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- buy, sell and transfer tax each at or under'), num('5%')],
+          equation: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            if (!cs || !cs.available) return 'not checked yet';
+            const hit = (cs.checks || []).find((c) => /tax/i.test(c.label || ''));
+            return hit ? (hit.detail || hit.label) : 'no tax reading for this chain';
+          },
+          where: 'calculations/asset-detail.js deriveIntel()',
+        },
+        {
+          label: 'NOT A MAJOR', status: 'live',
+          value: (v) => {
+            const mc = (S(v) || {}).marketCapUsd;
+            return fin(mc) ? (mc < 1e9 ? 'pass' : 'FAIL') : null;
+          },
+          calc: [ext('dexscreener', 'marketCapUsd'), op('else'), ext('geckoterminal', 'marketCapUsd'),
+            op('under'), num('$1B'), op('- the cap band, applied as a gate rather than a weight')],
+          via: api('/raw/<chain>/market.json'),
+          equation: (v) => {
+            const mc = (S(v) || {}).marketCapUsd;
+            return fin(mc) ? usd(mc) + ' against the $1B ceiling' : null;
+          },
+          note: 'Already applied upstream: a token that fails this never reaches the board, so every ' +
+            'row you can select here passed it. It is drawn so the rule is visible rather than implied.',
+          where: 'calculations/core.js screenRows()',
+        },
+        {
+          label: 'REAL TICKER', status: 'live',
+          value: (v) => (S(v) ? 'pass' : null),
+          calc: [op('not a stablecoin, wrapped native or stock-ticker impersonation -'),
+            ref('pipe', 'TOKEN LIST'), op('is screened before it is scored')],
+          equation: (v) => {
+            const s = S(v);
+            return s ? (s.symbol || '?') + ' is not on the stable / wrapped / major list' : null;
+          },
+          where: 'calculations/core.js screenRows()',
+        },
+        {
+          label: 'NOT WASH-FLAGGED', status: 'live',
+          value: (v) => {
+            const val = valueOf(modOf(v, 'organicFlow'));
+            return val === null ? null : (val >= 40 ? 'pass' : 'FAIL');
+          },
+          calc: [ref('pipe', 'Organic flow'), op('under'), num(40), op('= the flow is mostly not real')],
+          equation: (v) => {
+            const val = valueOf(modOf(v, 'organicFlow'));
+            if (val === null) return 'no trade sample for this pool yet - not checked';
+            return 'organic ' + val + ' against the 40 floor' + (val < 40 ? ' - would be vetoed' : '');
+          },
+          note: 'Today this costs points rather than vetoing. It is drawn here because it IS a veto in ' +
+            'the qualifier, and the map should show where it belongs before the behaviour follows.',
+          where: WHERE_MODEL,
+        },
+        {
+          label: 'VETO LOG', status: 'live',
+          value: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            const failed = cs && cs.available ? (cs.checks || []).filter((c) => !c.ok).length : 0;
+            return failed ? failed + ' failed' : 'clean';
+          },
+          calc: [ref('pipe', 'SELLABLE'), op('+'), ref('pipe', 'TAX IN RANGE'), op('+'),
+            ref('pipe', 'NOT A MAJOR'), op('+'), ref('pipe', 'REAL TICKER'), op('+'), ref('pipe', 'NOT WASH-FLAGGED')],
+          equation: (v) => {
+            const cs = (IN(v) || {}).contractSafety;
+            if (!cs || !cs.available) return 'nothing to log - no contract data for this token yet';
+            const failed = (cs.checks || []).filter((c) => !c.ok);
+            return failed.length ? failed.map((c) => c.label + ': ' + (c.detail || 'failed')).join('   ')
+              : 'every gate this token could be checked against passed';
+          },
+          note: 'The gates output, not an engine. A vetoed token is logged with its reason, which is ' +
+            'what makes the log a reject list you can read rather than an absence you have to infer.',
+          where: WHERE_MODEL,
+        },
+      ],
+    },
+    /* ------------------------------------------------------- 4 ENGINES -- */
     /*
      * The components, one box each, under the column header "4 · SCORE
      * DECOMPOSITION". This group IS the DETAIL tab's decomposition panel (its
@@ -485,9 +397,10 @@ PAGES.pipe = {
      * Folding them into one panel box was tried and reverted on request: one
      * box per component keeps each one's inputs and output on the map itself.
      */
-    {
-      group: 'SCORE DECOMPOSITION', stage: 4, flat: true,
+        {
+      group: 'DEMAND ENGINE', stage: 4,
       shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Is anyone actually trading it right now, and is the buying wide enough to be more than one wallet. Four readings against this pool’s own baseline.',
       fields: [
         component('volumeAnomaly',
           [op('multipleScore('), ref('pipe', 'VOLUME 5M vs BASELINE'), op(') = 100 × clamp( 0.5 + 0.3 × log10 multiple )')],
@@ -497,7 +410,7 @@ PAGES.pipe = {
           (v) => multipleMath((Z(v).buys5m || {}).multiple)),
         component('buyerBreadth',
           [op('½ × multipleScore('), ref('pipe', 'BUYERS 5M vs BASELINE'), op(') + ½ × logScore('),
-            ref('pipe', 'BUYERS 24H'), op(', 10, 3000 )')],
+            api('/raw/<chain>/market.json', 'BUYERS 24H'), op(', 10, 3000 )')],
           (v) => {
             const m = (Z(v).buyers5m || {}).multiple;
             const a = fin(m) ? multipleScore(m) : null;
@@ -507,7 +420,7 @@ PAGES.pipe = {
           }),
         component('netDemand',
           [op('100 × clamp( 0.5 +'), ref('pipe', 'NET FLOW RATIO'), op('÷ 2 ) ; with no trade sample: 100 × clamp( 0.5 + net ratio of'),
-            ref('pipe', 'JUPITER STATS'), op('÷ 2 ) ; with neither: 100 × clamp( ('), ref('pipe', 'BUY/SELL 24H'), op('− 0.5 ) ÷ 1.5 )')],
+            api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 2 ) ; with neither: 100 × clamp( ('), api('/raw/<chain>/market.json', 'BUY/SELL 24H'), op('− 0.5 ) ÷ 1.5 )')],
           (v) => {
             const t = TS(v);
             if (t && t.netRatio !== null) return 'our sample: 0.5 + ' + t.netRatio + ' ÷ 2 → ' + to100(0.5 + t.netRatio / 2);
@@ -517,8 +430,15 @@ PAGES.pipe = {
             const r = (S(v) || {}).buySellRatio24h;
             return fin(r) ? 'counts only: ( ' + rnd(r, 2) + ' − 0.5 ) ÷ 1.5 → ' + to100((r - 0.5) / 1.5) : null;
           }),
+      ],
+    },
+    {
+      group: 'EXECUTION ENGINE', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Could a position be taken at all — pool depth blended with what $10k actually costs to route.',
+      fields: [
         component('liquidity',
-          [op('½ × logScore('), ref('pipe', 'LIQUIDITY'), op(', $10K, $1M ) + ½ × 100 × clamp( 1 −'),
+          [op('½ × logScore('), api('/raw/<chain>/market.json', 'LIQUIDITY'), op(', $10K, $1M ) + ½ × 100 × clamp( 1 −'),
             ref('pipe', 'PRICE IMPACT $10K'), op('÷ 2.5 )')],
           (v) => {
             const d = logScore((S(v) || {}).liquidityUsd, 10000, 1000000);
@@ -527,43 +447,23 @@ PAGES.pipe = {
             if (d !== null && i !== null) return '½ × ' + d + ' (depth) + ½ × ' + i + ' (impact) → ' + Math.round(d * 0.5 + i * 0.5);
             return d !== null ? 'depth only: ' + d : (i !== null ? 'impact only: ' + i : null);
           }),
+      ],
+    },
+    {
+      group: 'CONFIRMATION ENGINE', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Do independent sources agree on the price. Disagreement is the first sign of a bad read, so this engine is a check on the others rather than a signal of its own.',
+      fields: [
         component('priceConfirmation',
-          [op('100 × clamp( 1 − |'), ref('pipe', 'PRICE, 2 SOURCES'), op('| ÷ 5 ) ; if only one source priced it: 40')],
+          [op('100 × clamp( 1 − |'), api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES'), op('| ÷ 5 ) ; if only one source priced it: 40')],
           (v) => {
             const x = (S(v) || {}).crossSource; if (!x) return null;
             if (fin(x.priceDeltaPct)) return '1 − ' + rnd(Math.abs(x.priceDeltaPct), 3) + ' ÷ 5 → ' + to100(1 - Math.abs(x.priceDeltaPct) / 5);
             return x.sourcesAgreeing < 2 ? 'one source → 40' : null;
           }),
-        component('holderGrowth',
-          [op('100 × clamp( 0.5 + 5 ×'), ref('pipe', 'HOLDER GROWTH RATE'), op('÷'), ref('pipe', 'HOLDERS'),
-            op('× 100 ) ; with no holder series: 100 × clamp( 0.5 + 1h holder % of'), ref('pipe', 'JUPITER STATS'), op('÷ 4 )')],
-          (v) => {
-            const h = (IN(v) || {}).holders; const g = h && h.growth;
-            if (g && fin(g.perHour)) {
-              const rate = h.count ? (g.perHour / h.count) * 100 : 0;
-              return '0.5 + ' + rnd(rate, 4) + ' × 5 → ' + to100(0.5 + rate * 5);
-            }
-            const p = (((S(v) || {}).jupiter || {}).stats1h || {}).holderChangePct;
-            return fin(p) ? 'Jupiter: 0.5 + ' + rnd(p, 2) + ' ÷ 4 → ' + to100(0.5 + p / 4) : null;
-          }),
-        component('walletQuality',
-          [op('[ ( holder spread'), op('×'), num(35), op(') + ( crowd independence'), op('×'), num(30),
-            op(') + ( volume spread'), op('×'), num(20), op(') + ( position intent'), op('×'), num(15),
-            op(') ] ÷ [ the weights of the parts that have a value ], where holder spread = 1 −'),
-            ref('pipe', 'TOP HOLDERS SHARE'), op('÷ 60 and the other three come from'), ref('pipe', 'WALLET SAMPLE'),
-            op('; then × 0.75 if insiders, × 0.8 if the creator launched 20+ tokens, × 1.15 if LP over 90% locked, from'),
-            ref('pipe', 'LP / CREATOR / INSIDERS')],
-          (v) => {
-            const q = (S(v) || {}).walletQuality; if (!q) return null;
-            return weightedMath(q.parts, q.modifiers);
-          },
-          { where: 'calculations/core.js walletQualityScore() - the wallets module owns this number' }),
-        component('capitalRotation',
-          [op('100 × clamp('), ref('pipe', 'SHARED WALLETS'), op('÷ 25 )')],
-          (v) => { const p = ((S(v) || {}).rotation || {}).sharedWalletPct; return fin(p) ? rnd(p, 1) + ' ÷ 25 → ' + to100(p / 25) : null; }),
         component('crossVenue',
-          [op('logScore('), ref('pipe', 'VENUES'), op(', 1, 20 ) × ( 1 if both price sources answered, else 0.6 ) - from'),
-            ref('pipe', 'PRICE, 2 SOURCES')],
+          [op('logScore('), api('/raw/<chain>/market.json', 'VENUES'), op(', 1, 20 ) × ( 1 if both price sources answered, else 0.6 ) - from'),
+            api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES')],
           (v) => {
             const s = S(v); const n = ((s && s.sources) || {}).dexscreener ? s.sources.dexscreener.pairs : null;
             if (!fin(n)) return null;
@@ -579,21 +479,79 @@ PAGES.pipe = {
             const dev = Math.abs(s.quoteTokenPriceUsd - r.median) / r.median * 100;
             return '1 − ' + rnd(dev, 3) + ' ÷ 2 → ' + to100(1 - dev / 2);
           }),
+      ],
+    },
+    {
+      group: 'HOLDERS ENGINE', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Who holds it and whether that base is growing. Concentration caps the score however well the token trades.',
+      fields: [
+        component('holderGrowth',
+          [op('100 × clamp( 0.5 + 5 ×'), ref('pipe', 'HOLDER GROWTH RATE'), op('÷'), api('/raw/<chain>/intel.json', 'HOLDERS'),
+            op('× 100 ) ; with no holder series: 100 × clamp( 0.5 + 1h holder % of'), api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 4 )')],
+          (v) => {
+            const h = (IN(v) || {}).holders; const g = h && h.growth;
+            if (g && fin(g.perHour)) {
+              const rate = h.count ? (g.perHour / h.count) * 100 : 0;
+              return '0.5 + ' + rnd(rate, 4) + ' × 5 → ' + to100(0.5 + rate * 5);
+            }
+            const p = (((S(v) || {}).jupiter || {}).stats1h || {}).holderChangePct;
+            return fin(p) ? 'Jupiter: 0.5 + ' + rnd(p, 2) + ' ÷ 4 → ' + to100(0.5 + p / 4) : null;
+          }),
+        component('walletQuality',
+          [op('[ ( holder spread'), op('×'), num(35), op(') + ( crowd independence'), op('×'), num(30),
+            op(') + ( volume spread'), op('×'), num(20), op(') + ( position intent'), op('×'), num(15),
+            op(') ] ÷ [ the weights of the parts that have a value ], where holder spread = 1 −'),
+            api('/raw/<chain>/intel.json', 'TOP HOLDERS SHARE'), op('÷ 60 and the other three come from'), ref('pipe', 'WALLET SAMPLE'),
+            op('; then × 0.75 if insiders, × 0.8 if the creator launched 20+ tokens, × 1.15 if LP over 90% locked, from'),
+            api('/raw/<chain>/intel.json', 'LP / CREATOR / INSIDERS')],
+          (v) => {
+            const q = (S(v) || {}).walletQuality; if (!q) return null;
+            return weightedMath(q.parts, q.modifiers);
+          },
+          { where: 'calculations/core.js walletQualityScore() - the wallets module owns this number' }),
+      ],
+    },
+    {
+      group: 'ROTATION ENGINE', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Where this pool’s capital came from — wallets shared with other pools, from the trade sample the wallet service already holds.',
+      fields: [
+        component('capitalRotation',
+          [op('100 × clamp('), ref('pipe', 'SHARED WALLETS'), op('÷ 25 )')],
+          (v) => { const p = ((S(v) || {}).rotation || {}).sharedWalletPct; return fin(p) ? rnd(p, 1) + ' ÷ 25 → ' + to100(p / 25) : null; }),
+      ],
+    },
+    {
+      group: 'COVERAGE ENGINE', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'How much of the model was measurable at all. It is a component in its own right, so a score built on half the inputs cannot look like one built on all of them.',
+      fields: [
         component('dataQuality',
-          [op('components above that resolved ÷'), num(SCORE_MODEL.length - 1), op('× 100')],
+          [op('how many of the other'), num(SCORE_MODEL.length - 1),
+            op('components resolved:'),
+            ...SCORE_MODEL.filter((c) => c.key !== 'dataQuality').map((c) => ref('pipe', c.label)),
+            op('÷'), num(SCORE_MODEL.length - 1), op('× 100')],
           (v) => {
             const list = ((S(v) || {}).scoreModel || []).filter((c) => c.key !== 'dataQuality');
             const got = list.filter((c) => !c.pending).length;
             return got + ' of ' + list.length + ' resolved' +
               (got < list.length ? ' - missing: ' + list.filter((c) => c.pending).map((c) => c.label).join(', ') : '');
           }),
+      ],
+    },
+    {
+      group: 'WASH & ORGANIC', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Does the volume belong to different people. This does not ADD to the score - it multiplies the weighted mean, because wash-traded volume should scale the whole verdict down rather than cost it one term.',
+      fields: [
         {
           label: 'Organic flow', status: 'live', weight: 'modifier',
           value: (v) => valueOf(modOf(v, 'organicFlow')),
           calc: [op('[ ( crowd spread'), op('×'), num(30), op(') + ( volume spread'), op('×'), num(25),
             op(') + ( churn-free'), op('×'), num(25), op(') + ( entry independence'), op('×'), num(20),
             op(') ] ÷ [ the weights of the parts that have a value ], each part from'), ref('pipe', 'WALLET SAMPLE'),
-            op('; with no sample of our own, Jupiter’s organicScore from'), ref('pipe', 'JUPITER STATS')],
+            op('; with no sample of our own, Jupiter’s organicScore from'), api('/raw/<chain>/market.json', 'JUPITER STATS')],
           equation: (v) => {
             const o = (S(v) || {}).organicFlow; if (!o) return null;
             // The Jupiter cross-check first, so the calculation ends on our result.
@@ -607,10 +565,17 @@ PAGES.pipe = {
             'points (2 when the number is Jupiter’s).',
           where: 'calculations/core.js organicFlowScore()',
         },
+      ],
+    },
+    {
+      group: 'CONTRACT SAFETY', stage: 4,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'What the contract itself allows. Also a multiplier, and the input the SELLABLE and TAX gates read before anything is scored at all.',
+      fields: [
         {
           label: 'Contract safety', status: 'live', weight: 'modifier',
           value: (v) => valueOf(modOf(v, 'contractSafety')),
-          calc: [ref('pipe', 'CONTRACT CHECKS'), op('passed ÷ total × 100')],
+          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('passed ÷ total × 100')],
           equation: (v) => {
             const cs = (IN(v) || {}).contractSafety; if (!cs || !cs.available) return null;
             const n = (cs.checks || []).length;
@@ -622,6 +587,73 @@ PAGES.pipe = {
         },
       ],
     },
+    {
+      group: 'REACHABILITY & INTENT', stage: 4,
+      note: 'Is there a project behind the token, and is it spending on being found. Measured ' +
+        'today and shown here, but carrying no weight in the score yet - which is why its boxes ' +
+        'say so rather than quietly contributing nothing.',
+      fields: [
+        {
+          label: 'PROJECT REPUTATION', status: 'partial',
+          value: (v) => (v && v.ethosLabel) || null,
+          calc: [api('/raw/ethos.json', 'ETHOS (PROJECT X)'),
+            op('- a score of 0 means Ethos has no record, which is NOT a bad reputation and is left out')],
+          equation: (v) => {
+            const e = v && v.ethos;
+            if (!e || !e.linked) return 'this token advertises no X account';
+            if (e.score === 0) return 'no Ethos record for @' + e.handle + ' - no score, not a bad one';
+            return '@' + e.handle + ' = ' + e.score + ' (' + (e.level || '?') + '), ' +
+              (e.delta > 0 ? '+' : '') + e.delta + ' against the 1200 start';
+          },
+          note: 'Not in the score. It raises a flag when a project account sits below the Ethos ' +
+            'starting score, and nothing more, until it is shown to predict something.',
+          where: 'services/ethos-intel.js ethosFor()',
+        },
+        {
+          label: 'CONTACTABLE', status: 'partial',
+          value: (v) => {
+            const l = (S(v) || {}).links || {};
+            const n = ((l.socials || []).length) + ((l.websites || []).length);
+            return n ? n + ' links' : null;
+          },
+          fetch: [ext('dexscreener', 'links.socials, links.websites')],
+          via: api('/raw/<chain>/market.json'),
+          equation: (v) => {
+            const l = (S(v) || {}).links || {};
+            const kinds = (l.socials || []).map((x) => x.type).join(', ');
+            return (kinds || 'no socials') + ' - ' + ((l.websites || []).length) + ' website(s)';
+          },
+          note: 'A project with no way to reach it cannot be pitched, however well it trades.',
+          where: WHERE_NORM,
+        },
+      ],
+    },
+    {
+      group: 'DURABILITY', stage: 4,
+      note: 'Has it held together over time rather than in the last five minutes. Built from the ' +
+        'only history we own - our own samples - so it is thin for a pool we met recently, and ' +
+        'carries no weight in the score yet.',
+      fields: [
+        {
+          label: 'SURVIVAL', status: 'partial',
+          value: (v) => {
+            const h = (S(v) || {}).poolAgeHours;
+            return fin(h) ? (h / 24).toFixed(1) + ' days' : null;
+          },
+          calc: [api('/raw/<chain>/market.json', 'POOL AGE'), op('past the first-week rug window, with'),
+            api('/raw/<chain>/history.json', 'POOL SAMPLES'), op('still holding and'), ref('pipe', 'HOLDER GROWTH RATE'), op('positive')],
+          equation: (v) => {
+            const h = (S(v) || {}).poolAgeHours;
+            if (!fin(h)) return null;
+            const lane = h < 24 * 14 ? 'inside the 14-day new-launch window' : 'past the 14-day window';
+            return Math.round(h) + ' hours old - ' + lane;
+          },
+          note: 'The 14-day line is what the listing spec uses to split a new launch from an ' +
+            'established token. Nothing branches on it yet; the box is where that decision will live.',
+          where: WHERE_NORM,
+        },
+      ],
+    },,
 
     /* ----------------------------------------------------------- 5 SCORE -- */
     {
@@ -654,9 +686,9 @@ PAGES.pipe = {
         {
           label: 'RISK FLAGS', status: 'live',
           value: (v) => { const s = S(v); return s ? (s.riskFlags || []).length + ' raised' : null; },
-          calc: [op('rules on'), ref('pipe', 'POOL AGE'), ref('pipe', 'PRICE, 2 SOURCES'), ref('pipe', 'LIQUIDITY'),
-            ref('pipe', 'VOLUME / LIQUIDITY'), ref('pipe', 'TOP-5 WALLET SHARE'), ref('pipe', 'Contract safety'),
-            ref('pipe', 'Organic flow'), ref('pipe', 'ETHOS (PROJECT X)')],
+          calc: [op('rules on'), api('/raw/<chain>/market.json', 'POOL AGE'), api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES'), api('/raw/<chain>/market.json', 'LIQUIDITY'),
+            api('/raw/<chain>/market.json', 'VOLUME / LIQUIDITY'), ref('pipe', 'TOP-5 WALLET SHARE'), ref('pipe', 'Contract safety'),
+            ref('pipe', 'Organic flow'), api('/raw/ethos.json', 'ETHOS (PROJECT X)')],
           equation: (v) => {
             const s = S(v); if (!s) return null;
             const f = s.riskFlags || [];
@@ -713,7 +745,9 @@ PAGES.pipe = {
         {
           label: 'COVERAGE', status: 'live',
           value: (v) => { const s = S(v); return s && fin(s.weightCovered) ? s.weightCovered + ' / ' + TOTAL_WEIGHT : null; },
-          calc: [op('Σ weights that resolved ÷'), num(TOTAL_WEIGHT)],
+          calc: [op('Σ weight of the components that resolved ÷'), num(TOTAL_WEIGHT),
+            op('- the same resolved/pending set'), ref('pipe', 'Data quality'),
+            op('counts, weighted instead of counted')],
           equation: (v) => { const s = S(v); return s ? s.componentsPresent + ' of ' + (s.scoreModel || []).length + ' components = ' + s.dataQuality : null; },
           note: 'The board’s CONF column.',
           where: 'scoreAsset(), dataQuality',
@@ -740,7 +774,44 @@ PAGES.pipe = {
 const DS = 'sources.dexscreener.';
 const GT = 'sources.geckoterminal.';
 const JUP = 'sources.jupiter.';
-const RAW = {
+
+/**
+ * THE RELAYS THAT WERE REMOVED, AND WHO ACTUALLY READS THEM.
+ *
+ * There used to be a column of "token input" boxes: one per reading, whose
+ * only job was to take a value out of a file and hand it on unchanged. Each
+ * of them said exactly what an arrow from the file to the box that uses the
+ * number says, so they were relays rather than steps, and every box on the
+ * map should be a thing it can be read AS - an API we fetch from, a file on
+ * disk, a calculation, or a panel that shows a result.
+ *
+ * Their port declarations did not go with them: RAW still holds which keys of
+ * which file are read, and this says which box reads each one. Together they
+ * are what puts a port on the right line of a raw-store card and points it at
+ * the right place.
+ */
+export const RELAY_CONSUMERS = {
+  'LIQUIDITY': ['Liquidity / executability', 'RISK FLAGS'],
+  'BUYERS 24H': ['Buyer breadth'],
+  'BUY/SELL 24H': ['Net demand'],
+  'PRICE, 2 SOURCES': ['Price confirmation', 'Cross-venue confirm', 'RISK FLAGS'],
+  'VENUES': ['Cross-venue confirm'],
+  'QUOTE TOKEN PRICE': ['QUOTE DEVIATION'],
+  'POOL AGE': ['SURVIVAL', 'RISK FLAGS'],
+  'VOLUME / LIQUIDITY': ['RISK FLAGS'],
+  'JUPITER STATS': ['Net demand', 'Holder growth', 'Organic flow'],
+  'POOL SAMPLES': ['SURVIVAL'],
+  'TRADE SAMPLE': ['NET FLOW RATIO', 'TOP-5 WALLET SHARE', 'SHARED WALLETS', 'WALLET SAMPLE'],
+  '$10K ROUTE QUOTE': ['PRICE IMPACT $10K'],
+  'HOLDERS': ['HOLDER GROWTH RATE', 'Holder growth'],
+  'TOP HOLDERS SHARE': ['Wallet quality'],
+  'CONTRACT CHECKS': ['SELLABLE', 'TAX IN RANGE', 'Contract safety'],
+  'LP / CREATOR / INSIDERS': ['Wallet quality'],
+  'USD REFERENCE': ['QUOTE DEVIATION'],
+  'ETHOS (PROJECT X)': ['PROJECT REPUTATION', 'RISK FLAGS'],
+};
+
+export const RAW = {
   'TOKEN LIST': {
     from: 'marketFile',
     picks: [{ path: 'rows', to: 'ROWS ON THIS CHAIN' }, { path: 'feed', to: 'ROWS ON THIS CHAIN' }],
