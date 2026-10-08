@@ -6,10 +6,10 @@
  * evaluateAsset):
  *
  *   1 TOKEN LIST    market.json, top 20 rows per chain -> normalizeRow -> screenRows
- *   2 TOKEN INPUTS  the raw readings for the picked token, as the files hold them
- *   3 MEASURES      what is derived from them: baselines, net ratio, impact, growth
- *   4 COMPONENTS    the twelve 0-100 inputs and two modifiers (computeComponents)
- *   5 SCORE         raw, flags, penalty, right now, final, stage (scoreAsset)
+ *   2 READINGS      what is derived from the raw files: baselines, net ratio, impact, growth
+ *   3 ENGINES       the 0-100 components and two modifiers (computeComponents)
+ *   4 GATES         hard pass/fail on the row and the engines' output (gates.js)
+ *   5 COMBINE       raw, flags, penalty, right now, final, stage (scoreAsset)
  *
  * Every value is READ, never recomputed: `v.pipe.s` is the token's scored row
  * exactly as the board holds it (asset.rawServerRow), `v.pipe.intel` the same
@@ -292,19 +292,372 @@ PAGES.pipe = {
       ],
     },
 
-    /* --------------------------------------------------------- 3 GATES -- */
+    /* ------------------------------------------------------- 3 ENGINES -- */
+    /*
+     * The components, one box each, under the column header "3 · ENGINES". This group IS the DETAIL tab's decomposition panel (its
+     * bars draw these values), so there is no second copy of it in step 6.
+     * Folding them into one panel box was tried and reverted on request: one
+     * box per component keeps each one's inputs and output on the map itself.
+     */
+        {
+      group: 'DEMAND ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Is anyone actually trading it right now, and is the buying wide enough to be more than one wallet. Four readings against this pool’s own baseline.',
+      fields: [
+        component('volumeAnomaly',
+          [op('multipleScore('), ref('pipe', 'VOLUME 5M vs BASELINE'), op(') = 100 × clamp( 0.5 + 0.3 × log10 multiple )')],
+          (v) => multipleMath((Z(v).volume5mUsd || {}).multiple)),
+        component('tradeActivity',
+          [op('multipleScore('), ref('pipe', 'BUYS 5M vs BASELINE'), op(')')],
+          (v) => multipleMath((Z(v).buys5m || {}).multiple)),
+        component('buyerBreadth',
+          [op('½ × multipleScore('), ref('pipe', 'BUYERS 5M vs BASELINE'), op(') + ½ × logScore('),
+            api('/raw/<chain>/market.json', 'BUYERS 24H'), op(', 10, 3000 )')],
+          (v) => {
+            const m = (Z(v).buyers5m || {}).multiple;
+            const a = fin(m) ? multipleScore(m) : null;
+            const b = logScore(((S(v) || {}).traders24h || {}).buyers, 10, 3000);
+            if (a !== null && b !== null) return '½ × ' + a + ' + ½ × ' + b + ' → ' + Math.round(a * 0.5 + b * 0.5);
+            return a !== null ? 'anomaly only: ' + a : (b !== null ? 'absolute only: ' + b : null);
+          }),
+        component('netDemand',
+          [op('100 × clamp( 0.5 +'), ref('pipe', 'NET FLOW RATIO'), op('÷ 2 ) ; with no trade sample: 100 × clamp( 0.5 + net ratio of'),
+            api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 2 ) ; with neither: 100 × clamp( ('), api('/raw/<chain>/market.json', 'BUY/SELL 24H'), op('− 0.5 ) ÷ 1.5 )')],
+          (v) => {
+            const t = TS(v);
+            if (t && t.netRatio !== null) return 'our sample: 0.5 + ' + t.netRatio + ' ÷ 2 → ' + to100(0.5 + t.netRatio / 2);
+            const j = (S(v) || {}).jupiter;
+            const w = j && (j.stats1h || j.stats5m || j.stats24h);
+            if (w && w.netRatio !== null && w.netRatio !== undefined) return 'Jupiter: 0.5 + ' + rnd(w.netRatio, 3) + ' ÷ 2 → ' + to100(0.5 + w.netRatio / 2);
+            const r = (S(v) || {}).buySellRatio24h;
+            return fin(r) ? 'counts only: ( ' + rnd(r, 2) + ' − 0.5 ) ÷ 1.5 → ' + to100((r - 0.5) / 1.5) : null;
+          }),
+      ],
+    },
+    {
+      group: 'EXECUTION ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Could a position be taken at all — pool depth blended with what $10k actually costs to route.',
+      fields: [
+        component('liquidity',
+          [op('½ × logScore('), api('/raw/<chain>/market.json', 'LIQUIDITY'), op(', $10K, $1M ) + ½ × 100 × clamp( 1 −'),
+            ref('pipe', 'PRICE IMPACT $10K'), op('÷ 2.5 )')],
+          (v) => {
+            const d = logScore((S(v) || {}).liquidityUsd, 10000, 1000000);
+            const ip = ((IN(v) || {}).impact || {}).priceImpactPct;
+            const i = fin(ip) ? to100(1 - ip / 2.5) : null;
+            if (d !== null && i !== null) return '½ × ' + d + ' (depth) + ½ × ' + i + ' (impact) → ' + Math.round(d * 0.5 + i * 0.5);
+            return d !== null ? 'depth only: ' + d : (i !== null ? 'impact only: ' + i : null);
+          }),
+      ],
+    },
+    {
+      group: 'CONFIRMATION ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Do independent sources agree on the price. Disagreement is the first sign of a bad read, so this engine is a check on the others rather than a signal of its own.',
+      fields: [
+        component('priceConfirmation',
+          [op('100 × clamp( 1 − |'), api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES'), op('| ÷ 5 ) ; if only one source priced it: 40')],
+          (v) => {
+            const x = (S(v) || {}).crossSource; if (!x) return null;
+            if (fin(x.priceDeltaPct)) return '1 − ' + rnd(Math.abs(x.priceDeltaPct), 3) + ' ÷ 5 → ' + to100(1 - Math.abs(x.priceDeltaPct) / 5);
+            return x.sourcesAgreeing < 2 ? 'one source → 40' : null;
+          }),
+        component('crossVenue',
+          [op('logScore('), api('/raw/<chain>/market.json', 'VENUES'), op(', 1, 20 ) × ( 1 if both price sources answered, else 0.6 ) - from'),
+            api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES')],
+          (v) => {
+            const s = S(v); const n = ((s && s.sources) || {}).dexscreener ? s.sources.dexscreener.pairs : null;
+            if (!fin(n)) return null;
+            const agree = s.crossSource ? s.crossSource.sourcesAgreeing : 1;
+            const l = logScore(n, 1, 20);
+            return 'logScore(' + n + ') = ' + l + ' × ' + (agree > 1 ? 1 : 0.6) + ' → ' + to100((l / 100) * (agree > 1 ? 1 : 0.6));
+          }),
+        component('usdReference',
+          [op('100 × clamp( 1 −'), ref('pipe', 'QUOTE DEVIATION'), op('÷ 2 )')],
+          (v) => {
+            const s = S(v); const r = s && s.usdReference;
+            if (!r || !r.median || !fin(s.quoteTokenPriceUsd)) return null;
+            const dev = Math.abs(s.quoteTokenPriceUsd - r.median) / r.median * 100;
+            return '1 − ' + rnd(dev, 3) + ' ÷ 2 → ' + to100(1 - dev / 2);
+          }),
+      ],
+    },
+    {
+      group: 'HOLDERS ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Who holds it and whether that base is growing. Concentration caps the score however well the token trades.',
+      fields: [
+        component('holderGrowth',
+          [op('100 × clamp( 0.5 + 5 ×'), ref('pipe', 'HOLDER GROWTH RATE'), op('÷'), api('/raw/<chain>/intel.json', 'HOLDERS'),
+            op('× 100 ) ; with no holder series: 100 × clamp( 0.5 + 1h holder % of'), api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 4 )')],
+          (v) => {
+            const h = (IN(v) || {}).holders; const g = h && h.growth;
+            if (g && fin(g.perHour)) {
+              const rate = h.count ? (g.perHour / h.count) * 100 : 0;
+              return '0.5 + ' + rnd(rate, 4) + ' × 5 → ' + to100(0.5 + rate * 5);
+            }
+            const p = (((S(v) || {}).jupiter || {}).stats1h || {}).holderChangePct;
+            return fin(p) ? 'Jupiter: 0.5 + ' + rnd(p, 2) + ' ÷ 4 → ' + to100(0.5 + p / 4) : null;
+          }),
+        component('walletQuality',
+          [op('[ ( holder spread'), op('×'), num(35), op(') + ( crowd independence'), op('×'), num(30),
+            op(') + ( volume spread'), op('×'), num(20), op(') + ( position intent'), op('×'), num(15),
+            op(') ] ÷ [ the weights of the parts that have a value ], where holder spread = 1 −'),
+            api('/raw/<chain>/intel.json', 'TOP HOLDERS SHARE'), op('÷ 60 and the other three come from'), ref('pipe', 'WALLET SAMPLE'),
+            op('; then × 0.75 if insiders, × 0.8 if the creator launched 20+ tokens, × 1.15 if LP over 90% locked, from'),
+            api('/raw/<chain>/intel.json', 'LP / CREATOR / INSIDERS')],
+          (v) => {
+            const q = (S(v) || {}).walletQuality; if (!q) return null;
+            return weightedMath(q.parts, q.modifiers);
+          },
+          { where: 'calculations/core.js walletQualityScore() - the wallets module owns this number' }),
+      ],
+    },
+    {
+      group: 'ROTATION ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Where this pool’s capital came from — wallets shared with other pools, from the trade sample the wallet service already holds.',
+      fields: [
+        component('capitalRotation',
+          [op('100 × clamp('), ref('pipe', 'SHARED WALLETS'), op('÷ 25 )')],
+          (v) => { const p = ((S(v) || {}).rotation || {}).sharedWalletPct; return fin(p) ? rnd(p, 1) + ' ÷ 25 → ' + to100(p / 25) : null; }),
+      ],
+    },
+    {
+      group: 'COVERAGE ENGINE', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'How much of the model was measurable at all. It is a component in its own right, so a score built on half the inputs cannot look like one built on all of them.',
+      fields: [
+        component('dataQuality',
+          [op('how many of the other'), num(SCORE_MODEL.length - 1),
+            op('components resolved:'),
+            ...SCORE_MODEL.filter((c) => c.key !== 'dataQuality').map((c) => ref('pipe', c.label)),
+            op('÷'), num(SCORE_MODEL.length - 1), op('× 100')],
+          (v) => {
+            const list = ((S(v) || {}).scoreModel || []).filter((c) => c.key !== 'dataQuality');
+            const got = list.filter((c) => !c.pending).length;
+            return got + ' of ' + list.length + ' resolved' +
+              (got < list.length ? ' - missing: ' + list.filter((c) => c.pending).map((c) => c.label).join(', ') : '');
+          }),
+      ],
+    },
+    {
+      group: 'WASH & ORGANIC', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'Does the volume belong to different people. This does not ADD to the score - it multiplies the weighted mean, because wash-traded volume should scale the whole verdict down rather than cost it one term.',
+      fields: [
+        {
+          label: 'Organic flow', status: 'live', weight: 'modifier',
+          value: (v) => valueOf(modOf(v, 'organicFlow')),
+          calc: [op('[ ( crowd spread'), op('×'), num(30), op(') + ( volume spread'), op('×'), num(25),
+            op(') + ( churn-free'), op('×'), num(25), op(') + ( entry independence'), op('×'), num(20),
+            op(') ] ÷ [ the weights of the parts that have a value ], each part from'), ref('pipe', 'WALLET SAMPLE'),
+            op('; with no sample of our own, Jupiter’s organicScore from'), api('/raw/<chain>/market.json', 'JUPITER STATS')],
+          equation: (v) => {
+            const o = (S(v) || {}).organicFlow; if (!o) return null;
+            // The Jupiter cross-check first, so the calculation ends on our result.
+            const cross = o.crossCheck ? '(Jupiter says ' + o.crossCheck.value + ') ' : '';
+            if (o.basis === 'jupiter') return 'no sample of our own → Jupiter organicScore = ' + o.score + '   ' + said(modOf(v, 'organicFlow'));
+            const body = weightedMath(o.parts, null);
+            return body ? cross + body + '   ' + said(modOf(v, 'organicFlow')) : null;
+          },
+          evidence: (v) => (modOf(v, 'organicFlow') || {}).evidence || '',
+          note: 'Not in the weighted average. Below 40 it raises LOW_ORGANIC_FLOW, which costs 3 ' +
+            'points (2 when the number is Jupiter’s).',
+          where: 'calculations/core.js organicFlowScore()',
+        },
+      ],
+    },
+    {
+      group: 'CONTRACT SAFETY', stage: 3,
+      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
+      note: 'What the contract itself allows. Also a multiplier, and the input the SELLABLE and TAX gates read before anything is scored at all.',
+      fields: [
+        {
+          label: 'Contract safety', status: 'live', weight: 'modifier',
+          value: (v) => valueOf(modOf(v, 'contractSafety')),
+          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('passed ÷ total × 100')],
+          equation: (v) => {
+            const cs = (IN(v) || {}).contractSafety; if (!cs || !cs.available) return null;
+            const n = (cs.checks || []).length;
+            return (n - cs.failedCount) + ' ÷ ' + n + ' → ' + Math.round(((n - cs.failedCount) / (n || 1)) * 100) +
+              '   ' + said(modOf(v, 'contractSafety'));
+          },
+          note: 'Not in the weighted average. Under 100 it raises CONTRACT_CHECKS: 3 points, or 6 under 70.',
+          where: 'asset-detail.js computeModifiers()',
+        },
+      ],
+    },
+    {
+      group: 'WHITESPACE', stage: 3,
+      note: 'Is the perp still up for grabs. A token another venue already lists has a perp, so ' +
+        'there is nothing for Vibe to offer it.',
+      fields: [
+        {
+          label: 'NO PERP ELSEWHERE', status: 'live',
+          value: (v) => {
+            const p = (P(v).raw || {}).perps;
+            if (!p || !S(v)) return null;
+            if (p.listedOn.length) return 'taken · ' + p.listedOn.length + ' venue' + (p.listedOn.length > 1 ? 's' : '');
+            return p.checked ? 'open · ' + p.checked + '/' + p.total + ' checked' : 'unknown';
+          },
+          fetch: [ext('hyperliquid', 'perp markets'), ext('binance', 'USD-M perps'), ext('aster', 'perps'),
+            ext('okx', 'swaps'), ext('bybit', 'linear perps')],
+          calc: [api('/raw/perps.json', 'PERP VENUES'), op('symbols[ ticker ] - empty = whitespace, any venue = taken')],
+          equation: (v) => {
+            const p = (P(v).raw || {}).perps;
+            if (!S(v)) return null;
+            if (!p) return 'perps.json not written yet';
+            const down = Object.keys(p.venues).filter((k) => !p.venues[k].ok).map((k) => p.venues[k].label);
+            const ask = p.symbol + ' on ' + p.checked + ' of ' + p.total + ' venues';
+            if (p.listedOn.length) {
+              return ask + ' → listed on ' + p.listedOn.map((k) => (p.venues[k] || {}).label || k).join(', ') + ' → whitespace 0';
+            }
+            if (!p.checked) return 'no venue answered (' + down.join(', ') + ') - unknown, not open';
+            return ask + ' → none list it → open' + (down.length ? '   (unreachable: ' + down.join(', ') + ')' : '');
+          },
+          note: 'Matched by TICKER - venues list symbols, not contracts - so a memecoin sharing a ticker ' +
+            'with a listed coin shows as taken. A strong hint, not proof. An unreachable venue counts as ' +
+            'unknown, never as "no perp there".',
+          where: 'admin/AdminPanel.jsx loadRawBundle() perps; server lib/perps.js',
+        },
+        component('whitespace',
+          [ref('pipe', 'NO PERP ELSEWHERE'), op('- no venue lists it →'), num(100), op(', any venue lists it →'), num(0),
+            op(', no venue answered → left out')],
+          (v) => {
+            const p = ((S(v) || {}).facts || {}).perp;
+            if (!p) return 'perps.json not read yet → left out of the average';
+            if (p.listedOn.length) return p.listedOn.map((k) => p.labels[k] || k).join(', ') + ' list ' + p.symbol + ' → 0';
+            if (!p.checked) return 'no venue answered → left out of the average';
+            return 'none of the ' + p.checked + ' venues that answered list ' + p.symbol + ' → 100';
+          }),
+      ],
+    },
+    {
+      group: 'REACHABILITY & INTENT', stage: 3,
+      note: 'Is there a project behind the token, and is it spending on being found. Ethos ' +
+        'reputation is shown but not scored (0 means no record, not a bad one).',
+      fields: [
+        {
+          label: 'PROJECT REPUTATION', status: 'partial',
+          value: (v) => (v && v.ethosLabel) || null,
+          calc: [api('/raw/ethos.json', 'ETHOS (PROJECT X)'),
+            op('- a score of 0 means Ethos has no record, which is NOT a bad reputation and is left out')],
+          equation: (v) => {
+            const e = v && v.ethos;
+            if (!e || !e.linked) return 'this token advertises no X account';
+            if (e.score === 0) return 'no Ethos record for @' + e.handle + ' - no score, not a bad one';
+            return '@' + e.handle + ' = ' + e.score + ' (' + (e.level || '?') + '), ' +
+              (e.delta > 0 ? '+' : '') + e.delta + ' against the 1200 start';
+          },
+          note: 'Not in the score. It raises a flag when a project account sits below the Ethos ' +
+            'starting score, and nothing more, until it is shown to predict something.',
+          where: 'services/ethos-intel.js ethosFor()',
+        },
+        {
+          label: 'CONTACTABLE', status: 'live',
+          value: (v) => {
+            const l = (S(v) || {}).links || {};
+            const n = ((l.socials || []).length) + ((l.websites || []).length);
+            return n ? n + ' links' : null;
+          },
+          fetch: [ext('dexscreener', 'links.socials, links.websites')],
+          via: api('/raw/<chain>/market.json'),
+          equation: (v) => {
+            const l = (S(v) || {}).links || {};
+            const kinds = (l.socials || []).map((x) => x.type).join(', ');
+            return (kinds || 'no socials') + ' - ' + ((l.websites || []).length) + ' website(s)';
+          },
+          note: 'A project with no way to reach it cannot be pitched, however well it trades.',
+          where: WHERE_NORM,
+        },
+        {
+          label: 'BOOSTED', status: 'live',
+          value: (v) => {
+            const pr = (P(v).raw || {}).promotion;
+            if (!pr || !S(v)) return null;
+            const boost = pr.rows.some((r) => r.kind === 'BOOST');
+            const profile = pr.rows.some((r) => r.kind === 'PROFILE');
+            if (!boost && !profile) return 'not paying';
+            return [boost ? 'boost' : null, profile ? 'profile' : null].filter(Boolean).join(' + ');
+          },
+          fetch: [ext('dexscreener', 'token-boosts/top, token-profiles/latest')],
+          calc: [api('/raw/<chain>/promotion.json', 'PROMOTION'), op('rows[ this token ] - a BOOST or PROFILE row = paying for attention')],
+          equation: (v) => {
+            const pr = (P(v).raw || {}).promotion;
+            if (!S(v)) return null;
+            if (!pr) return 'promotion.json not written yet';
+            if (!pr.rows.length) return 'not among the ' + pr.feedRows + ' boosted / profiled tokens on this chain';
+            return pr.rows.map((r) => r.kind + (fin(r.totalAmount) ? ' ×' + r.totalAmount : '')).join(' + ');
+          },
+          note: 'DexScreener boosts and profiles are paid. A team that bought one is spending on growth ' +
+            'right now - the warmest moment to pitch, and the first daily trigger in the listing spec. The ' +
+            'feed is DexScreener\'s top list, so "not paying" can also mean "paid less than the top".',
+          where: 'admin/AdminPanel.jsx loadRawBundle() promotion; server lib/providers.js fetchPromotion()',
+        },
+        component('reachability',
+          [ref('pipe', 'CONTACTABLE'), op('website'), num(30), op('+ X'), num(30), op('+ Telegram'), num(20),
+            op('+'), ref('pipe', 'BOOSTED'), num(20)],
+          (v) => {
+            const r = ((S(v) || {}).facts || {}).reach;
+            if (!r) return null;
+            const parts = [['website', 30], ['x', 30], ['telegram', 20], ['boosted', 20]]
+              .map(([k, w]) => '(' + k + ' ' + (r[k] ? w : 0) + ')');
+            return parts.join(' + ') + ' = ' + [['website', 30], ['x', 30], ['telegram', 20], ['boosted', 20]]
+              .reduce((a, [k, w]) => a + (r[k] ? w : 0), 0);
+          }),
+      ],
+    },
+    {
+      group: 'DURABILITY', stage: 3,
+      note: 'Has it held together over time rather than in the last five minutes. Pool age only ' +
+        'for now - the spec also asks for the 30-day liquidity trend and drawdown, which our ' +
+        'samples are too short to give.',
+      fields: [
+        {
+          label: 'SURVIVAL', status: 'live',
+          value: (v) => {
+            const h = (S(v) || {}).poolAgeHours;
+            return fin(h) ? (h / 24).toFixed(1) + ' days' : null;
+          },
+          calc: [api('/raw/<chain>/market.json', 'POOL AGE'), op('past the first-week rug window, with'),
+            api('/raw/<chain>/history.json', 'POOL SAMPLES'), op('still holding and'), ref('pipe', 'HOLDER GROWTH RATE'), op('positive')],
+          equation: (v) => {
+            const h = (S(v) || {}).poolAgeHours;
+            if (!fin(h)) return null;
+            const lane = h < 24 * 14 ? 'inside the 14-day new-launch window' : 'past the 14-day window';
+            return Math.round(h) + ' hours old - ' + lane;
+          },
+          note: 'The 14-day line is what the listing spec uses to split a new launch from an ' +
+            'established token: under it the AGE FLOOR gate vetoes the token.',
+          where: WHERE_NORM,
+        },
+        component('durability',
+          [ref('pipe', 'SURVIVAL'), op('on a log curve: 14 days →'), num(0), op(', 180 days →'), num(100)],
+          (v) => {
+            const h = (S(v) || {}).poolAgeHours;
+            if (!fin(h)) return null;
+            const d = Math.max(h / 24, 1);
+            return '( log10(' + rnd(d, 1) + ') − log10(14) ) ÷ ( log10(180) − log10(14) ) × 100 → ' + logScore(d, 14, 180);
+          }),
+      ],
+    },
+
+    /* --------------------------------------------------------- 4 GATES -- */
     //
-    // Hard pass/fail, run BEFORE any engine. A failed gate ends the token's
-    // run: nothing downstream is scored, and the reason is what the veto log
-    // lists. Gates answer 'should this be scored at all'; engines answer 'how
-    // well does it score'. Keeping them apart is what stops a honeypot from
-    // being rescued by good volume.
+    // Hard pass/fail, judged AFTER the engines - the wash gate reads Organic
+    // flow, which an engine produces - and BEFORE the score is combined. A
+    // failed gate sends RIGHT NOW and FINAL to 0, and the reason is what the
+    // veto log lists. Gates answer 'should this count at all'; engines answer
+    // 'how well does it score'. Keeping them apart is what stops a honeypot
+    // from being rescued by good volume.
     //
     // A gate may only fail on EVIDENCE. Missing data is 'not checked', never a
     // failure - otherwise every token the intel collector has not reached yet
     // would be vetoed for being new rather than for being bad.
     {
-      group: 'GATES', stage: 3, flat: true,
+      group: 'GATES', stage: 4, flat: true,
       fields: [
         {
           label: 'SELLABLE', status: 'live',
@@ -417,331 +770,6 @@ PAGES.pipe = {
         },
       ],
     },
-    /* ------------------------------------------------------- 4 ENGINES -- */
-    /*
-     * The components, one box each, under the column header "4 · SCORE
-     * DECOMPOSITION". This group IS the DETAIL tab's decomposition panel (its
-     * bars draw these values), so there is no second copy of it in step 6.
-     * Folding them into one panel box was tried and reverted on request: one
-     * box per component keeps each one's inputs and output on the map itself.
-     */
-        {
-      group: 'DEMAND ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Is anyone actually trading it right now, and is the buying wide enough to be more than one wallet. Four readings against this pool’s own baseline.',
-      fields: [
-        component('volumeAnomaly',
-          [op('multipleScore('), ref('pipe', 'VOLUME 5M vs BASELINE'), op(') = 100 × clamp( 0.5 + 0.3 × log10 multiple )')],
-          (v) => multipleMath((Z(v).volume5mUsd || {}).multiple)),
-        component('tradeActivity',
-          [op('multipleScore('), ref('pipe', 'BUYS 5M vs BASELINE'), op(')')],
-          (v) => multipleMath((Z(v).buys5m || {}).multiple)),
-        component('buyerBreadth',
-          [op('½ × multipleScore('), ref('pipe', 'BUYERS 5M vs BASELINE'), op(') + ½ × logScore('),
-            api('/raw/<chain>/market.json', 'BUYERS 24H'), op(', 10, 3000 )')],
-          (v) => {
-            const m = (Z(v).buyers5m || {}).multiple;
-            const a = fin(m) ? multipleScore(m) : null;
-            const b = logScore(((S(v) || {}).traders24h || {}).buyers, 10, 3000);
-            if (a !== null && b !== null) return '½ × ' + a + ' + ½ × ' + b + ' → ' + Math.round(a * 0.5 + b * 0.5);
-            return a !== null ? 'anomaly only: ' + a : (b !== null ? 'absolute only: ' + b : null);
-          }),
-        component('netDemand',
-          [op('100 × clamp( 0.5 +'), ref('pipe', 'NET FLOW RATIO'), op('÷ 2 ) ; with no trade sample: 100 × clamp( 0.5 + net ratio of'),
-            api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 2 ) ; with neither: 100 × clamp( ('), api('/raw/<chain>/market.json', 'BUY/SELL 24H'), op('− 0.5 ) ÷ 1.5 )')],
-          (v) => {
-            const t = TS(v);
-            if (t && t.netRatio !== null) return 'our sample: 0.5 + ' + t.netRatio + ' ÷ 2 → ' + to100(0.5 + t.netRatio / 2);
-            const j = (S(v) || {}).jupiter;
-            const w = j && (j.stats1h || j.stats5m || j.stats24h);
-            if (w && w.netRatio !== null && w.netRatio !== undefined) return 'Jupiter: 0.5 + ' + rnd(w.netRatio, 3) + ' ÷ 2 → ' + to100(0.5 + w.netRatio / 2);
-            const r = (S(v) || {}).buySellRatio24h;
-            return fin(r) ? 'counts only: ( ' + rnd(r, 2) + ' − 0.5 ) ÷ 1.5 → ' + to100((r - 0.5) / 1.5) : null;
-          }),
-      ],
-    },
-    {
-      group: 'EXECUTION ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Could a position be taken at all — pool depth blended with what $10k actually costs to route.',
-      fields: [
-        component('liquidity',
-          [op('½ × logScore('), api('/raw/<chain>/market.json', 'LIQUIDITY'), op(', $10K, $1M ) + ½ × 100 × clamp( 1 −'),
-            ref('pipe', 'PRICE IMPACT $10K'), op('÷ 2.5 )')],
-          (v) => {
-            const d = logScore((S(v) || {}).liquidityUsd, 10000, 1000000);
-            const ip = ((IN(v) || {}).impact || {}).priceImpactPct;
-            const i = fin(ip) ? to100(1 - ip / 2.5) : null;
-            if (d !== null && i !== null) return '½ × ' + d + ' (depth) + ½ × ' + i + ' (impact) → ' + Math.round(d * 0.5 + i * 0.5);
-            return d !== null ? 'depth only: ' + d : (i !== null ? 'impact only: ' + i : null);
-          }),
-      ],
-    },
-    {
-      group: 'CONFIRMATION ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Do independent sources agree on the price. Disagreement is the first sign of a bad read, so this engine is a check on the others rather than a signal of its own.',
-      fields: [
-        component('priceConfirmation',
-          [op('100 × clamp( 1 − |'), api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES'), op('| ÷ 5 ) ; if only one source priced it: 40')],
-          (v) => {
-            const x = (S(v) || {}).crossSource; if (!x) return null;
-            if (fin(x.priceDeltaPct)) return '1 − ' + rnd(Math.abs(x.priceDeltaPct), 3) + ' ÷ 5 → ' + to100(1 - Math.abs(x.priceDeltaPct) / 5);
-            return x.sourcesAgreeing < 2 ? 'one source → 40' : null;
-          }),
-        component('crossVenue',
-          [op('logScore('), api('/raw/<chain>/market.json', 'VENUES'), op(', 1, 20 ) × ( 1 if both price sources answered, else 0.6 ) - from'),
-            api('/raw/<chain>/market.json', 'PRICE, 2 SOURCES')],
-          (v) => {
-            const s = S(v); const n = ((s && s.sources) || {}).dexscreener ? s.sources.dexscreener.pairs : null;
-            if (!fin(n)) return null;
-            const agree = s.crossSource ? s.crossSource.sourcesAgreeing : 1;
-            const l = logScore(n, 1, 20);
-            return 'logScore(' + n + ') = ' + l + ' × ' + (agree > 1 ? 1 : 0.6) + ' → ' + to100((l / 100) * (agree > 1 ? 1 : 0.6));
-          }),
-        component('usdReference',
-          [op('100 × clamp( 1 −'), ref('pipe', 'QUOTE DEVIATION'), op('÷ 2 )')],
-          (v) => {
-            const s = S(v); const r = s && s.usdReference;
-            if (!r || !r.median || !fin(s.quoteTokenPriceUsd)) return null;
-            const dev = Math.abs(s.quoteTokenPriceUsd - r.median) / r.median * 100;
-            return '1 − ' + rnd(dev, 3) + ' ÷ 2 → ' + to100(1 - dev / 2);
-          }),
-      ],
-    },
-    {
-      group: 'HOLDERS ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Who holds it and whether that base is growing. Concentration caps the score however well the token trades.',
-      fields: [
-        component('holderGrowth',
-          [op('100 × clamp( 0.5 + 5 ×'), ref('pipe', 'HOLDER GROWTH RATE'), op('÷'), api('/raw/<chain>/intel.json', 'HOLDERS'),
-            op('× 100 ) ; with no holder series: 100 × clamp( 0.5 + 1h holder % of'), api('/raw/<chain>/market.json', 'JUPITER STATS'), op('÷ 4 )')],
-          (v) => {
-            const h = (IN(v) || {}).holders; const g = h && h.growth;
-            if (g && fin(g.perHour)) {
-              const rate = h.count ? (g.perHour / h.count) * 100 : 0;
-              return '0.5 + ' + rnd(rate, 4) + ' × 5 → ' + to100(0.5 + rate * 5);
-            }
-            const p = (((S(v) || {}).jupiter || {}).stats1h || {}).holderChangePct;
-            return fin(p) ? 'Jupiter: 0.5 + ' + rnd(p, 2) + ' ÷ 4 → ' + to100(0.5 + p / 4) : null;
-          }),
-        component('walletQuality',
-          [op('[ ( holder spread'), op('×'), num(35), op(') + ( crowd independence'), op('×'), num(30),
-            op(') + ( volume spread'), op('×'), num(20), op(') + ( position intent'), op('×'), num(15),
-            op(') ] ÷ [ the weights of the parts that have a value ], where holder spread = 1 −'),
-            api('/raw/<chain>/intel.json', 'TOP HOLDERS SHARE'), op('÷ 60 and the other three come from'), ref('pipe', 'WALLET SAMPLE'),
-            op('; then × 0.75 if insiders, × 0.8 if the creator launched 20+ tokens, × 1.15 if LP over 90% locked, from'),
-            api('/raw/<chain>/intel.json', 'LP / CREATOR / INSIDERS')],
-          (v) => {
-            const q = (S(v) || {}).walletQuality; if (!q) return null;
-            return weightedMath(q.parts, q.modifiers);
-          },
-          { where: 'calculations/core.js walletQualityScore() - the wallets module owns this number' }),
-      ],
-    },
-    {
-      group: 'ROTATION ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Where this pool’s capital came from — wallets shared with other pools, from the trade sample the wallet service already holds.',
-      fields: [
-        component('capitalRotation',
-          [op('100 × clamp('), ref('pipe', 'SHARED WALLETS'), op('÷ 25 )')],
-          (v) => { const p = ((S(v) || {}).rotation || {}).sharedWalletPct; return fin(p) ? rnd(p, 1) + ' ÷ 25 → ' + to100(p / 25) : null; }),
-      ],
-    },
-    {
-      group: 'COVERAGE ENGINE', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'How much of the model was measurable at all. It is a component in its own right, so a score built on half the inputs cannot look like one built on all of them.',
-      fields: [
-        component('dataQuality',
-          [op('how many of the other'), num(SCORE_MODEL.length - 1),
-            op('components resolved:'),
-            ...SCORE_MODEL.filter((c) => c.key !== 'dataQuality').map((c) => ref('pipe', c.label)),
-            op('÷'), num(SCORE_MODEL.length - 1), op('× 100')],
-          (v) => {
-            const list = ((S(v) || {}).scoreModel || []).filter((c) => c.key !== 'dataQuality');
-            const got = list.filter((c) => !c.pending).length;
-            return got + ' of ' + list.length + ' resolved' +
-              (got < list.length ? ' - missing: ' + list.filter((c) => c.pending).map((c) => c.label).join(', ') : '');
-          }),
-      ],
-    },
-    {
-      group: 'WASH & ORGANIC', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'Does the volume belong to different people. This does not ADD to the score - it multiplies the weighted mean, because wash-traded volume should scale the whole verdict down rather than cost it one term.',
-      fields: [
-        {
-          label: 'Organic flow', status: 'live', weight: 'modifier',
-          value: (v) => valueOf(modOf(v, 'organicFlow')),
-          calc: [op('[ ( crowd spread'), op('×'), num(30), op(') + ( volume spread'), op('×'), num(25),
-            op(') + ( churn-free'), op('×'), num(25), op(') + ( entry independence'), op('×'), num(20),
-            op(') ] ÷ [ the weights of the parts that have a value ], each part from'), ref('pipe', 'WALLET SAMPLE'),
-            op('; with no sample of our own, Jupiter’s organicScore from'), api('/raw/<chain>/market.json', 'JUPITER STATS')],
-          equation: (v) => {
-            const o = (S(v) || {}).organicFlow; if (!o) return null;
-            // The Jupiter cross-check first, so the calculation ends on our result.
-            const cross = o.crossCheck ? '(Jupiter says ' + o.crossCheck.value + ') ' : '';
-            if (o.basis === 'jupiter') return 'no sample of our own → Jupiter organicScore = ' + o.score + '   ' + said(modOf(v, 'organicFlow'));
-            const body = weightedMath(o.parts, null);
-            return body ? cross + body + '   ' + said(modOf(v, 'organicFlow')) : null;
-          },
-          evidence: (v) => (modOf(v, 'organicFlow') || {}).evidence || '',
-          note: 'Not in the weighted average. Below 40 it raises LOW_ORGANIC_FLOW, which costs 3 ' +
-            'points (2 when the number is Jupiter’s).',
-          where: 'calculations/core.js organicFlowScore()',
-        },
-      ],
-    },
-    {
-      group: 'CONTRACT SAFETY', stage: 4,
-      shows: showsForPanel('detail', 'SCORE DECOMPOSITION'),
-      note: 'What the contract itself allows. Also a multiplier, and the input the SELLABLE and TAX gates read before anything is scored at all.',
-      fields: [
-        {
-          label: 'Contract safety', status: 'live', weight: 'modifier',
-          value: (v) => valueOf(modOf(v, 'contractSafety')),
-          calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('passed ÷ total × 100')],
-          equation: (v) => {
-            const cs = (IN(v) || {}).contractSafety; if (!cs || !cs.available) return null;
-            const n = (cs.checks || []).length;
-            return (n - cs.failedCount) + ' ÷ ' + n + ' → ' + Math.round(((n - cs.failedCount) / (n || 1)) * 100) +
-              '   ' + said(modOf(v, 'contractSafety'));
-          },
-          note: 'Not in the weighted average. Under 100 it raises CONTRACT_CHECKS: 3 points, or 6 under 70.',
-          where: 'asset-detail.js computeModifiers()',
-        },
-      ],
-    },
-    {
-      group: 'WHITESPACE', stage: 4,
-      note: 'Is the perp still up for grabs. A token another venue already lists has a perp, so ' +
-        'there is nothing for Vibe to offer it. Measured and shown, carrying no weight yet.',
-      fields: [
-        {
-          label: 'NO PERP ELSEWHERE', status: 'partial',
-          value: (v) => {
-            const p = (P(v).raw || {}).perps;
-            if (!p || !S(v)) return null;
-            if (p.listedOn.length) return 'taken · ' + p.listedOn.length + ' venue' + (p.listedOn.length > 1 ? 's' : '');
-            return p.checked ? 'open · ' + p.checked + '/' + p.total + ' checked' : 'unknown';
-          },
-          fetch: [ext('hyperliquid', 'perp markets'), ext('binance', 'USD-M perps'), ext('aster', 'perps'),
-            ext('okx', 'swaps'), ext('bybit', 'linear perps')],
-          calc: [api('/raw/perps.json', 'PERP VENUES'), op('symbols[ ticker ] - empty = whitespace, any venue = taken')],
-          equation: (v) => {
-            const p = (P(v).raw || {}).perps;
-            if (!S(v)) return null;
-            if (!p) return 'perps.json not written yet';
-            const down = Object.keys(p.venues).filter((k) => !p.venues[k].ok).map((k) => p.venues[k].label);
-            const ask = p.symbol + ' on ' + p.checked + ' of ' + p.total + ' venues';
-            if (p.listedOn.length) {
-              return ask + ' → listed on ' + p.listedOn.map((k) => (p.venues[k] || {}).label || k).join(', ') + ' → whitespace 0';
-            }
-            if (!p.checked) return 'no venue answered (' + down.join(', ') + ') - unknown, not open';
-            return ask + ' → none list it → open' + (down.length ? '   (unreachable: ' + down.join(', ') + ')' : '');
-          },
-          note: 'Matched by TICKER - venues list symbols, not contracts - so a memecoin sharing a ticker ' +
-            'with a listed coin shows as taken. A strong hint, not proof. An unreachable venue counts as ' +
-            'unknown, never as "no perp there".',
-          where: 'admin/AdminPanel.jsx loadRawBundle() perps; server lib/perps.js',
-        },
-      ],
-    },
-    {
-      group: 'REACHABILITY & INTENT', stage: 4,
-      note: 'Is there a project behind the token, and is it spending on being found. Measured ' +
-        'today and shown here, but carrying no weight in the score yet - which is why its boxes ' +
-        'say so rather than quietly contributing nothing.',
-      fields: [
-        {
-          label: 'PROJECT REPUTATION', status: 'partial',
-          value: (v) => (v && v.ethosLabel) || null,
-          calc: [api('/raw/ethos.json', 'ETHOS (PROJECT X)'),
-            op('- a score of 0 means Ethos has no record, which is NOT a bad reputation and is left out')],
-          equation: (v) => {
-            const e = v && v.ethos;
-            if (!e || !e.linked) return 'this token advertises no X account';
-            if (e.score === 0) return 'no Ethos record for @' + e.handle + ' - no score, not a bad one';
-            return '@' + e.handle + ' = ' + e.score + ' (' + (e.level || '?') + '), ' +
-              (e.delta > 0 ? '+' : '') + e.delta + ' against the 1200 start';
-          },
-          note: 'Not in the score. It raises a flag when a project account sits below the Ethos ' +
-            'starting score, and nothing more, until it is shown to predict something.',
-          where: 'services/ethos-intel.js ethosFor()',
-        },
-        {
-          label: 'CONTACTABLE', status: 'partial',
-          value: (v) => {
-            const l = (S(v) || {}).links || {};
-            const n = ((l.socials || []).length) + ((l.websites || []).length);
-            return n ? n + ' links' : null;
-          },
-          fetch: [ext('dexscreener', 'links.socials, links.websites')],
-          via: api('/raw/<chain>/market.json'),
-          equation: (v) => {
-            const l = (S(v) || {}).links || {};
-            const kinds = (l.socials || []).map((x) => x.type).join(', ');
-            return (kinds || 'no socials') + ' - ' + ((l.websites || []).length) + ' website(s)';
-          },
-          note: 'A project with no way to reach it cannot be pitched, however well it trades.',
-          where: WHERE_NORM,
-        },
-        {
-          label: 'BOOSTED', status: 'partial',
-          value: (v) => {
-            const pr = (P(v).raw || {}).promotion;
-            if (!pr || !S(v)) return null;
-            const boost = pr.rows.some((r) => r.kind === 'BOOST');
-            const profile = pr.rows.some((r) => r.kind === 'PROFILE');
-            if (!boost && !profile) return 'not paying';
-            return [boost ? 'boost' : null, profile ? 'profile' : null].filter(Boolean).join(' + ');
-          },
-          fetch: [ext('dexscreener', 'token-boosts/top, token-profiles/latest')],
-          calc: [api('/raw/<chain>/promotion.json', 'PROMOTION'), op('rows[ this token ] - a BOOST or PROFILE row = paying for attention')],
-          equation: (v) => {
-            const pr = (P(v).raw || {}).promotion;
-            if (!S(v)) return null;
-            if (!pr) return 'promotion.json not written yet';
-            if (!pr.rows.length) return 'not among the ' + pr.feedRows + ' boosted / profiled tokens on this chain';
-            return pr.rows.map((r) => r.kind + (fin(r.totalAmount) ? ' ×' + r.totalAmount : '')).join(' + ');
-          },
-          note: 'DexScreener boosts and profiles are paid. A team that bought one is spending on growth ' +
-            'right now - the warmest moment to pitch, and the first daily trigger in the listing spec. The ' +
-            'feed is DexScreener\'s top list, so "not paying" can also mean "paid less than the top".',
-          where: 'admin/AdminPanel.jsx loadRawBundle() promotion; server lib/providers.js fetchPromotion()',
-        },
-      ],
-    },
-    {
-      group: 'DURABILITY', stage: 4,
-      note: 'Has it held together over time rather than in the last five minutes. Built from the ' +
-        'only history we own - our own samples - so it is thin for a pool we met recently, and ' +
-        'carries no weight in the score yet.',
-      fields: [
-        {
-          label: 'SURVIVAL', status: 'partial',
-          value: (v) => {
-            const h = (S(v) || {}).poolAgeHours;
-            return fin(h) ? (h / 24).toFixed(1) + ' days' : null;
-          },
-          calc: [api('/raw/<chain>/market.json', 'POOL AGE'), op('past the first-week rug window, with'),
-            api('/raw/<chain>/history.json', 'POOL SAMPLES'), op('still holding and'), ref('pipe', 'HOLDER GROWTH RATE'), op('positive')],
-          equation: (v) => {
-            const h = (S(v) || {}).poolAgeHours;
-            if (!fin(h)) return null;
-            const lane = h < 24 * 14 ? 'inside the 14-day new-launch window' : 'past the 14-day window';
-            return Math.round(h) + ' hours old - ' + lane;
-          },
-          note: 'The 14-day line is what the listing spec uses to split a new launch from an ' +
-            'established token. Nothing branches on it yet; the box is where that decision will live.',
-          where: WHERE_NORM,
-        },
-      ],
-    },,
-
     /* ----------------------------------------------------------- 5 SCORE -- */
     {
       group: 'SCORE', stage: 5, flat: true,

@@ -548,6 +548,56 @@ export function detailVals(app, a, showAdj, extra) {
       { k: 'Corp action', v: '—', c: UNAVAILABLE }
     ] : [];
 
+    // PERP LISTING: would this token make a good perp - the hard gates, and
+    // the three listing components the score now carries. Read off the row
+    // (row.gates, row.facts, row.scoreModel), never re-derived here.
+    const compOf = (key) => (row.scoreModel || []).find((c) => c.key === key) || null;
+    const compChip = (key) => {
+      const c = compOf(key);
+      return c && Number.isFinite(c.value) ? { n: c.value, c: barColor(c.value) } : { n: '—', c: UNAVAILABLE };
+    };
+    const facts = row.facts || {};
+    const perp = facts.perp || null;
+    const reach = facts.reach || null;
+    const gates = row.gates || null;
+    const listing = [
+      {
+        k: 'Perp elsewhere', chip: compChip('whitespace'),
+        v: !perp ? 'not checked yet'
+          : perp.listedOn.length ? perp.listedOn.map((id) => perp.labels[id] || id).join(', ')
+          : perp.checked ? 'none found' : 'venues unreachable',
+        c: !perp || (!perp.listedOn.length && !perp.checked) ? UNAVAILABLE : perp.listedOn.length ? '#ff4fae' : '#4d8dff',
+        why: perp ? 'Checked ' + perp.checked + ' of ' + perp.total + ' venues by ticker' +
+          (perp.unreachable && perp.unreachable.length ? ' (unreachable: ' + perp.unreachable.join(', ') + ')' : '') +
+          '. Venues list symbols, not contracts, so a shared ticker reads as listed.' : '',
+      },
+      {
+        k: 'Pool age', chip: compChip('durability'),
+        v: Number.isFinite(row.poolAgeHours) ? (row.poolAgeHours / 24).toFixed(1) + ' days' : '—',
+        c: Number.isFinite(row.poolAgeHours) ? (row.poolAgeHours >= 24 * 14 ? '#dfe6f6' : '#ff4fae') : UNAVAILABLE,
+        why: 'Durability: 14 days = 0, 180 days = 100. Under 14 days the age gate vetoes it.',
+      },
+      {
+        k: 'Contact', chip: compChip('reachability'),
+        v: reach ? ([reach.website && 'website', reach.x && 'X', reach.telegram && 'Telegram'].filter(Boolean).join(' · ') || 'none advertised') : '—',
+        c: reach && (reach.website || reach.x || reach.telegram) ? '#dfe6f6' : UNAVAILABLE,
+        why: 'Reachability: website 30 + X 30 + Telegram 20 + paid promotion 20.',
+      },
+      {
+        k: 'Paid promotion', chip: null,
+        v: reach && reach.promotion.length
+          ? reach.promotion.map((p) => p.kind.toLowerCase() + (Number.isFinite(p.totalAmount) ? ' ×' + p.totalAmount : '')).join(' + ')
+          : 'none',
+        c: reach && reach.boosted ? '#ffd60a' : UNAVAILABLE,
+        why: 'A DexScreener boost or profile bought - the team is paying to be seen right now.',
+      },
+    ];
+    const listingVerdict = !gates ? null : gates.vetoed
+      ? { text: 'VETOED · ' + gates.vetoes.map((g) => g.label.toLowerCase()).join(', '), c: '#ff4fae',
+          why: gates.vetoes.map((g) => g.label + ': ' + g.detail).join('\n') + '\nA vetoed token scores 0.' }
+      : { text: 'passes every gate' + (gates.unchecked.length ? ' checked so far' : ''), c: '#4d8dff',
+          why: gates.unchecked.length ? 'Not checked yet: ' + gates.unchecked.join(', ') : 'All ' + gates.checks.length + ' gates passed.' };
+
     const finalScore = Number.isFinite(scored.score) ? scored.score
       : (a.score == null ? null : Math.round(a.score));
     return {
@@ -594,6 +644,7 @@ export function detailVals(app, a, showAdj, extra) {
       // What the price & score chart loads for itself.
       chartChain: row.chain || null, chartPool: row.poolAddress || null, chartToken: row.tokenAddress || null,
       market, outcomes, subs, safety, safetyNote,
+      listing, listingVerdict,
       // Reputation of the X account this token advertises - a fact about the
       // project's identity, kept beside contract safety because that is where
       // the same question gets asked about the contract.
@@ -634,7 +685,9 @@ export default function AssetDetail({ v, css }) {
             <div style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0", { v, f })}><span style={css("font-size:9px;font-weight:700;padding:2px 6px;border-radius:10px;background:{{ f.bg }};color:{{ f.fg }};flex-shrink:0", { v, f })}>{f.sev}</span><span style={css("font-size:11px;color:#c6d1ea", { v, f })}>{f.text}</span></div>
           </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
             <div title={sc.detail} style={css("display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #16223f", { v, sc })}><span style={css("font-size:11px;font-weight:700;color:{{ sc.c }};flex-shrink:0;width:12px", { v, sc })}>{sc.glyph}</span><span style={css("flex:1;font-size:10.5px;color:#c6d1ea", { v, sc })}>{sc.label}</span><span style={css("font-size:9.5px;color:#6b7699", { v, sc })}>{sc.detail}</span></div>
-          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>PROJECT REPUTATION · Ethos</div>{v.d.rep && v.d.rep.linked ? (<>
+          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>PERP LISTING</span>{v.d.listingVerdict && (<span title={v.d.listingVerdict.why} style={css("font-size:9px;font-weight:700;letter-spacing:.4px;color:{{ lv.c }};text-align:right", { v, lv: v.d.listingVerdict })}>{v.d.listingVerdict.text}</span>)}</div>{(v.d.listing || []).map((l, i) => (<React.Fragment key={i}>
+            <div title={l.why} style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid #16223f", { v, l })}><span style={css("width:92px;flex-shrink:0;font-size:10px;color:#a3aed0", { v, l })}>{l.k}</span><span style={css("flex:1;min-width:0;font-size:10.5px;font-weight:600;color:{{ l.c }};overflow:hidden;text-overflow:ellipsis;white-space:nowrap", { v, l })}>{l.v}</span>{l.chip && (<span style={css("width:26px;flex-shrink:0;text-align:right;font-size:10px;font-weight:700;color:{{ ch.c }}", { v, ch: l.chip })}>{l.chip.n}</span>)}</div>
+          </React.Fragment>))}<div style={css("font-size:9px;color:#6b7699;margin-top:6px;line-height:1.45", { v })}>Would this token make a good perp: no perp elsewhere yet, a pool that has lasted, a team you can reach. The numbers are the Whitespace, Durability and Reachability scores.</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>PROJECT REPUTATION · Ethos</div>{v.d.rep && v.d.rep.linked ? (<>
             <div style={css("display:flex;align-items:baseline;justify-content:space-between;gap:10px", { v })}><a href={v.d.rep.url} target="_blank" rel="noreferrer" style={css("font-size:12px;font-weight:700;color:{{ d.repColor }};text-decoration:none", { v, d: v.d })}>@{v.d.rep.handle}</a><span style={css("font-size:15px;font-weight:700;color:{{ d.repColor }}", { v, d: v.d })}>{v.d.rep.score == null ? '—' : (v.d.rep.score === 0 ? 'unrated' : v.d.rep.score)}</span></div>
             <div style={css("display:flex;justify-content:space-between;margin-top:4px;font-size:9.5px", { v })}><span style={css("color:#6b7699;letter-spacing:.6px", { v })}>{v.d.rep.levelLabel || '—'}{v.d.rep.kind === 'post' ? ' · FROM A POST LINK' : ''}</span><span style={css("color:#6b7699", { v })}>{v.d.rep.delta == null ? '' : (v.d.rep.delta > 0 ? '+' : '') + v.d.rep.delta + ' vs start'}</span></div>
           </>) : null}<div style={css("font-size:10px;color:#3a4568;padding:6px 0 0;line-height:1.5", { v })}>{v.d.repNote}</div></div>{v.d.isStock && (<>

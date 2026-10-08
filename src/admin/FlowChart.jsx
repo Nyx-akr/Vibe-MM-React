@@ -353,8 +353,8 @@ function Legend() {
       <span style={{ width: 1, height: 11, background: C.border }} />
       <span style={{ fontSize: 8.5, color: C.grey }}>pipeline:</span>
       <Swatch color={STAGES[2].color} label="inputs" />
-      <Swatch color={STAGES[3].color} label="measures" />
-      <Swatch color={STAGES[4].color} label="components" />
+      <Swatch color={STAGES[3].color} label="components" />
+      <Swatch color={STAGES[4].color} label="gates" />
       <Swatch color={STAGES[5].color} label="score" />
       <span style={{ width: 1, height: 11, background: C.border }} />
       <span style={{ fontSize: 8.5, color: C.grey }}>shown on:</span>
@@ -1654,6 +1654,14 @@ export default function FlowChart({ v, onJumpToMirror }) {
   };
 
 
+  // A search hit inside a closed panel: jump once opening it has put the box
+  // into the graph (goTo then dives to whichever engine holds it).
+  const pendingFind = React.useRef(null);
+  React.useEffect(() => {
+    const id = pendingFind.current;
+    if (id && base && base.nodes.some((n) => n.id === id)) { pendingFind.current = null; goTo(id); }
+  });
+
   // A jump waiting for its level to be laid out, and the level change itself:
   // a new level starts with nothing open and fits itself to the canvas -
   // unless a jump is about to centre on one box, which then wins.
@@ -1913,7 +1921,16 @@ export default function FlowChart({ v, onJumpToMirror }) {
                 // Not at this level: find it inside an engine and dive there.
                 const hit = base.nodes.find((n) => String(n.label).toLowerCase().indexOf(q) !== -1);
                 const eng = !hit && Array.from(H.engines.values()).find((x) => x.label.toLowerCase().indexOf(q) !== -1);
-                if (hit) goTo(hit.id); else if (eng) goTo(eng.id);
+                // Or inside a CLOSED panel (a score component sits in DEMAND
+                // ENGINE etc.): open that panel, then jump once it is drawn.
+                const inner = !hit && !eng && full && full.nodes.find((n) => n.kind === 'field' && !n.flat
+                  && String(n.label).toLowerCase().indexOf(q) !== -1);
+                if (hit) goTo(hit.id);
+                else if (eng) goTo(eng.id);
+                else if (inner) {
+                  pendingFind.current = inner.id;
+                  setExpanded((cur) => new Set(cur).add('p:' + inner.page + ':' + inner.group));
+                }
               }
             }
             if (e.key === 'Escape') setQuery('');
@@ -1925,7 +1942,11 @@ export default function FlowChart({ v, onJumpToMirror }) {
             color: C.text, fontFamily: 'inherit', fontSize: 10, padding: '4px 11px', width: 200, outline: 'none',
           }}
         />
-        {matches && <span style={{ fontSize: 9, color: C.faint }}>{matches.size} match</span>}
+        {matches && (
+          <span style={{ fontSize: 9, color: C.faint }}>
+            {matches.size ? matches.size + ' match' : 'enter: search inside engines'}
+          </span>
+        )}
         <Legend />
       </div>
 

@@ -8,6 +8,7 @@ import { showsForPanel, showsForField } from './shows';
 // DATA FLOW is a standalone engine now: it computes the score itself from the
 // raw files rather than mirroring numbers the dashboard produced elsewhere.
 import FlowChart from './FlowChart';
+import TokenPicker from './TokenPicker';
 // Registers PAGES.pipe and step 6, so the SCORE PIPELINE tab and its refs resolve.
 import { SHOWN_ORDER } from './pipeline';
 import {
@@ -426,8 +427,7 @@ export default class AdminPanel extends App {
   };
 
   /** Admin picks the token the scoped tabs describe, without leaving the tab. */
-  pickToken = (e) => {
-    const id = e.target.value;
+  pickToken = (id) => {
     this.setState({ selectedId: id || null });
   };
 
@@ -525,22 +525,7 @@ export default class AdminPanel extends App {
 
           {/* Every token-scoped tab describes one asset. Choosing it here means
               an operator never has to go to the board and come back. */}
-          <select value={this.state.selectedId || ''} onChange={this.pickToken}
-            style={{
-              background: '#0d1730', border: `1px solid ${C.border}`, borderRadius: 999,
-              color: C.text, fontFamily: 'inherit', fontSize: 10, padding: '4px 10px',
-              maxWidth: 240,
-            }}>
-            {/* Only before the first poll - after that one is always picked. */}
-            {!this.state.selectedId && (
-              <option value="">waiting for the first poll</option>
-            )}
-            {(this.assets || []).slice(0, 60).map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.sym} {a.chain} {a.score == null ? '' : Math.round(a.score)}
-              </option>
-            ))}
-          </select>
+          <TokenPicker assets={this.assets} selectedId={this.state.selectedId} onPick={this.pickToken} />
 
           <div style={{ fontSize: 11, color: '#b6c2de', whiteSpace: 'nowrap' }}>{v.clock} UTC</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>

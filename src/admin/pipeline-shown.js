@@ -15,6 +15,7 @@
  */
 
 import { op, num, ref, ext, api, tile, sampleRow, fromCatalog } from './provenance';
+import { TOTAL_WEIGHT } from '../calculations/asset-detail.js';
 
 export const SHOWN_PAGES = {
 
@@ -113,9 +114,9 @@ export const SHOWN_PAGES = {
             label: 'CONF', status: 'live',
             value: (v) => (sampleRow(v) || {}).conf,
             calc: [ref('pipe', 'COVERAGE'), op('as a fraction')],
-            note: 'Measured against the ACTUAL total weight in SCORE_MODEL, which is 104 and not 100 ' +
-              '(walletQuality was raised 8 -> 12). Dividing by a hard-coded 100 is what once ' +
-              'reported a confidence of 1.04 on a fully resolved token.',
+            note: 'Measured against the ACTUAL total weight in SCORE_MODEL (' + TOTAL_WEIGHT + '), not ' +
+              'a hard-coded 100 - dividing by 100 is what once reported a confidence of 1.04 on a ' +
+              'fully resolved token.',
             feeds: [],
             where: 'calculations/asset-detail.js, dataQuality',
           },

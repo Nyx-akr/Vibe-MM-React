@@ -46,6 +46,12 @@ export const SCORE_MODEL = Object.freeze([
   { key: 'capitalRotation', label: 'Capital rotation', weight: 8 },
   { key: 'crossVenue', label: 'Cross-venue confirm', weight: 4 },
   { key: 'usdReference', label: 'USD reference', weight: 3 },
+  // The listing pillars (Vibe listing spec): is a perp still up for grabs,
+  // has the token lasted, is there a team behind it. Light weights on
+  // purpose - they describe the listing, not the 5-minute move.
+  { key: 'whitespace', label: 'Whitespace', weight: 6 },
+  { key: 'durability', label: 'Durability', weight: 4 },
+  { key: 'reachability', label: 'Reachability', weight: 3 },
   { key: 'dataQuality', label: 'Data quality', weight: 5 },
 ]);
 
@@ -490,6 +496,46 @@ export function computeComponents(row, extras) {
       ' median of ' + usdRef.quotes.length + ' venues (' + deviation.toFixed(2) + '% off)');
   }
 
+  // --- the listing pillars ---
+  // Whitespace: does another venue already list a perp? Venues list TICKERS,
+  // so the match is by symbol - a strong hint, not proof. A venue we could
+  // not reach is unknown, never "no perp there": with none answering, the
+  // component stays pending rather than claiming the field is open.
+  const listing = extras.listing || {};
+  const perp = listing.perp || null;
+  if (perp && perp.listedOn.length) {
+    set('whitespace', 0, 'perp already on ' + perp.listedOn.map((k) => perp.labels[k] || k).join(', '));
+  } else if (perp && perp.checked > 0) {
+    set('whitespace', 100, 'no perp on the ' + perp.checked + ' of ' + perp.total + ' venues that answered');
+  }
+  facts.perp = perp;
+
+  // Durability: has it lasted. Pool age on a log curve from the 14-day line
+  // (0) to six months (100) - a token under 14 days is already vetoed by the
+  // age gate, so this ranks the survivors.
+  if (Number.isFinite(row.poolAgeHours)) {
+    const days = row.poolAgeHours / 24;
+    set('durability', logScore(Math.max(days, 1), 14, 180),
+      days.toFixed(1) + ' days old (14d = 0, 180d = 100)');
+  }
+
+  // Reachability: is there a team you could reach, and is it paying to be
+  // seen. Website 30 + X 30 + Telegram 20 + a DexScreener boost or profile 20.
+  {
+    const links = row.links || {};
+    const kinds = (links.socials || []).map((s) => String((s && s.type) || '').toLowerCase());
+    const reach = {
+      website: (links.websites || []).length > 0,
+      x: kinds.includes('twitter') || kinds.includes('x'),
+      telegram: kinds.includes('telegram'),
+      boosted: (listing.promotion || []).length > 0,
+    };
+    const got = [['website', 30], ['x', 30], ['telegram', 20], ['boosted', 20]].filter(([k]) => reach[k]);
+    set('reachability', got.reduce((a, [, w]) => a + w, 0),
+      got.length ? got.map(([k, w]) => k + ' ' + w).join(' + ') : 'no website, X, Telegram or paid promotion');
+    facts.reach = { ...reach, promotion: listing.promotion || [] };
+  }
+
   // --- how much of the model actually resolved ---
   const measured = SCORE_MODEL.filter((c) => c.key !== 'dataQuality' && parts[c.key] != null);
   const coverable = SCORE_MODEL.length - 1;
@@ -881,7 +927,7 @@ export function scoreAsset(row, extras) {
  *                them yet; the score is computed on fewer inputs when we do not
  *   reference  - the quote token's price across CEX venues
  */
-export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel, ethos } = {}) {
+export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel, ethos, listing } = {}) {
   const poolSamples = (samples && samples[row.poolAddress]) || [];
   const fromSamples = zScoresFrom(poolSamples);
   const own = walletSets && walletSets.get(row.poolAddress);
@@ -902,6 +948,8 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference, wall
     walletIntel: walletIntel || null,
     jupiter: row.jupiter || null,
     ethos: ethos || null,
+    // Perp venues and paid promotion, for the listing components.
+    listing: listing || null,
   };
 
   const scored = scoreAsset(row, extras);

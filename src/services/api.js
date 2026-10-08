@@ -82,8 +82,13 @@ function apply(base) {
  *
  * A 200 is not enough - Vite answers any path with index.html. Only our own
  * manifest counts.
+ *
+ * Never asked on a shared link: there localhost is the VISITOR'S machine, so
+ * the answer means nothing, and the attempt makes Chrome ask them to let
+ * marketmonitor.site "access other apps and services on this device".
  */
 export async function probeLocalApi() {
+  if (sharedOrigin()) return false;
   return probeRawStore(LOCAL_BASE);
 }
 
@@ -102,9 +107,12 @@ export async function initApiBase() {
   // Someone else's view of a shared link: the collector serves the app, so the
   // store is the origin this page came from. Probed, not assumed - an app
   // served from anywhere that is not also the collector falls through to the
-  // usual choice rather than reading /raw off a host that has none.
+  // usual choice rather than reading /raw off a host that has none. The probe
+  // gets far longer than the localhost one: through a tunnel the first fetch
+  // pays a TLS handshake and a round trip abroad, and ngrok's free tier
+  // regularly passes 1.5s on a cold page load.
   const shared = sharedOrigin();
-  if (shared && await probeRawStore(shared)) return apply(shared);
+  if (shared && await probeRawStore(shared, 10000)) return apply(shared);
 
   if (!import.meta.env.DEV) return apply(REMOTE_BASE);
   return apply((await probeLocalApi()) ? LOCAL_BASE : REMOTE_BASE);
@@ -235,6 +243,45 @@ function referenceFor(symbols, symbol) {
     : null;
 }
 
+/**
+ * Perp venue listings (one file for every chain) and DexScreener's paid boosts
+ * and profiles (one per chain), for the listing components. Both move slowly:
+ * venues every 30 min, promotion every 2 min.
+ */
+async function perpsFile() {
+  return readRawQuiet('perps.json', null, { maxAgeMs: 60000 });
+}
+
+async function promotionFor(chainKey) {
+  const file = await readRawQuiet(chainKey + '/promotion.json', null, { maxAgeMs: 30000 });
+  const by = new Map();
+  ((file && file.rows) || []).forEach((r) => {
+    const key = String(r.tokenAddress || '').toLowerCase();
+    if (!by.has(key)) by.set(key, []);
+    by.get(key).push({ kind: r.kind, totalAmount: r.totalAmount ?? null });
+  });
+  return by;
+}
+
+/** This row's listing inputs: which venues list its ticker, and its paid promotion. */
+function listingFor(perps, promotion, row) {
+  let perp = null;
+  if (perps && perps.venues) {
+    const labels = {};
+    Object.keys(perps.venues).forEach((k) => { labels[k] = perps.venues[k].label || k; });
+    const symbol = String(row.symbol || '').toUpperCase();
+    perp = {
+      symbol,
+      listedOn: (perps.symbols || {})[symbol] || [],
+      checked: perps.venuesReachable || 0,
+      total: perps.venuesTotal || 0,
+      labels,
+      unreachable: Object.keys(perps.venues).filter((k) => !perps.venues[k].ok).map((k) => labels[k]),
+    };
+  }
+  return { perp, promotion: promotion.get(String(row.tokenAddress || '').toLowerCase()) || [] };
+}
+
 /* ------------------------------------------------------------ the score -- */
 
 /*
@@ -357,14 +404,15 @@ function reportScoreError(chainKey, row, error) {
  */
 export async function fetchLiveMarketData(chains = chainKeys) {
   try {
-    const references = await referencesFor();
+    const [references, perps] = await Promise.all([referencesFor(), perpsFile()]);
     const stamps = [];
     const perChain = await Promise.allSettled(chains.map(async (chainKey) => {
       const feed = await readRaw(chainKey + '/market.json');
       if (!feed || !Array.isArray(feed.rows) || !feed.rows.length) return [];
       if (Number.isFinite(feed.writtenAt)) stamps.push(feed.writtenAt);
 
-      const [raw, intelTokens] = await Promise.all([rawInputsFor(chainKey), intelTokensFor(chainKey)]);
+      const [raw, intelTokens, promotion] = await Promise.all([
+        rawInputsFor(chainKey), intelTokensFor(chainKey), promotionFor(chainKey)]);
       const normalized = feed.rows.slice(0, BOARD_ROWS).map((r) => normalizeRow(r, feed.fetchedAt));
       const screened = screenRows(normalized, {});
 
@@ -398,6 +446,8 @@ export async function fetchLiveMarketData(chains = chainKeys) {
           // flag and never a penalty - see assessRisk() - so the score stays
           // the one number it already was.
           ethos: ethosFor(chainKey, row.tokenAddress),
+          // Perp venues and paid promotion, for the listing components.
+          listing: listingFor(perps, promotion, row),
         });
         // Remember what we scored it at, so Evaluation can grade it later.
         // This lives in the app store only - it never goes to the server.

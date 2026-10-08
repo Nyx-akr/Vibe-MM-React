@@ -30,7 +30,7 @@ import { STAGES } from './graph';
 export const ROOT = 'root';
 
 /**
- * A pipeline step's own name, from graph.js STAGES ('3 · GATES' -> 'GATES'),
+ * A pipeline step's own name, from graph.js STAGES ('4 · GATES' -> 'GATES'),
  * so an engine named after a step follows the step when it is renamed - the
  * step-3 engine said MEASURES for a while after step 3 had become GATES.
  */
@@ -43,11 +43,12 @@ const stepName = (k) => String((STAGES[k] || {}).title || '').replace(/^\s*\d+\s
 export const DEFAULT_ENGINES = [
   { id: 'eng:ingest', label: 'INGEST', sub: 'providers → raw files', color: '#2ec4b6',
     of: (n) => n.kind === 'provider' || n.kind === 'file' },
-  { id: 'eng:inputs', label: stepName(1) + ' & ' + stepName(2), sub: 'the board, and this token’s readings', color: '#e2e8f0',
-    of: (n) => n.page === 'pipe' && (n.stage === 1 || n.stage === 2) },
-  { id: 'eng:measures', label: stepName(3), sub: 'checks a token must pass', color: '#94a3b8',
-    of: (n) => n.page === 'pipe' && n.stage === 3 },
-  { id: 'eng:decomp', label: 'SCORE DECOMPOSITION', sub: 'the 14 components', color: '#f43f5e',
+  // Steps 1-3 in one engine: the token list, its readings and the engines
+  // that turn them into components are one calculation, read left to right.
+  { id: 'eng:decomp', label: 'SCORE DECOMPOSITION', sub: 'token list → readings → components', color: '#f43f5e',
+    of: (n) => n.page === 'pipe' && n.stage >= 1 && n.stage <= 3 },
+  // After the engines: the wash gate reads one of their outputs.
+  { id: 'eng:measures', label: stepName(4), sub: 'checks a token must pass', color: '#94a3b8',
     of: (n) => n.page === 'pipe' && n.stage === 4 },
   { id: 'eng:score', label: 'SCORE', sub: 'raw → penalty → final → stage', color: '#ffd60a',
     of: (n) => n.page === 'pipe' && n.stage === 5 },
@@ -188,10 +189,21 @@ export function viewGraph(base, H, level) {
     return res;
   };
 
+  // A field folded into a closed panel is not a node of its own, but it is
+  // still the value a port carries - found through the panel holding it.
+  const foldedField = (id) => {
+    const m = /^f:([^:]+):(.*)$/.exec(String(id));
+    if (!m) return null;
+    const panel = base.nodes.find((n) => n.kind === 'panel' && n.page === m[1]
+      && (n.fields || []).some((f) => f.label === m[2]));
+    return panel ? panel.fields.find((f) => f.label === m[2]) : null;
+  };
   const labelOf = (id) => {
     if (H.engines.has(id)) return H.engines.get(id).label;
     const n = nodeOf.get(id);
-    return n ? n.label : String(id);
+    if (n) return n.label;
+    const f = foldedField(id);
+    return f ? f.label : String(id);
   };
 
   // Boxes directly at this level, and the engines that hold the rest.
@@ -226,13 +238,28 @@ export function viewGraph(base, H, level) {
     });
   };
 
+  // The data's key is the VALUE it carries, so one value is one port. An
+  // arrow out of a closed panel stands for several values (DEMAND ENGINE
+  // sends Trade activity, Buyer breadth, ...): split it back into one per
+  // value, so a port is named after its data rather than after the panel.
+  const carried = [];
   base.edges.forEach((e) => {
+    const from = nodeOf.get(e.from);
+    const parts = e.parts || [];
+    if (!from || from.kind !== 'panel' || !e.rolled || !parts.some((p) => p.from !== e.from)) {
+      carried.push({ e, key: e.from });
+      return;
+    }
+    const by = new Map();
+    parts.forEach((p) => { if (!by.has(p.from)) by.set(p.from, []); by.get(p.from).push(p); });
+    by.forEach((ps, src) => carried.push({ e: { ...e, parts: ps }, key: src }));
+  });
+
+  carried.forEach(({ e, key }) => {
     const ra = childOf(e.from);
     const rb = childOf(e.to);
     if (!ra && !rb) return;
     if (ra && rb && ra === rb) return; // inside one child engine: its business
-    // The data's key is its SOURCE box, so one value is one port.
-    const key = e.from;
     const fromIsEngine = ra && H.engines.has(ra) && ra !== e.from;
     const toIsEngine = rb && H.engines.has(rb) && rb !== e.to;
     if (!ra) {
@@ -275,13 +302,14 @@ export function viewGraph(base, H, level) {
   });
 
   // Boundary ports, inside an engine.
+  const fieldOf = (key) => (nodeOf.get(key) || {}).field || foldedField(key) || null;
   boundaryIn.forEach((label, key) => {
     nodes.push({ id: 'port:in:' + key, kind: 'port', side: 'in', label, src: key, srcNode: nodeOf.get(key) || null,
-      field: (nodeOf.get(key) || {}).field || null });
+      field: fieldOf(key) });
   });
   boundaryOut.forEach((label, key) => {
     nodes.push({ id: 'port:out:' + key, kind: 'port', side: 'out', label, src: key, srcNode: nodeOf.get(key) || null,
-      field: (nodeOf.get(key) || {}).field || null });
+      field: fieldOf(key) });
   });
 
   return { nodes, edges: Array.from(edges.values()) };

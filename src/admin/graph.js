@@ -152,8 +152,8 @@ export const PAGE_COLORS = {
 export const STAGES = {
   1: { title: '1 · TOKEN LIST', color: '#e2e8f0' },
   2: { title: '2 · READINGS', color: '#e2e8f0' },
-  3: { title: '3 · GATES', color: '#94a3b8' },
-  4: { title: '4 · ENGINES', color: '#f43f5e' },
+  3: { title: '3 · ENGINES', color: '#f43f5e' },
+  4: { title: '4 · GATES', color: '#94a3b8' },
   5: { title: '5 · COMBINE', color: '#ffd60a' },
 };
 
