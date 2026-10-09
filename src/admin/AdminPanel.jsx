@@ -9,12 +9,13 @@ import { showsForPanel, showsForField } from './shows';
 // raw files rather than mirroring numbers the dashboard produced elsewhere.
 import FlowChart from './FlowChart';
 import TokenPicker from './TokenPicker';
-// Registers PAGES.pipe and step 6, so the SCORE PIPELINE tab and its refs resolve.
-import { SHOWN_ORDER } from './pipeline';
-import {
-  API_ORIGIN, API_BASES, apiTarget, setApiTarget, probeLocalApi, usingLocalApi,
-} from '../services/api';
+import FlowUsers from './FlowUsers';
+// Registers PAGES.pipe and step 6 - the catalogue DATA FLOW draws.
+import './pipeline';
+import { API_ORIGIN } from '../services/api';
 import { readRawQuiet } from '../services/storage/raw-store';
+import { providerHealth } from '../calculations/core';
+import { chainKeys as ALL_CHAINS } from '../data/chains';
 
 /**
  * Keeps a render error in the map from taking the whole page with it.
@@ -94,39 +95,12 @@ const PAGE_FOR_LABEL = {
   EVALUATION: 'eval', HEALTH: 'health',
 };
 
-/** The page to actually show: a map-only tab (set by inherited App code) means the map. */
-const shownPage = (page) => (MAP_ONLY_PAGES.has(page) ? FLOW_PAGE : page);
-
-/** Which data server this page - and the dashboard - reads. */
-function ServerSwitch({ target, localUp, onPick }) {
-  const options = [
-    ['auto', 'AUTO', 'probe in dev, deployed otherwise'],
-    ['local', 'LOCAL', API_BASES.local],
-    ['remote', 'DEPLOYED', API_BASES.remote],
-  ];
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      {options.map(([k, label, hint]) => (
-        <div key={k} onClick={() => onPick(k)} title={hint}
-          style={{
-            cursor: 'pointer', fontSize: 9, fontWeight: 700, letterSpacing: 0.8,
-            padding: '4px 10px', borderRadius: 999,
-            border: `1px solid ${target === k ? C.blue : C.border}`,
-            background: target === k ? '#0e2a5c' : C.panel,
-            color: target === k ? '#6ea0ff' : C.faint,
-          }}>{label}</div>
-      ))}
-      <span style={{ fontSize: 9.5, color: C.dim, marginLeft: 2 }}>{API_ORIGIN}</span>
-      {localUp !== null && (
-        <span title={localUp ? 'our server is answering on ' + API_BASES.local
-          : 'nothing on ' + API_BASES.local}
-          style={{ fontSize: 8.5, color: localUp ? C.blue : C.grey }}>
-          {localUp ? 'local up' : 'local down'}
-        </span>
-      )}
-    </div>
-  );
-}
+/**
+ * The page to actually show. A map-only tab (set by inherited App code) means
+ * the map, and so does 'pipe': the SCORE PIPELINE tab was removed on
+ * 2026-10-08 - DATA FLOW draws the same catalogue, box by box.
+ */
+const shownPage = (page) => (MAP_ONLY_PAGES.has(page) || page === 'pipe' ? FLOW_PAGE : page);
 
 /**
  * A stable DOM id per field, so a jump can find its card.
@@ -156,9 +130,8 @@ function MirrorPage({ page, v, needsSelection, onJump, ping }) {
 
   /**
    * One page's groups as card bands. `key` is the catalogue page the cards
-   * belong to - not necessarily the tab on screen: the SCORE PIPELINE tab
-   * renders step 6 from the token tabs' own catalogues - so card ids and the
-   * jump ring stay keyed by where the field is defined.
+   * belong to, so card ids and the jump ring stay keyed by where the field
+   * is defined.
    */
   const renderGroups = (key, groups, titleOf) => groups.map((group, i) => {
     // A group either lists its fields up front, or generates them from the
@@ -211,7 +184,6 @@ function MirrorPage({ page, v, needsSelection, onJump, ping }) {
     );
   });
 
-  const isPipe = page === 'pipe';
   return (
     <>
       <div style={{ marginBottom: 14 }}>
@@ -220,22 +192,7 @@ function MirrorPage({ page, v, needsSelection, onJump, ping }) {
           {spec.blurb}
         </div>
       </div>
-      {renderGroups(page, spec.groups, isPipe ? (g) => g.stage + ' · ' + g.group : null)}
-
-      {/* Step 6: the token tabs' panels, each number with what it is read from. */}
-      {isPipe && (
-        <>
-          <div style={{ margin: '26px 0 12px', borderTop: `2px solid ${C.border}`, paddingTop: 12 }}>
-            <div style={{ fontSize: 13, fontWeight: 700, color: C.white }}>6 &middot; SHOWN ON THE DASHBOARD</div>
-            <div style={{ fontSize: 10.5, color: C.dim, marginTop: 3, maxWidth: 820, lineHeight: 1.6 }}>
-              Every panel of the token tabs and the step above it reads from. Nothing here is
-              computed a second time: each card names the pipeline box it displays.
-            </div>
-          </div>
-          {SHOWN_ORDER.map((key) => renderGroups(key, PAGES[key].groups,
-            (g) => PAGES[key].title + ' · ' + g.group))}
-        </>
-      )}
+      {renderGroups(page, spec.groups, null)}
     </>
   );
 }
@@ -245,8 +202,6 @@ export default class AdminPanel extends App {
     super(props);
     this.state = {
       ...this.state,
-      // Which server this page reads, and whether the local one is even up.
-      target: apiTarget(), localUp: null,
       // The field a jumped-from operand is pointing at, while it blinks.
       ping: null,
       // The map is home: the token-by-token tabs it replaced are gone.
@@ -259,7 +214,6 @@ export default class AdminPanel extends App {
     // background intel services. The mirror is worthless without them - the
     // wallet, social and rotation numbers only exist because they run.
     super.componentDidMount();
-    probeLocalApi().then((localUp) => this.setState({ localUp }));
   }
 
   componentWillUnmount() {
@@ -287,7 +241,14 @@ export default class AdminPanel extends App {
     if (fresh || this.rawLoading === key) return;
     this.rawLoading = key;
     try {
-      const [market, trades, history, intel, reference, ethos, perps, promotion] = await Promise.all([
+      // Every chain's market rows: the TOKEN LIST group starts from all of them.
+      const marketFiles = await Promise.all(ALL_CHAINS.map((c) => readRawQuiet(c + '/market.json', null)));
+      const marketAll = {};
+      ALL_CHAINS.forEach((c, i) => {
+        const f = marketFiles[i];
+        if (f && Array.isArray(f.rows)) marketAll[c] = { rows: f.rows, fetchedAt: f.fetchedAt };
+      });
+      const [market, trades, history, intel, reference, ethos, perps, promotion, system] = await Promise.all([
         readRawQuiet(s.chain + '/market.json', null),
         readRawQuiet(s.chain + '/trades.json', null),
         readRawQuiet(s.chain + '/history.json', null),
@@ -296,6 +257,7 @@ export default class AdminPanel extends App {
         readRawQuiet('ethos.json', null),
         readRawQuiet('perps.json', null),
         readRawQuiet(s.chain + '/promotion.json', null),
+        readRawQuiet('system.json', null),
       ]);
       const ethosToken = ethos && ethos.tokens && ethos.tokens[s.chain]
         ? ethos.tokens[s.chain][s.tokenAddress] || null : null;
@@ -313,6 +275,7 @@ export default class AdminPanel extends App {
           token: ethosToken,
           profile: (ethos.handles || {})[ethosToken.handle] || null,
         } : null,
+        marketAll,
         // Perp venues match by TICKER (venues list symbols, not contracts), so
         // this token's record is its symbol's entry plus every venue's status -
         // "no perp" only means something next to how many venues answered.
@@ -321,6 +284,8 @@ export default class AdminPanel extends App {
           listedOn: (perps.symbols || {})[String(s.symbol || '').toUpperCase()] || [],
           venues: perps.venues || {},
           checked: perps.venuesReachable, total: perps.venuesTotal,
+          // A failed run keeps the last good file, so its age matters.
+          writtenAt: perps.writtenAt || null,
         } : null,
         // DexScreener's paid boosts and profiles on this chain, this token's rows.
         promotion: promotion ? {
@@ -328,6 +293,8 @@ export default class AdminPanel extends App {
             String(r.tokenAddress || '').toLowerCase() === String(s.tokenAddress || '').toLowerCase()),
           feedRows: (promotion.rows || []).length,
         } : null,
+        // Every upstream's health, by host, judged the way the SERVER page judges it.
+        health: system && system.upstream ? providerHealth(system.upstream) : [],
         // What the file says its per-token record looks like, so a card with
         // no record for this token can still draw the format it expects.
         shapes: { ethos: (ethos && ethos.shape) || null },
@@ -343,7 +310,7 @@ export default class AdminPanel extends App {
 
   componentDidUpdate(prevProps, prevState) {
     // The dashboard loads a token's intel (holders, routed quote, contract
-    // checks) only while DETAIL is open. The map and the SCORE PIPELINE show
+    // checks) only while DETAIL is open. The map shows
     // those same inputs, so they load it too - through the same loader, which
     // fetches once per token. The parent is skipped on these pages because it
     // forgets the loaded token whenever DETAIL is not open, which would refetch
@@ -384,11 +351,9 @@ export default class AdminPanel extends App {
   jumpTo = (page, field) => {
     clearTimeout(this.pingTimer);
     clearTimeout(this.settleTimer);
-    // A token tab's field now lives in step 6 of the SCORE PIPELINE tab: go
-    // there, keep the ring keyed by the field's own catalogue page.
-    if (MAP_ONLY_PAGES.has(page)) {
-      this.setState({ page: 'pipe', ping: { page, field, at: Date.now() } },
-        () => this.settleJump(page, field, 0));
+    // A score step or a token tab's field lives on the map now.
+    if (MAP_ONLY_PAGES.has(page) || page === 'pipe') {
+      this.setState({ page: FLOW_PAGE });
       return;
     }
     this.setState({ page, ping: { page, field, at: Date.now() } }, () => this.settleJump(page, field, 0));
@@ -418,14 +383,6 @@ export default class AdminPanel extends App {
     this.settleTimer = setTimeout(() => this.settleJump(page, field, attempt + 1), 300);
   }
 
-  /** Pin this page - and the dashboard - to one server, or hand it to the probe. */
-  pickServer = async (next) => {
-    if (next === this.state.target) return;
-    await setApiTarget(next);
-    this.setState({ target: apiTarget(), localUp: await probeLocalApi(), apiIsLocal: usingLocalApi() });
-    this.syncLiveData();
-  };
-
   /** Admin picks the token the scoped tabs describe, without leaving the tab. */
   pickToken = (id) => {
     this.setState({ selectedId: id || null });
@@ -446,6 +403,9 @@ export default class AdminPanel extends App {
         this.rawBundle.key === selectedNow.rawServerRow.chain + ':' + selectedNow.rawServerRow.tokenAddress +
           ':' + selectedNow.rawServerRow.poolAddress ? this.rawBundle : null,
       assets: this.assets || [],
+      // For the map's SELECTOR box: which token is picked, and how to pick one.
+      selectedId: this.state.selectedId || null,
+      pick: this.pickToken,
     };
     const page = shownPage(this.state.page);
     const isOps = Object.prototype.hasOwnProperty.call(OPS_PAGES, page);
@@ -462,17 +422,6 @@ export default class AdminPanel extends App {
         tickC: isFlow ? '#e35ff2' : '#39445f',
         line: isFlow ? '#e35ff2' : 'transparent',
         bg: isFlow ? 'rgba(227,95,242,0.07)' : 'transparent',
-      },
-      // The pipeline's steps as cards, in order - the same catalogue the map
-      // lays out as its columns, readable top to bottom.
-      {
-        label: 'SCORE PIPELINE', child: true, disabled: false,
-        go: () => this.setState({ page: 'pipe' }),
-        hint: 'every step from raw file to score, for the selected token', indent: 30,
-        fg: page === 'pipe' ? '#e35ff2' : '#8b96b8',
-        tickC: page === 'pipe' ? '#e35ff2' : '#39445f',
-        line: page === 'pipe' ? '#e35ff2' : 'transparent',
-        bg: page === 'pipe' ? 'rgba(227,95,242,0.07)' : 'transparent',
       },
       // The dashboard's rail minus the tabs that now live only on the map.
       ...v.navItems.filter((item) => !MAP_ONLY_PAGES.has(PAGE_FOR_LABEL[item.label])).map((item) => {
@@ -519,27 +468,14 @@ export default class AdminPanel extends App {
           <div style={{ fontSize: 14, fontWeight: 800, color: C.white, whiteSpace: 'nowrap' }}>
             VibeScreener <span style={{ color: C.pink }}>Admin</span>
           </div>
-          <div style={{ width: 1, height: 24, background: C.border }} />
-          <ServerSwitch target={this.state.target} localUp={this.state.localUp} onPick={this.pickServer} />
           <div style={{ flex: 1 }} />
 
           {/* Every token-scoped tab describes one asset. Choosing it here means
               an operator never has to go to the board and come back. */}
           <TokenPicker assets={this.assets} selectedId={this.state.selectedId} onPick={this.pickToken} />
 
-          <div style={{ fontSize: 11, color: '#b6c2de', whiteSpace: 'nowrap' }}>{v.clock} UTC</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-            <div style={{
-              width: 7, height: 7, borderRadius: '50%', background: v.liveDotColor,
-              animation: v.liveDotAnim,
-            }} />
-            <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: v.liveDotColor }}>
-              {v.liveLabel}
-            </span>
-          </div>
-          <a href="/" style={{ fontSize: 10.5, color: C.dim, textDecoration: 'none', whiteSpace: 'nowrap' }}>
-            dashboard &rarr;
-          </a>
+          {/* Whose DATA FLOW this is: DEFAULT, or a user's own saved flow. */}
+          <FlowUsers />
         </div>
 
         <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
@@ -563,7 +499,7 @@ export default class AdminPanel extends App {
 
             {isFlow ? (
               <MapBoundary>
-                <FlowChart v={v} onJumpToMirror={this.jumpTo} />
+                <FlowChart v={v} />
               </MapBoundary>
             ) : isOps ? (
               <AdminOps initialTab={page === 'opsStore' ? 'storage' : page === 'opsSources' ? 'sources' : 'server'} />
@@ -573,8 +509,7 @@ export default class AdminPanel extends App {
                 v={v}
                 onJump={this.jumpTo}
                 ping={this.state.ping}
-                needsSelection={page === 'pipe'
-                  && !selected}
+                needsSelection={false}
               />
             )}
 

@@ -1,13 +1,13 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import { buildGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, STORES, STAGES } from './graph';
-import { C, Expression, Badge, RawData, rawRecordOf, RecordView, RAW_RECORD, WorkedSteps } from './Explain';
-import { showsForPanel, showsForField } from './shows';
-import { SOURCE_BY_ID, fieldValues, MAP_ONLY_PAGES } from './provenance';
-import { RAW as RAW_PORTS, RELAY_CONSUMERS } from './pipeline';
-import { API_ORIGIN } from '../services/api';
+import { getSetting, setSetting, clearSetting, subscribeSettings, applyFilter, filterSetting, FILTER_MODES } from './box-settings';
+import { activeFlow, activeFlowId, updateFlow, subscribeFlows, DEFAULT_FLOW } from './flow-store';
+import { buildGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, STORES, STAGES, CONNECTOR_W, CONNECTOR_H } from './graph';
+import { C, WorkedSteps } from './Explain';
+import { fieldValues } from './provenance';
 import {
   ROOT, ENGINE, loadConfig, saveConfig, emptyConfig, hierarchy, viewGraph, orderPortsLikeInside, portPoint, sketchEdges,
+  rowsTop,
 } from './engines';
 
 /**
@@ -97,9 +97,156 @@ function edgePath(p1, p2) {
 
 // A pipeline step wears its STEP's colour, so inputs, measures, components
 // and the score read as four bands rather than one yellow wall.
+/**
+ * Every group wears ONE colour and one icon: a group is a container, and a
+ * colour per group made it look like six different kinds of thing.
+ */
+export const GROUP_COLOR = '#8fa3ff';
+
+/**
+ * What kind of number a value is, from the value itself and its box: a wire
+ * is coloured by what it CARRIES (dollars, a ratio, a 0-100 score, a verdict)
+ * rather than by the box it left.
+ */
+export const UNIT_COLORS = {
+  usd: '#34d399', ratio: '#fbbf24', percent: '#f472b6', score: '#c084fc',
+  count: '#60a5fa', verdict: '#f87171', text: '#8b96b8', list: '#22d3ee', record: '#64748b',
+};
+export const UNIT_NAMES = {
+  usd: 'USD', ratio: 'ratio (×)', percent: 'percent', score: 'score 0-100',
+  count: 'count', verdict: 'pass / fail', text: 'text', list: 'list', record: 'a whole file (a record)',
+};
+export function unitOf(val, meta) {
+  if (val === null || val === undefined || val === '') return null;
+  const s = String(val).trim();
+  if (/^(pass|veto|clean|taken|open|unknown|not paying|boost|profile)/i.test(s)) return 'verdict';
+  if (/^-?\$/.test(s)) return 'usd';
+  if (/^-?[\d.]+x$/.test(s)) return 'ratio';
+  if (/%$/.test(s)) return 'percent';
+  // A list: "160 rows", "300 trades", "819 samples", "820 × 15s"...
+  if (/^\d[\d,]*\s*(rows|samples|trades|tokens|wallets|points|quotes|venue quotes|× 15s)/.test(s)) return 'list';
+  if (/^[+-]?[\d.,]+$/.test(s)) {
+    const f = (meta && meta.field) || meta || {};
+    const scored = f.weight || (meta && meta.stage === 5) || f.curve;
+    return scored ? 'score' : 'count';
+  }
+  return 'text';
+}
+
+/**
+ * A port's DATA TYPE. What a port EXPECTS is the type it has carried before
+ * (learned the first time a value arrives, per data key); what it is
+ * RECEIVING is the type of the value on it right now. The dot is coloured by
+ * the expected type; hovering it shows both, and an empty one says the data is
+ * missing.
+ */
+const EXPECTED = new Map();
+export function portType(key, val, meta, carries = true) {
+  // A port that carries a whole FILE (a record) has no single value to show -
+  // that is what it is, not missing data.
+  if (!carries) return { expected: 'record', receiving: 'record', val: null, record: true };
+  const got = unitOf(val, meta);
+  if (got && !EXPECTED.has(key)) EXPECTED.set(key, got);
+  return { expected: EXPECTED.get(key) || got || null, receiving: got, val };
+}
+const typeTitle = (label, t, side) => (t.record
+  ? label + '\na whole file (a record), not one value - it arrives as the file the server wrote'
+  : label + '\n' +
+  (side === 'in' ? 'expects: ' : 'gives: ') + (t.expected ? UNIT_NAMES[t.expected] : 'unknown yet') + '\n' +
+  (side === 'in' ? 'receiving: ' : 'sending: ') +
+  (t.receiving ? UNIT_NAMES[t.receiving] + ' · ' + t.val : 'nothing - missing data'));
+/** Does this port carry ONE value (a field), or a whole file? */
+const carriesValue = (p, nodeById) => {
+  const src = nodeById && nodeById.get(p.key);
+  const f = (src && src.field) || p.field;
+  return Boolean(f && f.value);
+};
+/** An inlet dot: its data type's colour; a red dashed ring only when a value is due and none arrives. */
+function InDot({ label, t }) {
+  return (
+    <span title={typeTitle(label, t, 'in')} style={{ position: 'absolute', left: -4.5, top: '50%', marginTop: -4,
+      width: 8, height: 8, borderRadius: '50%', background: t.receiving ? dotColor(t) : C.bg, cursor: 'help',
+      border: t.receiving ? 'none' : `1.5px dashed ${WIRE_BAD}`, boxSizing: 'border-box',
+      boxShadow: `0 0 0 2px ${C.bg}` }} />
+  );
+}
+const dotColor = (t) => (t.expected ? UNIT_COLORS[t.expected] : C.dim);
+export const WIRE_OK = '#7f8fb8';
+export const WIRE_BAD = '#ff4d4d';
+
+/**
+ * The STANDARD BOXES a user can add from the right-click menu, by category.
+ * `live` ones compute from whatever is wired into them right now; the others
+ * can be placed and wired, and compute once the graph runs the score.
+ */
+export const ADD_CATALOG = [
+  { cat: 'DATA', items: [
+    { type: 'fetcher', label: 'API fetch' },
+    { type: 'extract', label: 'Extract' },
+    { type: 'list', label: 'List extractor' },
+    { type: 'storage', label: 'Storage' },
+    { type: 'service', label: 'Service' },
+    { type: 'item', label: 'Dashboard item' },
+  ] },
+  { cat: 'MATH', items: [
+    { type: 'op', op: 'sum', label: 'Add (+)', live: true },
+    { type: 'op', op: 'sub', label: 'Subtract (−)', live: true },
+    { type: 'op', op: 'mul', label: 'Multiply (×)', live: true },
+    { type: 'op', op: 'div', label: 'Divide (÷)', live: true },
+    { type: 'op', op: 'min', label: 'Min', live: true },
+    { type: 'op', op: 'max', label: 'Max', live: true },
+  ] },
+  { cat: 'LOGIC', items: [
+    { type: 'compare', label: 'Compare (≥)', live: true },
+    { type: 'if', label: 'IF / ELSE', live: true },
+    { type: 'or', label: 'OR', live: true },
+  ] },
+  { cat: 'SHAPE', items: [
+    { type: 'mean', label: 'Average', live: true },
+    { type: 'filter', label: 'Filter' },
+    { type: 'selector', label: 'Selector' },
+    { type: 'join', label: 'Join' },
+    { type: 'curve', label: 'Curve (0-100)', live: true },
+  ] },
+  { cat: 'GROUP CONNECTORS', items: [
+    { type: 'input', label: 'Input', live: true, inGroup: true },
+    { type: 'output', label: 'Output', live: true, inGroup: true },
+  ] },
+  { cat: 'OTHER', items: [
+    { type: 'param', label: 'Parameter', live: true },
+    { type: 'group', label: 'Group', live: true },
+    { type: 'panel', label: 'Panel output' },
+  ] },
+];
+const OP_SYM = { sum: '+', sub: '−', mul: '×', div: '÷', min: 'MIN', max: 'MAX' };
+
+/** A number out of a shown value: "$4.2K" → 4200, "0.91x" → 0.91, "43.2%" → 43.2. */
+export function parseNum(val) {
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  if (val === null || val === undefined) return null;
+  const m = String(val).replace(/,/g, '').match(/-?\d+(\.\d+)?\s*([kKmMbB])?/);
+  if (!m) return null;
+  const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1;
+  return parseFloat(m[0]) * mult;
+}
+/** Is a shown value a "yes"? pass / clean / true / open / any positive number. */
+const truthy = (val) => {
+  if (val === null || val === undefined) return null;
+  const s = String(val).trim().toLowerCase();
+  if (/^(pass|clean|true|yes|open|no veto)/.test(s)) return true;
+  if (/^(veto|fail|false|no|taken)/.test(s)) return false;
+  const n = parseNum(val);
+  return n === null ? null : n > 0;
+};
+const fmtNum = (n) => (Number.isFinite(n) ? String(Math.round(n * 1000) / 1000) : null);
+
+/** An aggregate box: one colour wherever it sits, so it reads as its own kind. */
+export const AGG_COLOR = '#5eead4';
+
 const nodeColor = (n) => {
-  // An engine wears its own colour; a boundary port wears its source's.
-  if (n.kind === 'engine') return n.color || '#e7edff';
+  // A group wears the group colour; a boundary port wears its source's.
+  if (n.kind === 'engine') return GROUP_COLOR;
+  if (n.kind === 'field' && TYPE_COLORS[typeOf(n)]) return TYPE_COLORS[typeOf(n)];
   if (n.kind === 'port') return n.srcNode ? nodeColor(n.srcNode) : '#e7edff';
   if ((n.flat || n.page === 'pipe') && STAGES[n.stage]) return STAGES[n.stage].color;
   return n.kind === 'field' || n.kind === 'panel'
@@ -144,10 +291,86 @@ const ICON_PATHS = {
   // Into a bar / out of a bar: data crossing an engine's edge.
   'port-in': 'M3 12h11 M10 8l4 4-4 4 M19 4v16',
   'port-out': 'M5 4v16 M8 12h11 M15 8l4 4-4 4',
+  // Bars with a line across them: a collection reduced to one number.
+  aggregate: 'M5 20V13 M10 20V8 M15 20V11 M20 20V5 M3 10.5h19',
+  // A diamond: a condition with two ways out.
+  decision: 'M12 3l9 9-9 9-9-9z M9 12h6',
+  // A list with one row ticked: pick one of the inputs.
+  selector: 'M4 6h9 M4 12h9 M4 18h9 M15 12l2.5 2.5L22 9',
+  // Rows of a table with one column pulled out: a list read from a file.
+  list: 'M4 5h16 M4 10h16 M4 15h16 M4 20h10 M17 17l3 3-3 3',
+  // A funnel: keep some of a list, drop the rest.
+  filter: 'M3 5h18l-7 8v6l-4 2v-8z',
+  // A circle with an operator in it: one arithmetic step.
+  operation: 'M12 3a9 9 0 1 0 0.01 0 M8 12h8 M12 8v8',
+  // A bending line through a point: a number mapped onto 0-100.
+  curve: 'M3 20C9 20 10 4 21 4 M3 20h18 M3 20V3',
+  // A slider: a value you tune.
+  param: 'M4 8h16 M4 16h16 M9 5v6 M15 13v6',
+  // Two rings linked: this token matched against a list.
+  join: 'M9 12a5 5 0 1 0 0.01 0 M15 12a5 5 0 1 0 0.01 0',
+  // A page with one line pulled out of it.
+  extract: 'M5 3h9l4 4v6 M5 3v18h8 M9 12h4 M15 17h6 M18 14l3 3-3 3',
+  // A cloud: an API we fetch from.
+  fetcher: 'M7 18.5h10.5a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.3 9.3 4.6 4.6 0 0 0 7 18.5z',
+  // A screen: something the dashboard displays.
+  item: 'M3 5h18v11H3z M8 20h8 M12 16v4',
+  // A loop: a service that keeps running and keeps what it saw.
+  service: 'M20 12a8 8 0 1 1-2.34-5.66 M20 4v4h-4 M12 8v4l3 2',
 };
+/**
+ * What a box IS, read off its spec. One type per box; the type decides its
+ * icon, its colour and what its body shows.
+ */
+export const typeOf = (n) => {
+  if (n.kind === 'engine') return 'group';
+  if (n.kind === 'port') return 'port';
+  // An API we call is the fetcher; the raw file it fills is storage.
+  if (n.kind === 'provider') return 'fetcher';
+  if (n.kind === 'file') return 'storage';
+  if (n.kind === 'store') return 'storage';
+  if (n.kind === 'panel') return 'panel';
+  const f = n.field || {};
+  if (f.display) return 'item';
+  if (f.service) return 'service';
+  if (f.param) return 'param';
+  // One operator: a condition (IF, OR, SWITCH, a gate's check) or an
+  // operation (− + × ÷ SUM MIN MEAN COUNT CLAMP...).
+  if (f.portSpec) return f.portSpec.side === 'in' ? 'input' : 'output';
+  if (f.selector) return 'selector';
+  if (f.listSpec) return 'list';
+  if (f.opSpec && f.opSpec.filter) return 'filter';
+  if (f.opSpec) return f.opSpec.cond ? 'condition' : 'operation';
+  if (f.decision) return 'condition';
+  if (f.curve) return 'curve';
+  if (f.agg) return 'aggregate';
+  if (f.join) return 'join';
+  if (f.extract) return 'extract';
+  return 'math';
+};
+
+/** The special types wear their own colour; math keeps its pipeline step's. */
+export const TYPE_COLORS = {
+  aggregate: '#5eead4', condition: '#fb923c', operation: '#e2e8f0', filter: '#f0abfc', list: '#22d3ee', selector: '#86efac', input: '#e7edff', output: '#e7edff', curve: '#a78bfa',
+  param: '#94a3b8', join: '#38bdf8', extract: '#2ec4b6', service: '#fbbf24', item: '#60a5fa',
+};
+
+export const TYPE_NAMES = {
+  group: 'group', math: 'math', aggregate: 'aggregate', condition: 'condition', operation: 'operation', filter: 'filter', list: 'list extractor', selector: 'selector', input: 'group input', output: 'group output', curve: 'curve',
+  param: 'parameter', join: 'join / lookup', extract: 'extract', service: 'service', item: 'dashboard item',
+  fetcher: 'API fetch', storage: 'storage', panel: 'panel output', port: 'inlet / outlet',
+};
+
 const iconKind = (n) => {
   if (n.kind === 'port') return n.side === 'in' ? 'port-in' : 'port-out';
-  return n.kind === 'field' && n.flat ? 'step' : n.kind;
+  const t = typeOf(n);
+  if (t === 'math') return 'step';
+  if (t === 'group') return 'engine';
+  if (t === 'storage') return n.kind === 'file' ? 'file' : 'store';
+  if (t === 'condition') return 'decision';
+  if (t === 'input') return 'port-in';
+  if (t === 'output') return 'port-out';
+  return t;
 };
 
 function KindGlyph({ kind, color, size }) {
@@ -169,12 +392,6 @@ function KindGlyph({ kind, color, size }) {
 const BOX_FILL = '22';    // alpha suffix on the box colour, collapsed and open
 const BOX_STROKE = 'cc';
 const BOX_RADIUS = 6;
-/**
- * Clear space kept to the RIGHT of a calculation block, so a result pill can
- * sit astride its edge without the card body clipping the outer half. The body
- * scrolls, so its overflow-x cannot be visible.
- */
-const PILL_ROOM = 26;
 /** The box that names the token every per-token card is showing. */
 const TOKEN_PICKER_ID = 'f:pipe:THIS TOKEN';
 const boxLabelStyle = (n) => ({
@@ -187,15 +404,15 @@ const boxLabelStyle = (n) => ({
 
 /** What KIND of box this is, in words - shown when you hover its icon. */
 function subOf(n) {
-  if (n.kind === 'engine') return 'engine · ' + n.count + ' boxes inside · double-click to open';
+  if (n.kind === 'engine') return n.count + ' boxes inside · double-click to open';
   if (n.kind === 'port') return n.side === 'in' ? 'inlet · comes in from outside this engine' : 'outlet · leaves this engine';
   if (n.kind === 'provider') return 'provider we fetch from';
-  if (n.kind === 'file') return 'file in the raw store';
+  if (n.kind === 'file') return 'file in the raw store' + (clockOf(n.path) ? ' · ' + clockOf(n.path) : '');
   if (n.kind === 'store') return (STORES[n.id] || {}).backend || 'browser storage';
   // The double-click hint lives here now: it used to be the box's native
   // tooltip, which popped up over this one.
   if (n.kind === 'panel') return PAGE_TITLES[n.page] + ' · ' + n.count + ' fields · double-click to open';
-  if (n.flat && STAGES[n.stage]) return 'score pipeline · ' + STAGES[n.stage].title;
+  if (n.flat && STAGES[n.stage]) return 'step ' + STAGES[n.stage].title;
   return PAGE_TITLES[n.page] + ' · ' + n.group;
 }
 
@@ -228,7 +445,10 @@ function KindIcon({ node, color, size }) {
           background: '#0a1430f2', border: `1px solid ${color}88`, borderRadius: 5,
           padding: '4px 8px', fontSize: 10, color: C.text, whiteSpace: 'nowrap',
           boxShadow: '0 6px 18px #0009',
-        }}>{subOf(node)}</div>,
+        }}>
+          <div style={{ fontWeight: 800, letterSpacing: 0.6, color }}>{(TYPE_NAMES[typeOf(node)] || node.kind).toUpperCase()}</div>
+          {subOf(node) && <div style={{ color: C.dim, marginTop: 2 }}>{subOf(node)}</div>}
+        </div>,
         document.body,
       )}
     </>
@@ -253,45 +473,6 @@ function roundedPath(x, y, w, h, r) {
     + ` V ${y + rr} Q ${x} ${y} ${x + rr} ${y} Z`;
 }
 
-
-
-/**
- * Eases a map of numbers toward its target, frame by frame.
- *
- * In JS rather than in CSS because an SVG path's `d` cannot be transitioned:
- * a CSS glide would move the boxes and snap the arrows, leaving every line
- * detached from its box for the length of the animation. Driving both from
- * one number per frame keeps them together.
- */
-function useTween(target) {
-  const [value, setValue] = React.useState(() => new Map());
-  const ref = React.useRef(new Map());
-  React.useEffect(() => {
-    const from = new Map(ref.current);
-    const reduce = typeof window !== 'undefined' && window.matchMedia
-      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const dur = reduce ? 0 : GROW_MS;
-    const ease = (t) => 1 - Math.pow(1 - t, 3);
-    let raf = 0;
-    const start = performance.now();
-    const tick = (now) => {
-      const t = dur ? Math.min(1, (now - start) / dur) : 1;
-      const e = ease(t);
-      const next = new Map();
-      target.forEach((to, id) => {
-        const f = from.get(id) || 0;
-        next.set(id, f + (to - f) * e);
-      });
-      ref.current = next;
-      setValue(next);
-      if (t < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [target]);
-  return value;
-}
-
 /* ------------------------------------------------------------ toolbar --- */
 
 function Button({ onClick, children, title, active }) {
@@ -311,17 +492,6 @@ const SHORT_TAB = {
   rotation: 'ROTATION',
 };
 
-function Swatch({ color, label }) {
-  return (
-    <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 8.5, color: C.dim }}>
-      <span style={{
-        width: 9, height: 9, borderRadius: 2, flexShrink: 0,
-        border: `1px solid ${color}`, background: color + '33',
-      }} />
-      {label}
-    </span>
-  );
-}
 
 /**
  * Every colour on the canvas, named.
@@ -331,637 +501,8 @@ function Swatch({ color, label }) {
  * themselves. Since a line is drawn in the colour of the box it leaves, an
  * incomplete key makes the arrows unreadable too.
  */
-function Legend() {
-  return (
-    <div style={{
-      width: '100%', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
-      paddingTop: 2,
-    }}>
-      {/* The box TYPES, by the icon each box carries. */}
-      {[
-        ['provider', KIND_COLORS.provider, 'provider API'],
-        ['file', KIND_COLORS.file, 'server file'],
-        ['store', KIND_COLORS.store, 'browser storage'],
-        ['step', '#e7edff', 'calculation step'],
-        ['panel', '#e7edff', 'dashboard panel'],
-        ['engine', '#e7edff', 'engine (double-click to open)'],
-      ].map(([kind, color, label]) => (
-        <span key={kind} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 8.5, color: C.dim }}>
-          <KindGlyph kind={kind} color={color} size={12} />{label}
-        </span>
-      ))}
-      <span style={{ width: 1, height: 11, background: C.border }} />
-      <span style={{ fontSize: 8.5, color: C.grey }}>pipeline:</span>
-      <Swatch color={STAGES[2].color} label="inputs" />
-      <Swatch color={STAGES[3].color} label="components" />
-      <Swatch color={STAGES[4].color} label="gates" />
-      <Swatch color={STAGES[5].color} label="score" />
-      <span style={{ width: 1, height: 11, background: C.border }} />
-      <span style={{ fontSize: 8.5, color: C.grey }}>shown on:</span>
-      {Object.keys(SHORT_TAB).map((page) => (
-        <Swatch key={page} color={PAGE_COLORS[page]} label={SHORT_TAB[page]} />
-      ))}
-      <span style={{ width: 1, height: 11, background: C.border }} />
-      <span style={{ fontSize: 8.5, color: C.grey }}>
-        a line takes the colour of the box it leaves &middot; dashed = storage
-      </span>
-    </div>
-  );
-}
-
-/* --------------------------------------------------------- opened box --- */
-
-/**
- * An opened box grows DOWNWARD AND UPWARD ONLY - it keeps the width of the
- * box it came from.
- *
- * Growing sideways made a card straddle three columns, so opening one had to
- * shove its neighbours left and right as well as up and down and the diagram
- * lost its column structure for as long as the card was open. Keeping the
- * width means an open card lives inside its own column: the column simply
- * gets taller, and nothing outside it has to move at all.
- */
-// The CAP, not the size: an open card is as tall as what it holds, and only
-// scrolls past this. A fixed height left a provider with one row of wiring
-// as a tall empty slab.
-export const CARD_H = 520;
-
-/**
- * An open card is this wide - the reading width of the SCORE PIPELINE tab -
- * so a raw record, its highlighted keys and the wires to their outputs read the
- * same on the map as there. A box only 200px wide made all of it a squint.
- * It grows to the RIGHT and covers what is beside it; nothing moves.
- */
-export const CARD_W = 400;
-
-/** Long enough to read as the box stretching rather than as a cut. */
-const GROW_MS = 700;
-
-/**
- * The selected box, opened in place.
- *
- * It used to be a panel pinned to the right edge, which put the detail as
- * far from the thing it described as the window allows - you read a name on
- * the left and its working on the right, with the whole diagram in between.
- * Growing the box itself keeps the two together and keeps the arrows into
- * and out of it visible around the edges, so the context does not vanish
- * the moment you ask for the detail.
- *
- * It lives INSIDE the zoom transform, so it pans and scales with the map.
- * That is why selecting also lifts the zoom to a readable level: a box
- * opened at 13% would be a postage stamp.
- */
-/**
- * The (?) in front of a card title, holding every sentence ABOUT the box.
- *
- * The box itself is kept for wiring, values and arithmetic; the prose that
- * used to fill it lives here. Hover shows it, a click pins it (so a link in it
- * can be reached), a second click or the x unpins.
- *
- * Rendered through a PORTAL into <body>: the card clips its overflow and sits
- * inside the zoom transform, so a popover drawn inside it would be cut off and
- * shrink with the map. Fixed to the icon's screen rectangle instead.
- */
-function Info({ children, accent }) {
-  const ref = React.useRef(null);
-  const [hovered, setHovered] = React.useState(false);
-  const [pinned, setPinned] = React.useState(false);
-  const leave = React.useRef(null);
-  const open = hovered || pinned;
-  const enter = () => { clearTimeout(leave.current); setHovered(true); };
-  // A short grace period, so the pointer can cross from the icon into the
-  // popover without it closing in between.
-  const exit = () => { leave.current = setTimeout(() => setHovered(false), 160); };
-  React.useEffect(() => () => clearTimeout(leave.current), []);
-
-  let place = null;
-  if (open && ref.current) {
-    const r = ref.current.getBoundingClientRect();
-    const W = 320;
-    const left = Math.max(8, Math.min(window.innerWidth - W - 8, r.left));
-    const below = r.bottom + 6;
-    place = below > window.innerHeight - 200
-      ? { left, bottom: window.innerHeight - r.top + 6, width: W }
-      : { left, top: below, width: W };
-  }
-
-  return (
-    <>
-      <span
-        ref={ref}
-        onMouseEnter={enter}
-        onMouseLeave={exit}
-        // Not a drag of the card, and not the canvas either.
-        onMouseDown={(e) => e.stopPropagation()}
-        onClick={(e) => { e.stopPropagation(); setPinned((p) => !p); }}
-        title=""
-        style={{
-          width: 14, height: 14, borderRadius: '50%', flexShrink: 0, marginTop: 1,
-          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 9, fontWeight: 700, cursor: 'pointer', userSelect: 'none',
-          color: pinned ? '#0a1430' : accent, background: pinned ? accent : 'transparent',
-          border: `1px solid ${accent}`,
-        }}>?</span>
-      {place && ReactDOM.createPortal(
-        <div
-          onMouseEnter={enter}
-          onMouseLeave={exit}
-          onMouseDown={(e) => e.stopPropagation()}
-          style={{
-            position: 'fixed', ...place, zIndex: 60, maxHeight: '60vh', overflow: 'auto',
-            background: '#0a1430f7', border: `1px solid ${accent}88`, borderRadius: 8,
-            padding: '9px 11px', fontSize: 10, lineHeight: 1.6, color: C.text,
-            boxShadow: '0 10px 30px #000a',
-          }}>
-          {pinned && (
-            <div onClick={() => setPinned(false)} title="close" style={{
-              float: 'right', cursor: 'pointer', color: C.faint, fontSize: 13, lineHeight: 1, marginLeft: 8,
-            }}>&times;</div>
-          )}
-          {children}
-        </div>,
-        document.body,
-      )}
-    </>
-  );
-}
 
 const MONO_STACK = 'ui-monospace, Menlo, Consolas, monospace';
-
-/** A link that opens in a new tab - inside the popover, so it needs a pin. */
-function OutLink({ url, mono }) {
-  return (
-    <div onClick={() => window.open(url, '_blank', 'noopener,noreferrer')} style={{
-      marginTop: 8, cursor: 'pointer', fontSize: 9.5, color: C.blue, wordBreak: 'break-all',
-      fontFamily: mono ? MONO_STACK : 'inherit',
-    }}>{url} ↗</div>
-  );
-}
-
-/** The plain-words `shows` list, flattened for the popover. */
-function ShowsList({ shows, accent }) {
-  const list = Array.isArray(shows) ? shows : [shows];
-  return (
-    <ul style={{ listStyle: 'none', margin: '6px 0 0', padding: 0 }}>
-      {list.map((item, i) => (
-        <li key={i} style={{ margin: '0 0 4px', display: 'flex', gap: 6 }}>
-          <span style={{ color: accent, opacity: 0.7 }}>&bull;</span>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <span>{typeof item === 'string' ? item : item.t}</span>
-            {typeof item !== 'string' && item.sub && (
-              <ul style={{ listStyle: 'none', margin: '3px 0 4px', padding: '0 0 0 10px' }}>
-                {item.sub.map((s, j) => (
-                  <li key={j} style={{ color: C.dim, margin: '0 0 2px' }}>&ndash; {s}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-/** Which box is selected, and its neighbours - read by every open card. */
-const SelCtx = React.createContext({ selected: null, near: null });
-
-function CardShell({ node, at, grow, onDragStart, onAnchors, title, accent, onClose, info, children }) {
-  const sel = React.useContext(SelCtx);
-  const isSel = sel.selected === node.id;
-  const isNear = Boolean(sel.near && sel.near.has(node.id));
-  // Height is interpolated from the box's own height to the open one, so the
-  // first frame IS the box and the last is the card. Width never changes.
-  const g = grow === undefined ? 1 : grow;
-  // The content's own height, measured below. The body is flex:1 and would
-  // report the card's height back, so it is the INNER wrapper that is read.
-  const headRef = React.useRef(null);
-  const innerRef = React.useRef(null);
-  const [natural, setNatural] = React.useState(CARD_H);
-  React.useLayoutEffect(() => {
-    if (!headRef.current || !innerRef.current) return;
-    // + body padding (9 + 9, or 9 + 22 with a (?)) + border (2 x 1).
-    const want = headRef.current.offsetHeight + innerRef.current.offsetHeight + (info ? 33 : 20);
-    const next = Math.min(CARD_H, Math.max(node.h, want));
-    if (Math.abs(next - natural) > 1) setNatural(next);
-  });
-  const h = node.h + (natural - node.h) * g;
-  const w = node.w + (Math.max(node.w, CARD_W) - node.w) * g;
-  const left = at.x;
-  const top = at.y + node.h / 2 - h / 2;
-
-  /**
-   * Where each neighbour row sits, in the map's own coordinates, so the
-   * arrows can be drawn to it.
-   *
-   * Measured from the DOM rather than calculated: the rows are laid out by
-   * flow, they move as the card grows, and the body scrolls. Measured with
-   * bounding boxes, divided back out of the zoom: `offsetTop` broke twice -
-   * once when the (?) button came after the body (so "the last child" was no
-   * longer the scrolling one), and again when the flow rows became positioned
-   * boxes (so offsetTop was relative to the row block, not the card). A
-   * screen-space measurement includes the scroll and any nesting for free.
-   *
-   * A row scrolled out of sight is clamped to the card's edge, so its arrow
-   * still points at the card instead of wandering off above it.
-   */
-  const rootRef = React.useRef(null);
-  const lastSig = React.useRef('');
-  React.useLayoutEffect(() => {
-    const root = rootRef.current;
-    if (!root || !onAnchors) return;
-    const rootBox = root.getBoundingClientRect();
-    // Screen pixels per map pixel: the card lives inside the zoom transform.
-    const k = root.offsetHeight ? rootBox.height / root.offsetHeight : 1;
-    const out = [];
-    root.querySelectorAll('[data-anchor]').forEach((el) => {
-      const r = el.getBoundingClientRect();
-      const mid = (r.top + r.height / 2 - rootBox.top) / (k || 1);
-      const side = el.getAttribute('data-side');
-      // One element can anchor SEVERAL neighbours (comma-separated): a step's
-      // single result is where every one of its outgoing arrows leaves from.
-      // Where the PORT itself is, in map pixels. A row chip sits a few pixels
-      // inside the card and a nub carried the line the rest of the way; a dot
-      // on a record block is ~19px in, which is too far for a nub and is what
-      // made a line stop at the card's border and never reach its circle. The
-      // arrow layer is drawn above the cards, so it can simply go there.
-      const ownX = side === 'in'
-        ? left + (r.left - rootBox.left) / (k || 1)
-        : left + (r.right - rootBox.left) / (k || 1);
-      String(el.getAttribute('data-anchor')).split(',').filter(Boolean).forEach((id) => {
-        out.push({
-          id, side,
-          y: top + Math.max(8, Math.min(h - 8, mid)),
-          edgeX: side === 'in' ? left : left + w,
-          // Clamped inside the card, so a mis-measured row cannot throw the
-          // endpoint out onto the canvas.
-          portX: Math.max(left, Math.min(left + w, ownX)),
-        });
-      });
-    });
-    // Only report a real change, or setting state from a layout effect would
-    // render, measure, and report for ever.
-    const sig = out.map((a) => a.id + a.side + Math.round(a.y) + ':' + Math.round(a.portX || 0)).join('|');
-    if (sig === lastSig.current) return;
-    lastSig.current = sig;
-    onAnchors(node.id, out);
-  });
-
-  return (
-    <div
-      ref={rootRef}
-      data-card="1"
-      // The canvas pans on mousedown and zooms on wheel. Inside the box both
-      // are wrong: a drag is a text selection and a wheel is a scroll.
-      onMouseDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
-      onDoubleClick={(e) => e.stopPropagation()}
-      style={{
-        position: 'absolute',
-        // Grown from the box's own centre, so it reads as that box opening
-        // rather than as a dialogue that happened to appear nearby.
-        left,
-        // Centred on where the box was, so it opens evenly up and down.
-        top,
-        width: w, height: h, overflow: 'hidden', zIndex: 40,
-        display: 'flex', flexDirection: 'column', cursor: 'default',
-        // The canvas turns selection off for panning; a card's numbers and
-        // formulas are worth copying, so it turns it back on.
-        userSelect: 'text', WebkitUserSelect: 'text',
-        background: 'rgba(8,14,32,.985)', borderRadius: BOX_RADIUS,
-        // Selected: a solid glowing border. A neighbour of the selected box:
-        // its border at full colour. Neither changes the card's size.
-        border: `1px solid ${isSel || isNear ? accent : accent + BOX_STROKE}`,
-        boxShadow: isSel
-          ? `0 0 0 2px ${accent}, 0 0 22px ${accent}88, 0 18px 50px rgba(0,0,0,.7)`
-          : (isNear ? `0 0 0 1px ${accent}, 0 18px 50px rgba(0,0,0,.7)`
-            : '0 18px 50px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.05)'),
-      }}
-    >
-      {/* The header IS the collapsed box: same height, padding, fill, icon
-          and title style, so opening only adds the body beneath it. Height
-          minus the card's 1px top border (the bottom border is inside it). */}
-      <div
-        ref={headRef}
-        onMouseDown={onDragStart}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px',
-          height: node.h - 1, boxSizing: 'border-box',
-          borderBottom: `1px solid ${accent}44`, flexShrink: 0, cursor: 'grab',
-          background: accent + BOX_FILL,
-        }}>
-        <KindIcon node={node} color={accent} />
-        <span style={boxLabelStyle(node)}>{title}</span>
-        <div onClick={onClose} title="close" style={{
-          cursor: 'pointer', color: C.faint, fontSize: 13, lineHeight: 1, padding: '0 1px', flexShrink: 0,
-        }}>&times;</div>
-      </div>
-      {/* Room at the bottom for the (?) when there is one, so it never sits
-          on top of the last row. */}
-      <div style={{ flex: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'auto', padding: info ? '9px 9px 22px' : 9 }}>
-        {/* flow-root, or the first section's top margin collapses out of
-            the wrapper and the measured height comes up short. */}
-        <div ref={innerRef} style={{ display: 'flow-root' }}>{children}</div>
-      </div>
-      {info && (
-        <div style={{ position: 'absolute', right: 8, bottom: 6 }}>
-          {/* Always orange, whatever the box's colour - it is the one
-              control on every card, so it should be found at a glance. */}
-          <Info accent={KIND_COLORS.provider}>{info}</Info>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
- * The neighbours of an open box, ONE PER ROW.
- *
- * They used to wrap as a bag of chips. One per row is what lets each arrow
- * land on the row that names it: every neighbour then has a y of its own,
- * and the line can arrive beside the name of where it came from instead of
- * at the middle of the box with eleven others.
- *
- * `side` decides which way the row faces - inputs sit against the left edge
- * where their arrows arrive, outputs against the right where theirs leave -
- * and the nub carries the line the last few pixels through the card's
- * padding, which the arrow itself cannot do: the card is opaque and painted
- * over the SVG the arrows live in.
- */
-function Neighbours({ title, list, onPick, side, accent }) {
-  if (!list.length) return null;
-  const inbound = side === 'in';
-  return (
-    <div style={{ marginTop: 12 }}>
-      <div style={{
-        fontSize: 8, letterSpacing: 1, fontWeight: 700, color: C.grey, marginBottom: 5,
-        textAlign: inbound ? 'left' : 'right',
-      }}>{title}</div>
-      {list.map((n) => {
-        const col = nodeColor(n);
-        // The nub is the stub of the LINE, so it wears the line’s colour: a
-        // line is drawn in the colour of the box it leaves, which for an input
-        // is the neighbour and for an output is this box.
-        const lineCol = inbound ? col : (accent || col);
-        const nub = (
-          <span style={{
-            width: 9, height: 1, background: lineCol, flexShrink: 0, opacity: 0.85,
-            marginLeft: inbound ? -9 : 0, marginRight: inbound ? 0 : -9,
-          }} />
-        );
-        return (
-          <div key={n.id + ':' + side} style={{
-            display: 'flex', alignItems: 'center', margin: '0 0 3px',
-            justifyContent: inbound ? 'flex-start' : 'flex-end',
-          }}>
-            {inbound && nub}
-            <span
-              data-anchor={n.id}
-              data-side={side}
-              onClick={() => onPick(n.id)}
-              style={{
-                cursor: 'pointer', fontSize: 9, padding: '2px 7px', borderRadius: 6,
-                border: `1px solid ${col}55`, background: col + '14', color: col,
-                maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}>{n.label}</span>
-            {!inbound && nub}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-/* ------------------------------------------------- the box as a flow --- */
-
-/**
- * An open box drawn as the flow it is: what comes IN, what happens to it,
- * what goes OUT - top to bottom, with arrows.
- *
- *     IN    [neighbour] ──── what it carries ─┐
- *           [neighbour] ──── what it carries ─┤
- *                                             ▼
- *     ┌ COMPUTED / FETCHED / ON DISK ──────────┐
- *     │ the formula, with this token's numbers │
- *     └──────────────────────────────────────── ┘
- *     ▼ = result
- *     ├───▶ [reader]  how it uses it
- *     └───▶ [reader]
- *
- * The question "where does the calculation go when there is one between the
- * input and the output" answers itself in this shape: in the MIDDLE, where
- * the data actually passes through it. A plain fetch puts its source order
- * there instead; a file puts itself there.
- *
- * Inputs stay against the LEFT edge and outputs against the RIGHT, because
- * that is where the map's own arrows arrive and leave: the chips still carry
- * `data-anchor`, so an outside line lands on the row naming its neighbour.
- * The rows sit at the top and the bottom of a content-sized card, so the
- * anchoring survives - the old FED-BY-first rule existed because a fixed-
- * height card hid the rows below the fold.
- */
-function FlowRows({ side, rows, accent, onPick, title }) {
-  if (!rows.length) return null;
-  const inbound = side === 'in';
-  return (
-    <div style={{ position: 'relative', marginTop: inbound ? 4 : 0 }}>
-      <div style={{
-        fontSize: 7.5, letterSpacing: 1.1, fontWeight: 800, color: C.grey, marginBottom: 4,
-        textAlign: inbound ? 'left' : 'right',
-      }}>{title}</div>
-      {/* Outputs leave along a bus on the left. Inputs have none: they are a
-          plain list on the left, straight above the box they feed - a bus and
-          a down-arrow there only drew a second path to the same place. */}
-      {!inbound && (
-        <div style={{
-          position: 'absolute', top: 15, bottom: 9, width: 1.5,
-          left: 3, background: accent, opacity: 0.6,
-        }} />
-      )}
-      {rows.map((r) => {
-        const col = nodeColor(r.node);
-        // The nub carries the MAP's arrow through the card padding to the
-        // chip, in that line's colour: an input's line is its source's colour,
-        // an output's line is this box's.
-        const nub = (
-          <span style={{
-            width: 9, height: 1, background: inbound ? col : accent, flexShrink: 0, opacity: 0.85,
-            marginLeft: inbound ? -9 : 0, marginRight: inbound ? 0 : -9,
-          }} />
-        );
-        const chip = (
-          <span
-            data-anchor={r.anchorKey || r.node.id}
-            data-side={side}
-            onClick={() => onPick(r.node.id)}
-            title={r.label ? r.label + ' \u2014 from ' + r.node.label : r.node.label}
-            style={{
-              cursor: 'pointer', fontSize: 9, padding: '2px 6px', borderRadius: 6, flexShrink: 1,
-              border: `1px solid ${col}55`, background: col + '14', color: col, minWidth: 0,
-              maxWidth: '62%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-            }}>{r.label || r.node.label}</span>
-        );
-        // What travels along this arrow, written ON the arrow.
-        const carried = r.carries ? (
-          <span style={{
-            fontSize: 8.5, fontWeight: 700, color: C.white, flexShrink: 0, maxWidth: 92,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', padding: '0 3px',
-          }} title={r.carries}>{r.carries}</span>
-        ) : null;
-        const line = <span style={{ flex: 1, minWidth: 6, height: 1, background: accent, opacity: 0.45 }} />;
-        return inbound ? (
-          <div key={r.node.id} style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '0 0 3px' }}>
-            {nub}{chip}{carried}
-          </div>
-        ) : (
-          <div key={r.node.id} style={{ display: 'flex', alignItems: 'center', margin: '0 0 3px', paddingLeft: 4 }}>
-            <span style={{ width: 4, height: 1, background: accent, opacity: 0.6, flexShrink: 0 }} />
-            {carried}{line}
-            <span style={{ fontSize: 7, color: accent, opacity: 0.8, marginRight: 2, flexShrink: 0 }}>&#9654;</span>
-            {chip}{nub}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-/**
- * The key a SPLIT line is anchored by, at both ends.
- *
- * A collapsed arrow between two boxes can stand for several field-to-field
- * links. While either end is open those links are drawn as separate lines, and
- * each needs its own anchor - keying them by the neighbour's id alone would
- * make three rows feeding RAW fight over one anchor and only the last would
- * win. The key names the LINK, so a line leaves the formula that produced it
- * and lands on the row that consumes it.
- */
-const partKey = (fromId, toId) => fromId + '>' + toId;
-
-/** A down arrow between two parts of the flow, optionally carrying a value. */
-function FlowDown({ align, accent, label, outIds }) {
-  // As the box's OUTPUT node: the result carries every outgoing arrow, with a
-  // line from it to the card's right edge where those arrows leave.
-  const isOut = Boolean(outIds && outIds.length);
-  // The output node sits on the RIGHT, beside the edge its arrows leave from,
-  // with a short connecting line to that edge.
-  if (isOut) {
-    // The result sits ASTRIDE the card's right edge - half in, half out - the
-    // same way a collapsed box wears its output count, so a box's output reads
-    // as leaving it rather than as a number parked inside it. -9px clears the
-    // body padding and translateX(50%) centres the pill on the edge, which is
-    // also where its arrows leave, so the old stub line to the edge is gone.
-    return (
-      <div style={{ position: 'relative', height: 18, margin: '5px 0 3px' }}>
-        <span
-          data-anchor={outIds.join(',')}
-          data-side="out"
-          style={{
-            position: 'absolute', right: -9, top: '50%',
-            transform: 'translate(50%, -50%)',
-            fontSize: 12, fontWeight: 800, color: C.white, padding: '1px 7px', borderRadius: 6,
-            background: C.bg, border: `1px solid ${accent}aa`, flexShrink: 0,
-            whiteSpace: 'nowrap', boxShadow: `0 0 0 2px ${C.bg}`,
-          }}>{label}</span>
-      </div>
-    );
-  }
-  return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 5, margin: '1px 0',
-      justifyContent: align === 'right' ? 'flex-end' : 'flex-start',
-    }}>
-      {align !== 'right' && <span style={{ fontSize: 9, color: accent, lineHeight: 1 }}>&#9660;</span>}
-      {label !== null && label !== undefined && label !== '' && (
-        <span style={{
-          fontSize: 12, fontWeight: 800, color: C.white, padding: '1px 7px', borderRadius: 6,
-          background: accent + '22', border: `1px solid ${accent}66`, flexShrink: 0,
-        }}>{label}</span>
-      )}
-      {align === 'right' && <span style={{ fontSize: 9, color: accent, lineHeight: 1 }}>&#9660;</span>}
-    </div>
-  );
-}
-
-/** The middle of the flow: what happens to the data. */
-function Machine({ title, accent, right, children }) {
-  return (
-    <div style={{
-      border: `1px solid ${accent}66`, borderRadius: 6, background: accent + '0d',
-      padding: '5px 7px 6px', margin: '2px 0',
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-        <span style={{ fontSize: 7.5, letterSpacing: 1.1, fontWeight: 800, color: accent, flex: 1 }}>{title}</span>
-        {right}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-/**
- * `single`: the box has ONE output value (a pipeline step, a field). Then
- * there is no list of readers - the result is the output node and every
- * outgoing arrow leaves from it; who reads it is what the arrows show. A file,
- * provider or panel hands DIFFERENT data to each neighbour, so it keeps its
- * per-neighbour rows, each saying what that neighbour takes.
- */
-function FlowBody({ ins, outs, accent, onPick, inTitle, outTitle, machine, result, single }) {
-  const asOutput = single && result;
-  // A result straddling the CALCULATION block's edge needs half its width of
-  // clear space to the right of that block, because the card body clips
-  // horizontally (overflowX hidden, which a scrollable body cannot avoid).
-  // Without it the pill is cut in half and reads as "=" with no number.
-  if (asOutput && machine) {
-    return (
-      <div>
-        <FlowRows side="in" rows={ins} accent={accent} onPick={onPick} title={inTitle || 'IN'} />
-        <div style={{ position: 'relative', paddingRight: PILL_ROOM }}>
-          {machine}
-          <span
-            data-anchor={outs.map((r) => r.node.id).join(',')}
-            data-side="out"
-            style={{
-              position: 'absolute', right: PILL_ROOM, top: '50%',
-              transform: 'translate(50%, -50%)',
-              fontSize: 12, fontWeight: 800, color: C.white, padding: '1px 7px', borderRadius: 6,
-              background: C.bg, border: `1px solid ${accent}aa`, whiteSpace: 'nowrap',
-              boxShadow: `0 0 0 2px ${C.bg}`,
-            }}>{result}</span>
-        </div>
-      </div>
-    );
-  }
-  return (
-    <div>
-      <FlowRows side="in" rows={ins} accent={accent} onPick={onPick} title={inTitle || 'IN'} />
-      {machine}
-      {asOutput ? (
-        <FlowDown align="left" accent={accent} label={result} outIds={outs.map((r) => r.node.id)} />
-      ) : (
-        <>
-          {(machine || result) && outs.length > 0 && <FlowDown align="left" accent={accent} label={result} />}
-          {!machine && !outs.length && result && <FlowDown align="left" accent={accent} label={result} />}
-          <FlowRows side="out" rows={outs} accent={accent} onPick={onPick} title={outTitle || 'OUT'} />
-        </>
-      )}
-    </div>
-  );
-}
-
-/* -------------------------------------- what travels along each arrow --- */
-
-const flowShort = (val) => {
-  if (val === null || val === undefined || val === '') return null;
-  if (typeof val !== 'string' && typeof val !== 'number') return null;
-  const s = String(val);
-  return s.length > 16 ? s.slice(0, 15) + '…' : s;
-};
-
-/** Every operand token a card names as an input. */
-const inTokens = (field) => [].concat(field.calc || [], field.fetch || [], field.via ? [field.via] : [])
-  .filter((t) => t && typeof t === 'object' && t.t && t.t !== 'op' && t.t !== 'num');
-
 /**
  * How often the collector rewrites each file - the server's own intervals
  * (Vibe-mm-server/server.js), so a file box can say how fresh what it holds is.
@@ -981,125 +522,88 @@ const FILE_CLOCK = [
 ];
 const clockOf = (path) => (FILE_CLOCK.find(([re]) => re.test(path)) || [null, null])[1];
 
-/** A raw file, to the slot of `v.pipe.raw` holding this token's record in it. */
-const FILE_SLOT = [
-  [/market\.json$/, 'market'], [/trades\.json$/, 'trades'], [/history\.json$/, 'history'],
-  [/intel\.json$/, 'intel'], [/reference\.json$/, 'reference'], [/ethos\.json$/, 'ethos'],
-  [/perps\.json$/, 'perps'], [/promotion\.json$/, 'promotion'],
-];
-const slotOfPath = (path) => (FILE_SLOT.find(([re]) => re.test(path)) || [null, null])[1];
-
-/**
- * Where each provider's answer sits inside this token's records: GoPlus is
- * `intel.goplus`, DexScreener is `market.sources.dexscreener`, and so on - the
- * keys the collector files each provider's payload under.
- */
-const PROVIDER_PARTS = {
-  dexscreener: [['market', 'sources.dexscreener'], ['promotion', 'rows']],
-  hyperliquid: [['perps', 'venues.hyperliquid']],
-  binance: [['perps', 'venues.binance']],
-  aster: [['perps', 'venues.aster']],
-  okx: [['perps', 'venues.okx']],
-  bybit: [['perps', 'venues.bybit']],
-  geckoterminal: [['market', 'sources.geckoterminal'], ['trades', 'trades'], ['history', '[]']],
-  jupiter: [['market', 'sources.jupiter'], ['intel', 'jupiterQuote'], ['intel', 'jupiterToken']],
-  kyberswap: [['intel', 'kyberQuote']],
-  goplus: [['intel', 'goplus']],
-  rugcheck: [['intel', 'rugcheck']],
-  honeypot: [['intel', 'honeypot']],
-  cex: [['reference', 'quotes']],
-  ethos: [['ethos', 'token'], ['ethos', 'profile']],
-};
-
-/**
- * Every key the pipeline reads out of one record (optionally only under one
- * prefix), wired to the step that reads it, valued with that step's value.
- * The union of the input steps' own `raw.picks`, so a file box and a provider
- * box can never claim a key no step reads.
- */
-/**
- * The record a card draws when the selected token has none.
- *
- * Every leaf becomes "-". The shape comes from the FILE when it declares one
- * (ethos.json carries `shape`), because only the file knows the keys nothing
- * currently reads; otherwise it is rebuilt from the paths the pipeline picks
- * out of it, which is at least every key that matters to a score.
- *
- * Drawing the empty shape rather than falling back to a list of readers is
- * the point: the card then looks the same whether or not the data arrived,
- * and the gap reads as "no value yet" instead of as a different card.
- */
-function skeletonOf(shape, picks) {
-  const blank = (v) => {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const out = {};
-      Object.keys(v).forEach((k) => { out[k] = blank(v[k]); });
-      return out;
-    }
-    return '-';
-  };
-  if (shape && typeof shape === 'object') return blank(shape);
-  if (!picks || !picks.length) return null;
-  const out = {};
-  picks.forEach((p) => {
-    // 'profile.score' -> out.profile.score; array steps are left alone.
-    const parts = String(p.path).split('.');
-    let at = out;
-    parts.forEach((key, i) => {
-      if (i === parts.length - 1) { at[key] = '-'; return; }
-      if (!at[key] || typeof at[key] !== 'object') at[key] = {};
-      at = at[key];
-    });
-  });
-  return Object.keys(out).length ? out : null;
-}
-
-function recordReaders(allFields, slot, prefix) {
-  const under = (p) => !prefix || p === prefix || p.startsWith(prefix + '.') || p.startsWith(prefix + '[');
-  const picks = [];
-  const outs = [];
-  const idOf = {};
-  (allFields || []).forEach((fn) => { if (!idOf[fn.label]) idOf[fn.label] = fn.id; });
-
-  // The ports a FILE has are a property of the file, not of some box standing
-  // in front of it. RAW says which keys are read out of each file; RELAY_
-  // CONSUMERS says which box reads each one.
-  Object.keys(RAW_PORTS || {}).forEach((label) => {
-    const r = RAW_PORTS[label];
-    if (!r || r.from !== slot) return;
-    const readers = RELAY_CONSUMERS[label] || [label];
-    (r.picks || []).filter((p) => under(p.path)).forEach((p) => {
-      readers.forEach((to) => {
-        if (!idOf[to]) return;
-        picks.push({ path: p.path, to, toId: idOf[to], alt: p.alt });
-      });
-    });
-  });
-
-  // A box that still declares its own record (the token list, the identity
-  // step) keeps its outputs listed, because its card draws them.
-  (allFields || []).forEach((fn) => {
-    const r = fn.field && fn.field.raw;
-    if (!r || r.from !== slot) return;
-    outs.push({ label: fn.label, value: (vv) => (fn.field.value ? fn.field.value(vv) : null) });
-  });
-  return { picks, outs, last: slot === 'history' };
-}
-
 /* --------------------------------------------------------------- view --- */
 
 /* ------------------------------------------------------------ engines --- */
 
+/**
+ * THE CONNECTOR - one design for every input and output on the map: a
+ * group's IN / OUT and a user's INPUT / OUTPUT alike. A round node and, beside
+ * it, a slim name field. The name is edited in place (Enter or click away);
+ * the parent group's dot carries the same name. The round node shows the data
+ * arriving on hover. An input also has an outlet dot to drag a wire from.
+ */
+function ConnectorNode({ n, pos, col, dim, isSel, v, side, label, onRename, onMouseDown, onClick, onDoubleClick,
+  onHover, onStartWire, onContextMenu, value }) {
+  const [tip, setTip] = React.useState(null);
+  const ref = React.useRef(null);
+  const show = () => {
+    const r = ref.current && ref.current.getBoundingClientRect();
+    if (r) setTip({ x: side === 'in' ? r.left : r.right, y: r.top - 6 });
+    onHover(true);
+  };
+  const stop = (e) => e.stopPropagation();
+  const knob = (
+    <div ref={ref} onMouseEnter={show} onMouseLeave={() => { setTip(null); onHover(false); }}
+      style={{
+        position: 'relative', width: CONNECTOR_H, height: CONNECTOR_H, flexShrink: 0, boxSizing: 'border-box',
+        borderRadius: '50%', background: '#060d22', border: `${isSel ? 2.4 : 1.6}px solid ${col}`,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        boxShadow: isSel ? `0 0 10px ${col}` : 'none',
+      }}>
+      <KindGlyph kind={side === 'in' ? 'port-in' : 'port-out'} color={col} size={12} />
+      {side === 'in' && <Outlet col={col} onMouseDown={onStartWire} style={{ right: -5 }} />}
+    </div>
+  );
+  const field = (
+    <input key={label} defaultValue={label} spellCheck={false} title="rename - the group's dot takes the same name"
+      onMouseDown={stop} onClick={stop} onDoubleClick={stop}
+      onBlur={(e) => { if (e.target.value.trim() && e.target.value.trim().toUpperCase() !== label) onRename(e.target.value); }}
+      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); if (e.key === 'Escape') { e.currentTarget.value = label; e.currentTarget.blur(); } }}
+      style={{
+        flex: 1, minWidth: 0, height: 20, boxSizing: 'border-box', padding: '0 7px', borderRadius: 10,
+        background: 'transparent', border: `1px solid ${col}44`, color: C.white, outline: 'none',
+        fontFamily: 'inherit', fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase',
+        textAlign: side === 'in' ? 'left' : 'right',
+      }}
+      onFocus={(e) => { e.currentTarget.style.borderColor = col; e.currentTarget.style.background = '#0d1730'; }}
+      onBlurCapture={(e) => { e.currentTarget.style.borderColor = col + '44'; e.currentTarget.style.background = 'transparent'; }} />
+  );
+  return (
+    <>
+      <div data-node-id={n.id} onMouseDown={onMouseDown} onClick={onClick} onDoubleClick={onDoubleClick} onContextMenu={onContextMenu}
+        style={{
+          position: 'absolute', left: pos.x, top: pos.y, width: n.w, height: n.h, display: 'flex', alignItems: 'center',
+          gap: 6, cursor: 'grab', opacity: dim ? 0.3 : 1, flexDirection: side === 'in' ? 'row' : 'row-reverse',
+        }}>
+        {knob}
+        {field}
+      </div>
+      {tip && ReactDOM.createPortal(
+        <div style={{
+          position: 'fixed', left: tip.x, top: tip.y, transform: side === 'in' ? 'translate(0, -100%)' : 'translate(-100%, -100%)',
+          zIndex: 60, pointerEvents: 'none', background: '#0a1430f2', border: `1px solid ${col}88`, borderRadius: 6,
+          padding: '4px 8px', fontSize: 10, color: C.text, whiteSpace: 'nowrap', boxShadow: '0 6px 18px #0009',
+        }}>
+          <span style={{ color: C.dim }}>{side === 'in' ? 'IN · ' : 'OUT · '}</span>
+          {label}{value !== null && value !== undefined && <b style={{ color: C.white, marginLeft: 6 }}>{value}</b>}
+        </div>,
+        document.body,
+      )}
+    </>
+  );
+}
+
 /** A box's outlet dot, on its right edge: press and drag to draw a sketch wire. */
-function Outlet({ col, onMouseDown, style }) {
+function Outlet({ col, onMouseDown, style, title, missing }) {
   return (
     <span
       onMouseDown={onMouseDown}
       onClick={(e) => e.stopPropagation()}
-      title="drag to another box to draw a sketch wire"
+      title={title || 'drag to another box to draw a sketch wire'}
       style={{
         position: 'absolute', right: -5, top: '50%', width: 9, height: 9, marginTop: -4.5,
-        borderRadius: '50%', background: C.bg, border: `1.5px solid ${col}`, cursor: 'crosshair',
+        borderRadius: '50%', background: C.bg, border: `1.5px ${missing ? 'dashed' : 'solid'} ${missing ? WIRE_BAD : col}`, cursor: 'crosshair',
         boxSizing: 'border-box', ...(style || {}),
       }} />
   );
@@ -1114,17 +618,928 @@ function Outlet({ col, onMouseDown, style }) {
  * in. Drop a box onto it to move that box inside. Drag from an outlet to draw
  * a sketch wire from that value.
  */
-function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClick, onDoubleClick,
-  onHover, onStartWire, v, nodeById }) {
+/** A calculation box's width: wider than a group, for its working. */
+export const CALC_W = 300;
+
+/**
+ * The formula as DATA: each input named by what it is (Volume 5m history,
+ * Buyer breadth), never by the file or box it came through - following a
+ * wire to its source is what the map is for.
+ */
+function FormulaText({ tokens }) {
+  return (
+    <span style={{ lineHeight: 1.7 }}>
+      {(tokens || []).map((t, i) => {
+        if (!t) return null;
+        if (t.t === 'op') return <span key={i} style={{ color: C.dim }}>{' ' + t.s + ' '}</span>;
+        if (t.t === 'num') return <span key={i} style={{ color: C.white, fontWeight: 700 }}>{' ' + t.s + ' '}</span>;
+        const name = t.t === 'ref' ? t.label || t.field
+          : t.t === 'api' ? t.field
+            : t.t === 'ext' ? t.field || t.source : null;
+        if (!name) return null;
+        return (
+          <span key={i} style={{
+            display: 'inline-block', padding: '0 5px', margin: '0 1px', borderRadius: 4,
+            border: `1px solid ${C.teal}55`, background: C.teal + '14', color: C.teal,
+            fontSize: 9, lineHeight: '15px', whiteSpace: 'nowrap',
+          }}>{name}</span>
+        );
+      })}
+    </span>
+  );
+}
+
+const capStyle = { fontSize: 7, letterSpacing: 1.1, fontWeight: 700, color: C.grey, marginBottom: 3 };
+
+/**
+ * A SERVICE: always on, in the background, and it keeps what it saw. It
+ * says how often it runs, what it remembers and what it costs upstream.
+ */
+/**
+ * A DASHBOARD ITEM: what one panel shows, and nothing else - no arithmetic.
+ * Its wires come straight from the box whose value it displays.
+ */
+function ItemBody({ display, col, result }) {
+  const shown = result === null || result === undefined || result === '' ? '—' : String(result);
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <span style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.8, color: col, padding: '1px 6px',
+          border: `1px solid ${col}66`, borderRadius: 6 }}>{String(display).toUpperCase()}</span>
+        <span style={{ fontSize: 8, color: C.faint }}>shown on the dashboard</span>
+      </div>
+      <div style={{ fontSize: display === 'number' ? 16 : 10.5, fontWeight: 800, color: C.white,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shown}</div>
+    </div>
+  );
+}
+
+function ServiceBody({ spec, col, result }) {
+  const row = (k, x) => (
+    <div style={{ display: 'flex', gap: 8, fontSize: 9, lineHeight: '14px' }}>
+      <span style={{ width: 44, flexShrink: 0, fontSize: 7.5, fontWeight: 700, letterSpacing: 0.8, color: C.grey }}>{k}</span>
+      <span style={{ color: C.text, minWidth: 0 }}>{x}</span>
+    </div>
+  );
+  return (
+    <div>
+      {row('RUNS', 'every ' + spec.every)}
+      {row('KEEPS', spec.keeps)}
+      {spec.costs && row('COSTS', spec.costs)}
+      <ResultLine name="STATUS" value={result} col={col} />
+    </div>
+  );
+}
+
+function ResultLine({ name, value, col }) {
+  if (value === null || value === undefined) return null;
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'flex-end', gap: 6, marginTop: 4 }}>
+      <span style={{ fontSize: 7.5, letterSpacing: 1, color: C.grey, fontWeight: 700 }}>{name}</span>
+      <span style={{ fontSize: 13, fontWeight: 800, color: col }}>{value}</span>
+    </div>
+  );
+}
+
+/** A DECISION: the condition, which way it went, and why. */
+function DecisionBody({ f, v, col, tokens, working, result }) {
+  let ok = null;
+  try { ok = f.decision.test(v); } catch (e) { ok = null; }
+  const lit = ok === null ? { t: 'NOT CHECKED', c: C.grey } : ok ? { t: f.decision.yes, c: '#4ade80' } : { t: f.decision.no, c: '#f87171' };
+  return (
+    <>
+      <div style={capStyle}>CONDITION</div>
+      <FormulaText tokens={tokens} />
+      <div style={{ marginTop: 6, paddingTop: 5, borderTop: `1px dashed ${C.line}` }}>
+        <div style={capStyle}>THIS TOKEN</div>
+        {working ? <WorkedSteps text={working} accent={col} result={result} /> : null}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+          <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: 0.6, color: lit.c, padding: '2px 8px',
+            borderRadius: 999, border: `1px solid ${lit.c}88`, background: lit.c + '18' }}>{lit.t}</span>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * ONE OPERATOR. An operation shows its symbol and this token's arithmetic; a
+ * condition shows its test and which way it went - the branch taken lit, the
+ * other dimmed.
+ */
+function OpBody({ o, v, col, result }) {
+  const call = (fn) => { if (typeof fn !== 'function') return fn; try { return fn(v); } catch (e) { return null; } };
+  const c = o.cond;
+  const fmt = (x) => (x === null || x === undefined ? '—' : String(x));
+  const row = (tag, text, on, tone) => (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, padding: '3px 6px', borderRadius: 5, margin: '2px 0',
+      background: on ? tone + '1f' : 'transparent', border: `1px solid ${on ? tone + '88' : C.line}`, opacity: on === false ? 0.45 : 1 }}>
+      <span style={{ width: 40, flexShrink: 0, fontSize: 8, fontWeight: 800, letterSpacing: 0.8, color: on ? tone : C.grey }}>{tag}</span>
+      <span style={{ flex: 1, fontSize: 9.5, fontFamily: MONO_STACK, color: on ? C.white : C.dim }}>{text}</span>
+    </div>
+  );
+  if (c && c.kind === 'IF') {
+    const t = call(c.test);
+    return (
+      <>
+        {row('IF', c.when + (t === null ? ' ?' : t ? '  → yes' : '  → no'), t === null ? null : true, t ? '#4ade80' : '#f87171')}
+        {row('THEN', fmt(call(c.then)), t === null ? null : t === true, '#4ade80')}
+        {row('ELSE', fmt(call(c.else)), t === null ? null : t === false, '#fbbf24')}
+        <ResultLine name="RESULT" value={result} col={col} />
+      </>
+    );
+  }
+  if (c && c.kind === 'OR') {
+    const terms = call(c.terms) || [];
+    const any = terms.some((x) => x.ok === true);
+    return (
+      <>
+        <div style={capStyle}>{c.when.toUpperCase()}</div>
+        {terms.map((x, i) => (
+          <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8.5, fontFamily: MONO_STACK,
+            color: x.ok ? '#f87171' : C.dim }}>
+            <span>{x.label}</span><span>{x.ok === null ? 'not checked' : x.ok ? (c.words ? c.words[0] : 'VETO') : (c.words ? c.words[1] : 'pass')}</span>
+          </div>
+        ))}
+        <div style={{ marginTop: 4, fontSize: 9.5, fontFamily: MONO_STACK, color: any ? '#f87171' : '#4ade80' }}>
+          OR → {any ? (c.words ? c.words[0] : 'VETO') : (c.words ? c.words[1] : 'clean')}
+        </div>
+      </>
+    );
+  }
+  if (c && c.kind === 'SWITCH') {
+    const x = call(c.input);
+    const hit = Number.isFinite(x) ? c.cases.findIndex((k) => x >= k.min) : -1;
+    return (
+      <>
+        <div style={capStyle}>SWITCH ON {fmt(x)}</div>
+        {c.cases.map((k, i) => row(k.when, k.then, hit === -1 ? null : i === hit, '#4ade80'))}
+      </>
+    );
+  }
+  // An operation: the symbol, then this token's numbers.
+  const expr = call(o.expr);
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: o.sym.length > 2 ? 11 : 18, fontWeight: 900, color: col, minWidth: 24, textAlign: 'center' }}>{o.sym}</span>
+        <span style={{ flex: 1, fontSize: 9.5, fontFamily: MONO_STACK, color: C.text }}>{expr || 'no value for this token yet'}</span>
+      </div>
+      <ResultLine name="=" value={result} col={col} />
+    </>
+  );
+}
+
+/** A dotted path out of a record: 'sources.dexscreener.liquidityUsd'. */
+const atPath = (obj, path) => String(path).split('.').reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj);
+const brief = (x) => {
+  if (x === null || x === undefined) return '—';
+  if (typeof x === 'number') return String(Math.round(x * 1000) / 1000);
+  if (typeof x === 'string') return x.length > 22 ? x.slice(0, 10) + '…' + x.slice(-6) : x;
+  if (Array.isArray(x)) return '[' + x.length + ']';
+  return '{…}';
+};
+
+/**
+ * A LIST EXTRACTOR: a file's list (every trade, every row) read as a list.
+ * One row is shown as the TEMPLATE - its fields, the ones picked out of
+ * every row lit - and the whole list goes on to a filter, a sum, a count.
+ */
+function ListBody({ spec, v, col }) {
+  let rows = [];
+  try { rows = spec.rows(v) || []; } catch (e) { rows = []; }
+  const first = rows[0];
+  return (
+    <>
+      <div style={capStyle}>TEMPLATE · ONE OF {rows.length} {String(spec.of).toUpperCase()}</div>
+      {first === undefined ? (
+        <div style={{ fontSize: 9.5, color: C.grey }}>no rows for this token yet</div>
+      ) : (
+        <div style={{ fontFamily: MONO_STACK, fontSize: 8.5, lineHeight: 1.55 }}>
+          {spec.fields.map((f) => (
+            <div key={f} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: C.teal }}>{f}</span>
+              <span style={{ color: C.white, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{brief(atPath(first, f))}</span>
+            </div>
+          ))}
+          {first && typeof first === 'object' && (
+            <div style={{ color: C.grey, marginTop: 2 }}>
+              + {Object.keys(first).filter((k) => !k.startsWith('_') && !spec.fields.some((f) => f === k || f.startsWith(k + '.'))).length} other fields not read
+            </div>
+          )}
+        </div>
+      )}
+      <ResultLine name="LIST" value={rows.length + ' ' + spec.of} col={col} />
+    </>
+  );
+}
+
+/**
+ * A SELECTOR: every option it is given, one of them picked. Click a row to
+ * pick it; the search narrows a long list. The list scrolls by itself (the
+ * map does not zoom under it).
+ */
+function SelectorBody({ spec, v, col }) {
+  const [q, setQ] = React.useState('');
+  const listRef = React.useRef(null);
+  let options = [];
+  try { options = spec.options(v) || []; } catch (e) { options = []; }
+  let selected = null;
+  try { selected = spec.selected(v); } catch (e) { selected = null; }
+  const needle = q.trim().toLowerCase().replace(/^\$/, '');
+  const shown = needle
+    ? options.filter((o) => String(o.label).toLowerCase().replace(/^\$/, '').includes(needle) || String(o.sub || '').toLowerCase().includes(needle))
+    : options;
+  // Keep the picked row in view when the box first draws.
+  React.useEffect(() => {
+    const el = listRef.current && listRef.current.querySelector('[data-picked="1"]');
+    if (el && listRef.current) listRef.current.scrollTop = Math.max(0, el.offsetTop - 60);
+  }, [selected]);
+  const stop = (e) => e.stopPropagation();
+  const current = options.find((o) => o.id === selected);
+  return (
+    <div onMouseDown={stop} onClick={stop} onDoubleClick={stop}>
+      <div style={capStyle}>PICK ONE OF {options.length} {String(spec.of).toUpperCase()}</div>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search" spellCheck={false}
+        style={{ width: '100%', boxSizing: 'border-box', background: '#0d1730', color: C.text, border: `1px solid ${C.border}`,
+          borderRadius: 5, padding: '4px 7px', fontFamily: 'inherit', fontSize: 9.5, outline: 'none', marginBottom: 4 }} />
+      <div ref={listRef} data-card="1" style={{ maxHeight: 200, overflowY: 'auto', border: `1px solid ${C.line}`, borderRadius: 5 }}>
+        {shown.map((o) => {
+          const on = o.id === selected;
+          return (
+            <div key={o.id} data-picked={on ? '1' : '0'} onClick={() => spec.pick(v, o.id)} style={{
+              display: 'flex', alignItems: 'baseline', gap: 6, padding: '3px 7px', cursor: 'pointer',
+              background: on ? col + '22' : 'transparent', borderLeft: `2px solid ${on ? col : 'transparent'}`,
+            }}>
+              <span style={{ fontSize: 9.5, fontWeight: 700, color: on ? C.white : C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{o.label}</span>
+              <span style={{ fontSize: 8, color: C.faint, flex: 1 }}>{o.sub}</span>
+              <span style={{ fontSize: 9, fontFamily: MONO_STACK, color: o.value === 'VETO' ? '#f87171' : C.dim }}>{o.value}</span>
+            </div>
+          );
+        })}
+        {!shown.length && <div style={{ padding: 8, fontSize: 9, color: C.grey }}>no match</div>}
+      </div>
+      <ResultLine name="SELECTED" value={current ? current.label + ' · ' + current.sub : null} col={col} />
+    </div>
+  );
+}
+
+/**
+ * A RULE FILTER: keep the rows that pass each rule, in order. Every rule says
+ * how many rows it dropped; a rule with a number (first N) has the standard
+ * input on it.
+ */
+function RuleFilterBody({ o, v, col, result }) {
+  const spec = o.filter;
+  let rows = [];
+  try { rows = spec.rows(v) || []; } catch (e) { rows = []; }
+  const start = rows.length;
+  const steps = spec.rules.map((rule) => {
+    const before = rows.length;
+    try { rows = rule.apply(rows, v) || []; } catch (e) { /* keep rows */ }
+    return { rule, dropped: before - rows.length };
+  });
+  return (
+    <>
+      <div style={capStyle}>KEEP THE {String(spec.of).toUpperCase()} WHERE</div>
+      {steps.map(({ rule, dropped }, i) => (
+        <div key={i} style={{ margin: '3px 0', padding: '3px 6px', borderRadius: 5, border: `1px solid ${C.line}` }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 9 }}>
+            <span style={{ color: C.text }}>{rule.label}</span>
+            <span style={{ color: dropped ? '#f87171' : C.grey, fontFamily: MONO_STACK, flexShrink: 0 }}>−{dropped}</span>
+          </div>
+          {rule.setting && (
+            <div style={{ marginTop: 3 }}>
+              <NumberInput id={rule.setting.id} def={rule.setting.def} step={rule.setting.step} min={rule.setting.min} max={rule.setting.max} col={col} compact />
+            </div>
+          )}
+        </div>
+      ))}
+      <div style={{ fontSize: 9, fontFamily: MONO_STACK, color: C.dim, marginTop: 4 }}>{start} in → {rows.length} kept</div>
+      <ResultLine name="KEPT" value={result} col={col} />
+    </>
+  );
+}
+
+/**
+ * A FILTER: keep the highest, middle or lowest N of a list. The mode and N
+ * are controls on the box - the first box a user can change - and every box
+ * after it computes from what is kept. Below: the whole list as bars, the
+ * kept ones lit.
+ */
+function FilterBody({ o, v, col, result }) {
+  const spec = o.filter;
+  const s = filterSetting(spec.id, spec.defaults);
+  let values = [];
+  try { values = spec.values(v) || []; } catch (e) { values = []; }
+  const sorted = values.filter(Number.isFinite).slice().sort((a, b) => b - a);
+  const kept = applyFilter(sorted, s);
+  const keptSet = new Map();
+  kept.forEach((x) => keptSet.set(x, (keptSet.get(x) || 0) + 1));
+  const lit = sorted.map((x) => { const c = keptSet.get(x) || 0; if (c) { keptSet.set(x, c - 1); return true; } return false; });
+  const isDefault = s.mode === spec.defaults.mode && s.n === spec.defaults.n;
+  const stop = (e) => e.stopPropagation();
+  const max = sorted.length ? sorted[0] : 1;
+  const W = 260;
+  const H = 34;
+  const bw = sorted.length ? W / sorted.length : W;
+  return (
+    <div onMouseDown={stop} onClick={stop}>
+      <div style={capStyle}>KEEP</div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 5 }}>
+        {FILTER_MODES.map((m) => (
+          <button key={m.id} onClick={() => (m.id === spec.defaults.mode ? clearSetting(spec.id) : setSetting(spec.id, { mode: m.id }))} style={{
+            flex: 1, cursor: 'pointer', fontFamily: 'inherit', fontSize: 8.5, fontWeight: 800, letterSpacing: 0.6,
+            padding: '4px 0', borderRadius: 5, border: `1px solid ${s.mode === m.id ? col : C.border}`,
+            background: s.mode === m.id ? col + '26' : 'transparent', color: s.mode === m.id ? C.white : C.dim,
+          }}>{m.label}</button>
+        ))}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <NumberInput id={spec.id + ':n'} def={spec.defaults.n} step={1} min={1} max={Math.max(sorted.length, 1)} col={col} />
+        <span style={{ fontSize: 9, color: C.dim }}>of {sorted.length} {spec.of}</span>
+      </div>
+      {sorted.length > 0 && (
+        <svg width="100%" viewBox={'0 0 ' + W + ' ' + H} preserveAspectRatio="none" style={{ display: 'block', height: H, marginTop: 6 }}>
+          {sorted.map((x, i) => {
+            const h = Math.max(1, (Math.sqrt(x / max)) * (H - 2));
+            return <rect key={i} x={i * bw} y={H - h} width={Math.max(0.6, bw - 0.4)} height={h} fill={lit[i] ? col : C.line} />;
+          })}
+        </svg>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8, fontFamily: MONO_STACK, color: C.faint, marginTop: 2 }}>
+        <span>highest</span><span>lowest</span>
+      </div>
+      {!isDefault && (
+        <div style={{ fontSize: 8.5, color: C.amber, marginTop: 4 }}>
+          changed from the default ({spec.defaults.mode === 'top' ? 'highest' : spec.defaults.mode} {spec.defaults.n}) - a preview; the score still uses the default
+        </div>
+      )}
+      <ResultLine name="KEPT" value={result} col={col} />
+    </div>
+  );
+}
+
+/** A CURVE: the mapping drawn, with this token's input marked on it. */
+function CurveBody({ f, v, col, tokens, result }) {
+  const c = f.curve;
+  let x = null;
+  try { x = c.x(v); } catch (e) { x = null; }
+  const W = 260;
+  const H = 70;
+  const N = 60;
+  const toT = (val) => (c.log ? (Math.log10(val) - Math.log10(c.lo)) / (Math.log10(c.hi) - Math.log10(c.lo)) : (val - c.lo) / (c.hi - c.lo));
+  const fromT = (t) => (c.log ? Math.pow(10, Math.log10(c.lo) + t * (Math.log10(c.hi) - Math.log10(c.lo))) : c.lo + t * (c.hi - c.lo));
+  const yOf = (score) => H - 4 - (Math.max(0, Math.min(100, score)) / 100) * (H - 8);
+  const pts = [];
+  for (let i = 0; i <= N; i += 1) {
+    let y = null;
+    try { y = c.f(fromT(i / N)); } catch (e) { y = null; }
+    if (Number.isFinite(y)) pts.push([(i / N) * W, yOf(y)]);
+  }
+  const path = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+  let fx = null;
+  if (Number.isFinite(x) && (!c.log || x > 0)) { try { fx = c.f(x); } catch (e) { fx = null; } }
+  const px = Number.isFinite(x) && (!c.log || x > 0) ? Math.max(0, Math.min(1, toT(x))) * W : null;
+  return (
+    <>
+      <div style={capStyle}>CURVE</div>
+      <FormulaText tokens={tokens} />
+      <svg width="100%" viewBox={'0 0 ' + W + ' ' + H} preserveAspectRatio="none" style={{ display: 'block', height: H, marginTop: 4 }}>
+        <line x1={0} x2={W} y1={yOf(50)} y2={yOf(50)} stroke={C.line} strokeDasharray="2 3" vectorEffect="non-scaling-stroke" />
+        <path d={path} fill="none" stroke={col} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
+        {px !== null && Number.isFinite(fx) && (
+          <>
+            <line x1={px} x2={px} y1={H} y2={yOf(fx)} stroke={C.white} strokeDasharray="2 2" strokeWidth={0.8} vectorEffect="non-scaling-stroke" />
+            <circle cx={px} cy={yOf(fx)} r={3.2} fill={C.white} />
+          </>
+        )}
+      </svg>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8.5, fontFamily: MONO_STACK, color: C.faint, marginTop: 2 }}>
+        <span>{c.xFmt(c.lo)}</span>
+        <span style={{ color: C.text }}>{Number.isFinite(x) ? c.xFmt(x) + ' → ' + (Number.isFinite(fx) ? fx : 'no score') : 'no input yet'}</span>
+        <span>{c.xFmt(c.hi)}</span>
+      </div>
+      <ResultLine name="SCORE" value={result} col={col} />
+    </>
+  );
+}
+
+/** A PARAMETER: the constant itself, and what it tunes. */
+function ParamBody({ f, col, result }) {
+  const p = f.param;
+  const changed = p.list ? p.list.some((x) => getSetting(x.id, { n: x.def }).n !== x.def)
+    : getSetting(p.id, { n: p.def }).n !== p.def;
+  return (
+    <>
+      {p.list ? (
+        <>
+          <div style={capStyle}>WEIGHTS</div>
+          {p.list.map((x) => (
+            <div key={x.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, margin: '2px 0' }}>
+              <span style={{ fontSize: 8.5, color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{x.label}</span>
+              <NumberInput id={x.id} def={x.def} step={x.step} min={x.min} max={x.max} col={col} compact />
+            </div>
+          ))}
+          <ResultLine name="TOTAL" value={result} col={col} />
+        </>
+      ) : (
+        <>
+          <div style={capStyle}>VALUE</div>
+          <NumberInput id={p.id} def={p.def} step={p.step} min={p.min} max={p.max} col={col} />
+          <div style={{ fontSize: 8, color: C.faint, marginTop: 3 }}>default {Number(p.def).toLocaleString('en-US')}</div>
+        </>
+      )}
+      {changed && (
+        <div style={{ fontSize: 8.5, color: C.amber, marginTop: 4 }}>
+          changed - the boxes on the map now use it; the dashboard score still uses the default
+        </div>
+      )}
+      {f.note && <div style={{ fontSize: 8.5, color: C.faint, marginTop: 3 }}>{f.note}</div>}
+    </>
+  );
+}
+
+/**
+ * THE number input - one control for every value a user can change: a
+ * parameter, a weight, a filter's count. A raw number (the unit is in the
+ * box's name), − / + by its step, typed directly, and RESET once it differs
+ * from its default.
+ */
+export function NumberInput({ id, def, step, min, max, col, compact }) {
+  const val = getSetting(id, { n: def }).n;
+  const clampN = (x) => {
+    let n = Number(x);
+    if (!Number.isFinite(n)) return val;
+    if (Number.isFinite(min)) n = Math.max(min, n);
+    if (Number.isFinite(max)) n = Math.min(max, n);
+    return Math.round(n * 1e6) / 1e6;
+  };
+  const set = (x) => { const n = clampN(x); if (n === def) clearSetting(id); else setSetting(id, { n }); };
+  const stop = (e) => e.stopPropagation();
+  const changed = val !== def;
+  const btn = { width: compact ? 18 : 22, height: compact ? 18 : 22, cursor: 'pointer', borderRadius: 5, padding: 0,
+    border: `1px solid ${C.border}`, background: 'transparent', color: C.text, fontWeight: 800, fontSize: compact ? 10 : 12 };
+  return (
+    <span onMouseDown={stop} onClick={stop} onDoubleClick={stop} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <button style={btn} onClick={() => set(val - (step || 1))}>−</button>
+      <input type="number" value={val} step={step || 1} onChange={(e) => set(e.target.value)}
+        style={{ width: compact ? 62 : 104, textAlign: 'right', background: '#0d1730', color: C.white,
+          border: `1px solid ${changed ? C.amber : col}`, borderRadius: 5, padding: compact ? '1px 4px' : '3px 6px',
+          fontFamily: MONO_STACK, fontSize: compact ? 9.5 : 11, fontWeight: 800, outline: 'none' }} />
+      <button style={btn} onClick={() => set(val + (step || 1))}>+</button>
+      {changed && (
+        <button onClick={() => clearSetting(id)} title={'back to the default, ' + def}
+          style={{ cursor: 'pointer', fontSize: 7.5, fontWeight: 800, letterSpacing: 0.5, padding: compact ? '1px 4px' : '3px 6px',
+            borderRadius: 5, border: `1px solid ${C.amber}88`, background: 'transparent', color: C.amber }}>RESET</button>
+      )}
+    </span>
+  );
+}
+
+/** A JOIN: the key this token is looked up by, the list, what matched. */
+function JoinBody({ f, v, col, result }) {
+  const j = f.join;
+  const call = (fn) => { try { return fn(v); } catch (e) { return null; } };
+  const key = call(j.key);
+  const against = call(j.against);
+  const matches = call(j.matches) || [];
+  return (
+    <>
+      <div style={capStyle}>LOOK UP BY {String(j.by).toUpperCase()}</div>
+      <div style={{ fontSize: 10, fontFamily: MONO_STACK, color: C.white }}>{key || '—'}</div>
+      <div style={{ ...capStyle, marginTop: 6 }}>IN</div>
+      <div style={{ fontSize: 9, color: C.dim }}>{against || 'not loaded yet'}</div>
+      <div style={{ ...capStyle, marginTop: 6 }}>MATCHED</div>
+      {matches.length
+        ? matches.map((m, i) => <div key={i} style={{ fontSize: 9.5, color: col, fontFamily: MONO_STACK }}>{m}</div>)
+        : <div style={{ fontSize: 9.5, color: C.grey }}>no match</div>}
+      <ResultLine name="RESULT" value={result} col={col} />
+    </>
+  );
+}
+
+
+/** An EXTRACT: the keys picked out of the file, and the value they give. */
+function ExtractBody({ f, col, result }) {
+  return (
+    <>
+      <div style={capStyle}>PICKS FROM {String(f.extract.path).replace(/^\/raw\//, '').toUpperCase()}</div>
+      {f.extract.picks.map((k, i) => (
+        <div key={i} style={{ fontSize: 8.5, fontFamily: MONO_STACK, color: C.dim, wordBreak: 'break-all' }}>{k}</div>
+      ))}
+      <ResultLine name="VALUE" value={result} col={col} />
+    </>
+  );
+}
+
+/**
+ * What an AGGREGATE box shows instead of a formula: the collection itself, as
+ * a little chart, with the reduced value drawn across it - so "the mean of
+ * 809 samples" is something you can see, not a number to take on trust.
+ */
+/** A duration, short: 5h 59m, 14m 30s, 45s. */
+const duration = (ms) => {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + (s % 60) + 's';
+  return s + 's';
+};
+
+function AggregateBody({ agg, v, col }) {
+  let pts = [];
+  let result = null;
+  try { pts = agg.points ? agg.points(v) || [] : (agg.series(v) || []).map((x) => ({ x })); } catch (e) { pts = []; }
+  try { result = agg.result(v); } catch (e) { result = null; }
+  const xs = pts.map((p) => p.x);
+  const count = xs.length;
+  const covers = pts.length > 1 && Number.isFinite(pts[0].t) ? pts[pts.length - 1].t - pts[0].t : null;
+  const win = agg.window ? getSetting(agg.window.id, { n: agg.window.def }).n : null;
+  const fmt = agg.fmt || ((n) => String(n));
+  const W = 260;
+  const H = 46;
+  const lo = xs.length ? Math.min(...xs, result ?? Infinity) : 0;
+  const hi = xs.length ? Math.max(...xs, result ?? -Infinity) : 1;
+  const span = hi - lo || 1;
+  const y = (val) => H - 3 - ((val - lo) / span) * (H - 6);
+  const step = xs.length > 1 ? W / (xs.length - 1) : 0;
+  const line = xs.map((val, i) => (i ? 'L' : 'M') + (i * step).toFixed(1) + ' ' + y(val).toFixed(1)).join(' ');
+  const cap = (t) => <div style={{ fontSize: 7, letterSpacing: 1.1, fontWeight: 700, color: C.grey, marginBottom: 3 }}>{t}</div>;
+  return (
+    <>
+      {cap(agg.fn + ' OF ' + count + ' VALUES · ' + agg.what.toUpperCase())}
+      {/* The time frame: how often a value arrives, and what span they cover. */}
+      <div style={{ fontSize: 9, color: C.dim, marginBottom: 4 }}>
+        {agg.every ? 'one every ' + agg.every + ' · ' : ''}
+        {covers !== null ? 'covering the last ' + duration(covers) : 'no time span yet'}
+      </div>
+      {agg.window && (
+        <div onMouseDown={(e) => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 5 }}>
+          <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: 0.8, color: C.grey }}>WINDOW (min)</span>
+          <NumberInput id={agg.window.id} def={agg.window.def} step={agg.window.step} min={agg.window.min} max={agg.window.max} col={col} compact />
+          <span style={{ fontSize: 8, color: C.faint }}>
+            {win !== agg.window.def ? 'preview - the score uses ' + agg.window.def + ' min' : agg.window.note}
+          </span>
+        </div>
+      )}
+      {xs.length > 1 ? (
+        <svg width="100%" viewBox={'0 0 ' + W + ' ' + H} preserveAspectRatio="none" style={{ display: 'block', height: H }}>
+          <path d={line} fill="none" stroke={C.dim} strokeWidth={1.2} vectorEffect="non-scaling-stroke" />
+          {result !== null && (
+            <line x1={0} x2={W} y1={y(result)} y2={y(result)} stroke={col} strokeWidth={1.4}
+              strokeDasharray="4 3" vectorEffect="non-scaling-stroke" />
+          )}
+        </svg>
+      ) : (
+        <div style={{ fontSize: 9.5, color: C.grey }}>no series for this token yet</div>
+      )}
+      {xs.length > 1 && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8.5, fontFamily: MONO_STACK, color: C.faint, marginTop: 2 }}>
+          <span>min {fmt(Math.min(...xs))}</span>
+          <span style={{ color: col }}>- - {agg.fn.toLowerCase()}</span>
+          <span>max {fmt(Math.max(...xs))}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * A CALCULATION box. Always open - no box on the map expands. Top: what
+ * comes in (left) and what goes out (right), each named by its data with its
+ * value, on the rows the wires attach to. Below: the formula in data names,
+ * then this token's numbers worked through to the result.
+ */
+function CalcBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClick, onHover, onStartWire,
+  v, nodeById, onMeasure, alert, onContextMenu }) {
+  const ref = React.useRef(null);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const report = () => onMeasure(n.id, el.offsetHeight);
+    report();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(report);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [n.id, onMeasure]);
+
+  const f = n.field || {};
+  const type = typeOf(n);
+  const live = (x) => {
+    if (typeof x !== 'function') return x || null;
+    try { return x(v); } catch (e) { return null; }
+  };
+  const result = boxValue(n, v);
+  const working = live(f.equation);
+  const tokens = f.calc || f.fetch || [];
   const rows = Math.max(n.inPorts.length, n.outPorts.length, 1);
-  const valueOf = (key) => {
-    const src = nodeById && nodeById.get(key);
-    return src ? boxValue(src, v) : null;
+  const valueOf = (p) => {
+    const src = nodeById && nodeById.get(p.key);
+    if (src && src.kind === 'field') return boxValue(src, v);
+    return p.field ? boxValue({ kind: 'field', field: p.field }, v) : null;
+  };
+  const port = (p, side) => {
+    const val = side === 'out' && p.key === n.id ? result : valueOf(p);
+    const unit = unitOf(val, side === 'out' && p.key === n.id ? n : (nodeById && nodeById.get(p.key)) || p);
+    return (
+      <span title={p.label + (unit ? ' · ' + UNIT_NAMES[unit] : '')} style={{ display: 'flex', alignItems: 'baseline', gap: 4, minWidth: 0, maxWidth: '100%',
+        justifyContent: side === 'in' ? 'flex-start' : 'flex-end' }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, color: C.dim }}>{p.label}</span>
+        {val !== null && <span style={{ color: C.white, fontWeight: 700, flexShrink: 0 }}>{val}</span>}
+      </span>
+    );
+  };
+  const label = (t) => (
+    <div style={{ fontSize: 7, letterSpacing: 1.1, fontWeight: 700, color: C.grey, marginBottom: 2 }}>{t}</div>
+  );
+  return (
+    <div ref={ref} data-node-id={n.id} onMouseDown={onMouseDown} onClick={onClick} onContextMenu={onContextMenu}
+      onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)}
+      style={{
+        position: 'absolute', left: pos.x, top: pos.y, width: n.w, boxSizing: 'border-box',
+        borderRadius: 8, background: '#0a1430', cursor: 'grab', opacity: dim ? 0.3 : 1,
+        border: `${isSel ? 2 : 1.5}px ${inGroup ? 'dashed' : 'solid'} ${inGroup ? '#ffffff' : alert ? WIRE_BAD : col}`,
+        boxShadow: isSel ? `0 0 0 1px ${col}, 0 0 20px ${col}99` : (isNear ? `0 0 0 1px ${col}` : '0 6px 18px rgba(0,0,0,.55)'),
+      }}>
+      <div style={{
+        height: ENGINE.HEAD, display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px',
+        background: col + '22', borderBottom: `1px solid ${col}44`, borderRadius: '6px 6px 0 0',
+      }}>
+        <KindIcon node={n} color={col} />
+        <span style={{ flex: 1, minWidth: 0, fontSize: 9.5, fontWeight: 800, letterSpacing: 0.5, color: '#e7edff',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.label}</span>
+        {f.weight && <span title="its weight in the score" style={{ fontSize: 8.5, color: C.faint }}>{f.weight}</span>}
+        {alert && (
+          <span title={alert.join('\n')} style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.6, color: WIRE_BAD,
+            padding: '1px 5px', borderRadius: 6, border: `1px solid ${WIRE_BAD}88`, cursor: 'help' }}>MISSING DATA</span>
+        )}
+        {f.memory && (
+          <span title={'remembers: ' + f.memory} style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.6, color: '#fde68a',
+            padding: '1px 5px', borderRadius: 6, border: '1px solid #fde68a66', cursor: 'help' }}>MEMORY</span>
+        )}
+        <span title={TYPE_NAMES[type]} style={{ fontSize: 7.5, letterSpacing: 0.6, color: col, opacity: 0.8 }}>{TYPE_NAMES[type].toUpperCase()}</span>
+        {f.note && <span title={f.note} style={{ fontSize: 9, color: C.amber, cursor: 'help' }}>?</span>}
+      </div>
+      {/* The ports: the rows the wires land on, at the same height as a group's. */}
+      <div style={{ position: 'relative', height: rows * ENGINE.ROW }}>
+        {Array.from({ length: rows }).map((_, i) => {
+          const pin = n.inPorts[i];
+          const pout = n.outPorts[i];
+          return (
+            <div key={i} style={{
+              position: 'absolute', left: 0, right: 0, top: i * ENGINE.ROW, height: ENGINE.ROW,
+              display: 'flex', alignItems: 'center', fontSize: 8, fontFamily: MONO_STACK,
+            }}>
+              <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
+                {pin && (() => {
+                  const t = portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById));
+                  return (
+                    <>
+                      <InDot label={pin.label} t={t} />
+                      {port(pin, 'in')}
+                    </>
+                  );
+                })()}
+              </div>
+              <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingRight: 9, paddingLeft: 3, textAlign: 'right' }}>
+                {pout && (() => {
+                  const ov = pout.key === n.id ? result : valueOf(pout);
+                  const t = portType(pout.key, ov, pout.key === n.id ? n : (nodeById && nodeById.get(pout.key)) || pout,
+                    pout.key === n.id || carriesValue(pout, nodeById));
+                  return (
+                    <>
+                      {port(pout, 'out')}
+                      <Outlet col={dotColor(t)} missing={!t.receiving} title={typeTitle(pout.label, t, 'out')}
+                        onMouseDown={onStartWire(pout.key)} style={{ right: -5 }} />
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {/* The body: what this TYPE of box does, for this token. */}
+      <div style={{ margin: `${ENGINE.PAD}px 8px 8px`, padding: '6px 8px', borderRadius: 6,
+        background: '#060d22', border: `1px solid ${C.line}`, fontSize: 9.5 }}>
+        {type === 'aggregate' && (
+          <>
+            <AggregateBody agg={f.agg} v={v} col={col} />
+            <ResultLine name={f.agg.fn} value={result} col={col} />
+          </>
+        )}
+        {(type === 'condition' || type === 'operation') && f.opSpec && <OpBody o={f.opSpec} v={v} col={col} result={result} />}
+        {type === 'filter' && (f.opSpec.filter.rules
+          ? <RuleFilterBody o={f.opSpec} v={v} col={col} result={result} />
+          : <FilterBody o={f.opSpec} v={v} col={col} result={result} />)}
+        {type === 'list' && <ListBody spec={f.listSpec} v={v} col={col} />}
+        {type === 'selector' && <SelectorBody spec={f.selector} v={v} col={col} />}
+        {type === 'service' && <ServiceBody spec={f.service} col={col} result={result} />}
+        {type === 'item' && <ItemBody display={f.display} col={col} result={result} />}
+        {type === 'condition' && !f.opSpec && <DecisionBody f={f} v={v} col={col} tokens={tokens} working={working} result={result} />}
+        {type === 'curve' && <CurveBody f={f} v={v} col={col} tokens={tokens} result={result} />}
+        {type === 'param' && <ParamBody f={f} col={col} result={result} />}
+        {type === 'join' && <JoinBody f={f} v={v} col={col} result={result} />}
+        {type === 'extract' && <ExtractBody f={f} col={col} result={result} />}
+        {type === 'math' && (
+          <>
+            {label('FORMULA')}
+            <FormulaText tokens={tokens} />
+            <div style={{ marginTop: 6, paddingTop: 5, borderTop: `1px dashed ${C.line}` }}>
+              {label('THIS TOKEN')}
+              {working
+                ? <WorkedSteps text={working} accent={col} result={result} />
+                : <div style={{ fontSize: 9.5, color: C.grey }}>no value for this token yet</div>}
+              <ResultLine name="RESULT" value={result} col={col} />
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/*
+ * API BOXES - each one shows how the API is doing and what it last sent.
+ * Health is the server's own counters for the API's host (system.json,
+ * judged by providerHealth(), as on the SERVER page); the sample is this
+ * API's part of the selected token's record in the raw file it fills.
+ */
+const PROVIDER_HOSTS = {
+  geckoterminal: 'api.geckoterminal.com', dexscreener: 'api.dexscreener.com', jupiter: 'lite-api.jup.ag',
+  kyberswap: 'aggregator-api.kyberswap.com', goplus: 'api.gopluslabs.io', rugcheck: 'api.rugcheck.xyz',
+  honeypot: 'api.honeypot.is', defillama: 'coins.llama.fi', ethos: 'api.ethos.network',
+  hyperliquid: 'api.hyperliquid.xyz', binance: 'fapi.binance.com', aster: 'fapi.asterdex.com',
+  okx: 'www.okx.com', bybit: 'api.bybit.com', cex: 'api.coingecko.com',
+  'binance-spot': 'api.binance.com', coinbase: 'api.coinbase.com', reddit: 'www.reddit.com', '4chan': 'a.4cdn.org',
+  mastodon: 'mastodon.social', warpcast: 'api.warpcast.com', bluesky: 'public.api.bsky.app',
+};
+/** Where an API's answer sits in intel.json's per-token record. */
+const INTEL_KEYS = { goplus: 'goplus', rugcheck: 'rugcheck', honeypot: 'honeypot', kyberswap: 'kyberswap',
+  defillama: 'defillama', jupiter: 'jupiterQuote' };
+/** The venue name a spot price API answers under in reference.json. */
+const REFERENCE_VENUES = { 'binance-spot': 'binance', coinbase: 'coinbase', cex: 'coingecko' };
+const PERP_VENUES = new Set(['hyperliquid', 'binance', 'aster', 'okx', 'bybit']);
+const HEALTH_COLORS = { OK: '#22c55e', DEGRADED: '#f59e0b', 'LAST CALL FAILED': '#f59e0b', DOWN: WIRE_BAD, IDLE: '#64748b' };
+/** Fewer calls than this in the window, and its rate is not a verdict. */
+const MIN_JUDGED_CALLS = 5;
+
+/*
+ * The box's status. The 15-minute rate judges an API only when it made
+ * enough calls in that window to mean something: an API polled every 30 min
+ * makes one call, and one failed call would read DOWN for a quarter hour.
+ * Otherwise it is judged on its LAST call and its long-run error rate.
+ */
+const boxStatus = (h) => {
+  const r = h.recent;
+  if (r && r.calls >= MIN_JUDGED_CALLS) return { status: h.status, windowed: true };
+  const lastFailed = (h.lastErrorAt || 0) > (h.lastOkAt || 0);
+  if (lastFailed) return { status: h.errorRatePct >= 50 ? 'DOWN' : 'LAST CALL FAILED', windowed: false };
+  if (!h.lastOkAt) return { status: 'IDLE', windowed: false };
+  return { status: h.errorRatePct >= 50 ? 'DEGRADED' : 'OK', windowed: false };
+};
+
+const ago = (t) => {
+  if (!Number.isFinite(t)) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  return Math.round(s / 3600) + 'h ago';
+};
+
+function ProviderHealth({ source, v }) {
+  const raw = (v && v.pipe && v.pipe.raw) || null;
+  const host = PROVIDER_HOSTS[source];
+  const h = raw && host ? (raw.health || []).find((p) => p.provider === host) : null;
+  // A perp venue also reports its own reachability in perps.json.
+  const venue = raw && raw.perps && PERP_VENUES.has(source) ? raw.perps.venues[source] : null;
+  const judged = h ? boxStatus(h) : null;
+  const status = judged ? judged.status : venue ? (venue.ok ? 'OK' : 'DOWN') : null;
+  const sc = HEALTH_COLORS[status] || C.faint;
+  // The window's numbers when it has enough calls; the long run otherwise.
+  const r = judged && judged.windowed ? h.recent : null;
+  const rate = r ? (r.errorRatePct || 0) : h ? h.errorRatePct : 0;
+  const lastAt = h ? Math.max(h.lastOkAt || 0, h.lastErrorAt || 0) : 0;
+  const spark = (h && h.spark) || [];
+  const peak = Math.max(1, ...spark.map((b) => b.calls));
+  return (
+    <div title={h && h.lastError ? 'last error: ' + h.lastError + ' · ' + ago(h.lastErrorAt) : undefined}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+        <span style={{ width: 7, height: 7, borderRadius: '50%', background: sc, boxShadow: `0 0 6px ${sc}`, flexShrink: 0 }} />
+        <span style={{ fontSize: 8.5, fontWeight: 800, letterSpacing: 0.8, color: sc }}>{status || 'NO HEALTH DATA'}</span>
+        <span style={{ fontSize: 7.5, color: C.faint, marginLeft: 'auto', whiteSpace: 'nowrap' }}>
+          {h ? (status === 'OK' || !h.lastOkAt ? 'last ok ' + ago(h.lastOkAt) : 'last ok ' + ago(h.lastOkAt) + ' · failed ' + ago(h.lastErrorAt)) : venue ? (venue.ok ? venue.markets + ' markets' : venue.error || 'unreachable') : host || ''}
+        </span>
+      </div>
+      {h && (
+        <div style={{ display: 'flex', gap: 8, fontSize: 7.5, color: C.dim, whiteSpace: 'nowrap', overflow: 'hidden' }}>
+          <span><b style={{ color: C.white }}>{r ? r.callsPerMinute : h.callsPerMinute}</b>/min</span>
+          <span><b style={{ color: rate > 0 ? sc : C.white }}>{rate}%</b> errors</span>
+          {h.p50Ms !== null && <span>p50 <b style={{ color: C.white }}>{h.p50Ms}</b>ms</span>}
+          <span style={{ color: C.faint }}>{r ? r.minutes + ' min' : 'all calls · last ' + (lastAt ? ago(lastAt) : 'never')}</span>
+        </div>
+      )}
+      {spark.length > 0 && (
+        // Calls per minute over the last hour; the red part of a bar is errors.
+        <div title="calls per minute, last 60 min · red = errors" style={{ display: 'flex', alignItems: 'flex-end', gap: 1, height: 14, marginTop: 3 }}>
+          {spark.map((b, i) => (
+            <div key={i} style={{ flex: 1, height: Math.max(1, (b.calls / peak) * 14), display: 'flex', flexDirection: 'column-reverse',
+              background: b.calls ? '#3b5b9a' : '#1a2747' }}>
+              {b.errors > 0 && <div style={{ height: (b.errors / Math.max(1, b.calls)) * 100 + '%', background: WIRE_BAD }} />}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** This API's part of the selected token's record, as key: value lines. */
+const providerSample = (source, raw) => {
+  if (!raw) return null;
+  if (PERP_VENUES.has(source) && raw.perps) {
+    const venue = raw.perps.venues[source] || {};
+    return { file: 'perps.json', at: raw.perps.writtenAt,
+      rec: { ...venue, [raw.perps.symbol + ' listed']: raw.perps.listedOn.indexOf(source) !== -1 } };
+  }
+  if (source === 'ethos') return raw.ethos ? { file: 'ethos.json', rec: raw.ethos } : null;
+  if (REFERENCE_VENUES[source]) {
+    const q = raw.reference && (raw.reference.quotes || []).find((x) => x.venue === REFERENCE_VENUES[source]);
+    return q ? { file: 'reference.json', rec: { symbol: raw.reference.symbol, ...q } } : null;
+  }
+  const src = raw.market && raw.market.sources ? raw.market.sources[source] : null;
+  if (src) return { file: 'market.json', at: raw.marketFile && Date.parse(raw.marketFile.fetchedAtIso), rec: src };
+  const key = INTEL_KEYS[source];
+  if (key && raw.intel) {
+    const status = (raw.intel.sources || {})[key];
+    const rec = raw.intel[key];
+    return { file: 'intel.json', rec: rec && typeof rec === 'object' ? { status, ...rec } : { status } };
+  }
+  return null;
+};
+const flatten = (o, pre, out) => {
+  Object.keys(o || {}).forEach((k) => {
+    const x = o[k];
+    const key = pre ? pre + '.' + k : k;
+    if (x && typeof x === 'object' && !Array.isArray(x)) flatten(x, key, out);
+    else out.push([key, Array.isArray(x) ? '[' + x.length + ']' : x]);
+  });
+  return out;
+};
+const sampleValue = (x) => {
+  if (x === null || x === undefined) return '-';
+  if (typeof x === 'number') {
+    if (Math.abs(x) >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+    if (Math.abs(x) >= 1e4) return Math.round(x).toLocaleString();
+    return String(+x.toPrecision(5));
+  }
+  return String(x);
+};
+const SAMPLE_LINES = 7;
+
+function ProviderSample({ source, v, col }) {
+  const raw = (v && v.pipe && v.pipe.raw) || null;
+  const s = providerSample(source, raw);
+  const lines = s ? flatten(s.rec, '', []) : [];
+  return (
+    <div style={{ flex: 1, minHeight: 0, border: `1px solid ${col}44`, borderRadius: 6, background: '#060d22', padding: '5px 7px', overflow: 'hidden' }}>
+      <div style={{ ...capStyle, display: 'flex', gap: 6 }}>
+        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {s ? 'SAMPLE · ' + s.file.toUpperCase() + ' · THIS TOKEN' : 'SAMPLE'}
+        </span>
+        {/* How old the file is: a failed run keeps the last good one. */}
+        {s && Number.isFinite(s.at) && <span style={{ color: Date.now() - s.at > 35 * 60000 ? '#f59e0b' : C.faint }}>written {ago(s.at)}</span>}
+      </div>
+      {!s && <div style={{ fontSize: 8, color: C.faint }}>nothing from this API for the selected token</div>}
+      {lines.slice(0, SAMPLE_LINES).map(([k, x]) => (
+        <div key={k} style={{ display: 'flex', gap: 6, fontSize: 8, lineHeight: '12px', fontFamily: 'ui-monospace, Menlo, Consolas, monospace' }}>
+          <span style={{ color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}>{k}</span>
+          <span style={{ color: C.white, whiteSpace: 'nowrap' }}>{sampleValue(x)}</span>
+        </div>
+      ))}
+      {lines.length > SAMPLE_LINES && <div style={{ fontSize: 7.5, color: C.faint, marginTop: 2 }}>+ {lines.length - SAMPLE_LINES} other fields</div>}
+    </div>
+  );
+}
+
+function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClick, onDoubleClick,
+  onHover, onStartWire, v, nodeById, alert, onContextMenu }) {
+  const rows = Math.max(n.inPorts.length, n.outPorts.length, 1);
+  const valueOf = (p) => {
+    const src = nodeById && nodeById.get(p.key);
+    if (src && src.kind === 'field') return boxValue(src, v);
+    // A field folded into a closed panel: its value comes with the port.
+    return p.field ? boxValue({ kind: 'field', field: p.field }, v) : null;
   };
   const portLabel = (p, side) => {
-    const val = valueOf(p.key);
+    const val = valueOf(p);
+    const unit = unitOf(val, (nodeById && nodeById.get(p.key)) || p);
     return (
-      <span style={{
+      <span title={p.label + (unit ? ' · ' + UNIT_NAMES[unit] : '')} style={{
         display: 'flex', alignItems: 'baseline', gap: 4, minWidth: 0, maxWidth: '100%',
         justifyContent: side === 'in' ? 'flex-start' : 'flex-end',
       }}>
@@ -1142,12 +1557,13 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
       onMouseDown={onMouseDown}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onContextMenu={onContextMenu}
       onMouseEnter={() => onHover(true)}
       onMouseLeave={() => onHover(false)}
       style={{
         position: 'absolute', left: pos.x, top: pos.y, width: n.w, height: n.h, boxSizing: 'border-box',
         borderRadius: 8, background: '#0a1430', cursor: 'grab', opacity: dim ? 0.3 : 1,
-        border: `${isSel ? 2 : 1.5}px ${inGroup ? 'dashed' : 'solid'} ${inGroup ? '#ffffff' : col}`,
+        border: `${isSel ? 2 : 1.5}px ${inGroup ? 'dashed' : 'solid'} ${inGroup ? '#ffffff' : alert ? WIRE_BAD : col}`,
         boxShadow: isSel ? `0 0 0 1px ${col}, 0 0 20px ${col}99` : (isNear ? `0 0 0 1px ${col}` : '0 6px 18px rgba(0,0,0,.55)'),
       }}
     >
@@ -1158,38 +1574,55 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
         <KindIcon node={n} color={col} />
         <span style={{ flex: 1, minWidth: 0, fontSize: 9.5, fontWeight: 800, letterSpacing: 0.6, color: '#e7edff',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.label}</span>
-        <span title="boxes inside" style={{ fontSize: 8, color: col, padding: '1px 5px', borderRadius: 7,
-          border: `1px solid ${col}66` }}>{n.count}</span>
+        {alert && (
+          <span title={alert.join('\n')} style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.6, color: WIRE_BAD,
+            padding: '1px 5px', borderRadius: 6, border: `1px solid ${WIRE_BAD}88`, cursor: 'help' }}>MISSING DATA</span>
+        )}
       </div>
       {Array.from({ length: rows }).map((_, i) => {
         const pin = n.inPorts[i];
         const pout = n.outPorts[i];
         return (
           <div key={i} style={{
-            position: 'absolute', left: 0, right: 0, top: ENGINE.HEAD + i * ENGINE.ROW, height: ENGINE.ROW,
+            position: 'absolute', left: 0, right: 0, top: rowsTop(n) + i * ENGINE.ROW, height: ENGINE.ROW,
             display: 'flex', alignItems: 'center', fontSize: 8, fontFamily: MONO_STACK,
           }}>
-            <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
-              {pin && (
-                <>
-                  <span style={{ position: 'absolute', left: -4.5, top: '50%', marginTop: -4, width: 8, height: 8,
-                    borderRadius: '50%', background: col, boxShadow: `0 0 0 2px ${C.bg}` }} />
-                  {portLabel(pin, 'in')}
-                </>
-              )}
+            <div data-inport={pin ? pin.key : undefined} style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
+              {pin && (() => {
+                const t = portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById));
+                return (
+                  <>
+                    <InDot label={pin.label} t={t} />
+                    {portLabel(pin, 'in')}
+                  </>
+                );
+              })()}
             </div>
             <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingRight: 9, paddingLeft: 3, textAlign: 'right' }}>
-              {pout && (
-                <>
-                  {portLabel(pout, 'out')}
-                  <Outlet col={col} onMouseDown={onStartWire(pout.key)} style={{ right: -5 }} />
-                </>
-              )}
+              {pout && (() => {
+                const t = portType(pout.key, valueOf(pout), (nodeById && nodeById.get(pout.key)) || pout, carriesValue(pout, nodeById));
+                return (
+                  <>
+                    {portLabel(pout, 'out')}
+                    <Outlet col={dotColor(t)} missing={!t.receiving}
+                      title={typeTitle(pout.label, t, 'out')} onMouseDown={onStartWire(pout.key)} style={{ right: -5 }} />
+                  </>
+                );
+              })()}
             </div>
           </div>
         );
       })}
-      {!n.inPorts.length && !n.outPorts.length && (
+      {n.kind === 'provider' && (
+        <div onMouseDown={(e) => e.stopPropagation()} style={{
+          position: 'absolute', left: 8, right: 8, top: rowsTop(n) + rows * ENGINE.ROW + 4, bottom: 8,
+          display: 'flex', flexDirection: 'column', gap: 6, cursor: 'default',
+        }}>
+          <ProviderHealth source={n.source} v={v} />
+          <ProviderSample source={n.source} v={v} col={col} />
+        </div>
+      )}
+      {n.kind === 'engine' && !n.inPorts.length && !n.outPorts.length && (
         <div style={{ position: 'absolute', left: 9, top: ENGINE.HEAD + 2, fontSize: 8, color: C.grey }}>
           {n.count ? 'no wires cross its edge' : 'empty — drop boxes here'}
         </div>
@@ -1198,15 +1631,12 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
   );
 }
 
-export default function FlowChart({ v, onJumpToMirror }) {
+export default function FlowChart({ v }) {
   const wrapRef = React.useRef(null);
   const liveV = React.useRef(v);
   liveV.current = v;
 
   const [expanded, setExpanded] = React.useState(() => new Set());
-  // A SET, not one id. Comparing two panels means having both open, and the
-  // push below is what makes that readable rather than a pile.
-  const [cards, setCards] = React.useState(() => new Set());
   const [hover, setHover] = React.useState(null);
   // The arrow under the pointer, and where on SCREEN the pointer is - the
   // tooltip sits outside the zoom transform so it reads at any zoom.
@@ -1215,19 +1645,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
   // Where the user has dragged each box, relative to where the layout put
   // it. Kept apart from the layout so a rebuild never undoes a drag, and so
   // RESET is one line rather than a re-layout.
-  const [moved, setMoved] = React.useState(() => new Map());
-  // Where each open card's neighbour rows are, reported by the card itself
-  // after it has laid itself out. Keyed by the card, then by neighbour+side.
-  const [anchors, setAnchors] = React.useState(() => new Map());
-  const reportAnchors = React.useCallback((id, list) => {
-    setAnchors((cur) => {
-      const next = new Map(cur);
-      const m = new Map();
-      list.forEach((a) => m.set(a.id + ':' + a.side, a));
-      next.set(id, m);
-      return next;
-    });
-  }, []);
+  const [moved, setMoved] = React.useState(() => new Map(Object.entries(activeFlow().positions || {})));
 
   const [view, setView] = React.useState({ k: 0.6, x: 40, y: 20 });
   const [full, setFull] = React.useState(null);
@@ -1245,16 +1663,41 @@ export default function FlowChart({ v, onJumpToMirror }) {
 
   /* ---- engines: the map as nested subpatchers ------------------------- */
 
-  // The user's layer - their engines, moves, renames and sketch wires - saved
-  // in this browser on every change.
+  // The user's layer - their engines, moves, renames and sketch wires - in
+  // the ACTIVE FLOW (flow-store.js): saved in a user's file, a preview on
+  // DEFAULT. Saved outside the state updater, so the store's listeners never
+  // run in the middle of a render.
   const [cfg, setCfgState] = React.useState(loadConfig);
+  const cfgRef = React.useRef(cfg);
   const setCfg = React.useCallback((update) => {
-    setCfgState((cur) => {
-      const next = typeof update === 'function' ? update(cur) : update;
-      saveConfig(next);
-      return next;
-    });
+    const next = typeof update === 'function' ? update(cfgRef.current) : update;
+    cfgRef.current = next;
+    setCfgState(next);
+    saveConfig(next);
   }, []);
+
+  // Switching flow (the user picker in the header) swaps the whole layer:
+  // groups, moves and positions, and starts again from the MAP.
+  const [flowId, setFlowId] = React.useState(activeFlowId);
+  React.useEffect(() => subscribeFlows(() => {
+    const id = activeFlowId();
+    setFlowId((cur) => {
+      if (cur === id) return cur;
+      const fresh = loadConfig();
+      cfgRef.current = fresh;
+      setCfgState(fresh);
+      setMoved(new Map(Object.entries(activeFlow().positions || {})));
+      setPath([ROOT]);
+      return id;
+    });
+  }), []);
+  // Boxes dragged by hand are kept in the flow too, once the drag settles.
+  const movedLoaded = React.useRef(false);
+  React.useEffect(() => {
+    if (!movedLoaded.current) { movedLoaded.current = true; return undefined; }
+    const t = setTimeout(() => updateFlow({ positions: Object.fromEntries(moved) }), 400);
+    return () => clearTimeout(t);
+  }, [moved]);
   // Where we are: ROOT, then each engine dived into.
   const [path, setPath] = React.useState([ROOT]);
   // Shift-clicked boxes, waiting to be grouped into an engine.
@@ -1266,23 +1709,231 @@ export default function FlowChart({ v, onJumpToMirror }) {
   const [pickedWire, setPickedWire] = React.useState(null);
 
   // The folded graph (panels collapsed) plus the user's sketch wires.
-  const base = React.useMemo(() => {
+  /*
+   * An ADDED box: a standard box the user placed. Its inputs are the wires
+   * dragged into it; the live ones (math, logic, average, curve, parameter)
+   * compute from the values on those wires, in the order they were wired.
+   */
+  const userWires = React.useRef({ into: new Map(), nodes: new Map() });
+  const inputsOf = (id, v) => (userWires.current.into.get(id) || []).map((src) => {
+    const n = userWires.current.nodes.get(src);
+    if (!n) return { label: src, val: null };
+    let val = null;
+    try { val = n.field && n.field.value ? n.field.value(v) : null; } catch (e) { val = null; }
+    return { label: n.label, val };
+  });
+  const makeAdded = (a) => {
+    const base = { id: a.id, page: 'user', label: a.label, group: 'user', status: 'live', stage: 3, flat: true, added: true };
+    const nums = (v) => inputsOf(a.id, v).map((x) => parseNum(x.val));
+    const draft = 'A draft: it can be placed and wired; it computes once the graph runs the score.';
+    if (a.type === 'fetcher') return { ...base, kind: 'provider', source: null };
+    if (a.type === 'storage') return { ...base, kind: 'store', backend: 'not set', detail: draft };
+    if (a.type === 'panel') return { ...base, kind: 'panel', fields: [], count: 0 };
+    const field = { label: a.label, status: 'live', note: a.live === false ? draft : null };
+    if (a.type === 'input' || a.type === 'output') {
+      const side = a.type === 'input' ? 'in' : 'out';
+      field.portSpec = { side };
+      // What passes through it: whatever is wired in.
+      field.value = (v) => { const ins = inputsOf(a.id, v); return ins.length ? ins[0].val : null; };
+      return { ...base, kind: 'field', field, uport: side };
+    }
+    if (a.type === 'op') {
+      const sym = OP_SYM[a.op];
+      const calc = (v) => {
+        const xs = nums(v);
+        if (!xs.length || xs.some((x) => x === null)) return null;
+        if (a.op === 'sum') return xs.reduce((s, x) => s + x, 0);
+        if (a.op === 'sub') return xs.slice(1).reduce((s, x) => s - x, xs[0]);
+        if (a.op === 'mul') return xs.reduce((s, x) => s * x, 1);
+        if (a.op === 'div') return xs.slice(1).reduce((s, x) => (x ? s / x : null), xs[0]);
+        if (a.op === 'min') return Math.min(...xs);
+        return Math.max(...xs);
+      };
+      field.opSpec = { sym, label: a.label,
+        expr: (v) => { const ins = inputsOf(a.id, v); return ins.length ? ins.map((x) => x.val === null ? '—' : x.val).join(' ' + sym + ' ') : 'wire inputs into it'; } };
+      field.value = (v) => fmtNum(calc(v));
+    } else if (a.type === 'compare') {
+      const test = (v) => { const xs = nums(v); return xs.length >= 2 && xs[0] !== null && xs[1] !== null ? xs[0] >= xs[1] : null; };
+      field.opSpec = { sym: '≥', cond: { kind: 'IF', when: 'first input ≥ second input', test, then: () => 'pass', else: () => 'fail' } };
+      field.value = (v) => { const t = test(v); return t === null ? null : t ? 'pass' : 'fail'; };
+    } else if (a.type === 'if') {
+      const test = (v) => { const ins = inputsOf(a.id, v); return ins.length ? truthy(ins[0].val) : null; };
+      const pick = (i) => (v) => { const ins = inputsOf(a.id, v); return ins[i] ? ins[i].val : null; };
+      field.opSpec = { sym: 'IF', cond: { kind: 'IF', when: 'the first input is a yes', test, then: pick(1), else: pick(2) } };
+      field.value = (v) => { const t = test(v); return t === null ? null : t ? pick(1)(v) : pick(2)(v); };
+    } else if (a.type === 'or') {
+      const terms = (v) => inputsOf(a.id, v).map((x) => ({ label: x.label, ok: truthy(x.val) }));
+      field.opSpec = { sym: 'OR', cond: { kind: 'OR', when: 'any input is a yes', words: ['yes', 'no'], terms } };
+      field.value = (v) => { const t = terms(v); return t.length ? (t.some((x) => x.ok) ? 'true' : 'false') : null; };
+    } else if (a.type === 'mean') {
+      const xs = (v) => nums(v).filter((x) => x !== null);
+      field.agg = { fn: 'MEAN', fmt: fmtNum, what: 'every wired input',
+        points: (v) => xs(v).map((x) => ({ x })), result: (v) => { const l = xs(v); return l.length ? l.reduce((s, x) => s + x, 0) / l.length : null; } };
+      field.value = (v) => fmtNum(field.agg.result(v));
+    } else if (a.type === 'curve') {
+      field.curve = { f: (x) => Math.round(Math.max(0, Math.min(100, x))), x: (v) => nums(v)[0], lo: 0, hi: 100, log: false, xFmt: (x) => fmtNum(x) };
+      field.calc = [];
+      field.value = (v) => { const x = nums(v)[0]; return x === null || x === undefined ? null : Math.round(Math.max(0, Math.min(100, x))); };
+    } else if (a.type === 'param') {
+      const pid = 'param:user:' + a.id;
+      field.param = { id: pid, def: 0, step: 1 };
+      field.value = () => getSetting(pid, { n: 0 }).n;
+    } else if (a.type === 'item') {
+      field.display = 'number';
+      field.value = (v) => { const ins = inputsOf(a.id, v); return ins.length ? ins[0].val : null; };
+    } else if (a.type === 'service') {
+      field.service = { every: 'not set', keeps: 'nothing yet' };
+      field.value = () => null;
+    } else if (a.type === 'extract') {
+      field.extract = { path: 'no file chosen yet', picks: [] };
+      field.value = () => null;
+    } else if (a.type === 'list') {
+      field.listSpec = { rows: () => [], fields: [], of: 'rows' };
+      field.value = () => null;
+    } else if (a.type === 'filter') {
+      field.opSpec = { sym: 'FILTER', filter: { rows: () => [], rules: [], of: 'rows' } };
+      field.value = () => null;
+    } else if (a.type === 'selector') {
+      field.selector = { of: 'inputs', options: (v) => inputsOf(a.id, v).map((x, i) => ({ id: String(i), label: x.label, sub: '', value: x.val })),
+        selected: () => null, pick: () => {} };
+      field.value = () => null;
+    } else if (a.type === 'join') {
+      field.join = { by: 'key', key: () => null, against: () => null, matches: () => [] };
+      field.value = () => null;
+    }
+    return { ...base, kind: 'field', field };
+  };
+
+  /**
+   * The graph AFTER the user's edits - boxes deleted, wires cut, boxes
+   * copied - and what those edits BREAK: every box downstream of a deleted
+   * box or a cut wire has lost data it needs, and is marked so (red), with
+   * the reason, so a removal can be troubleshot by looking.
+   */
+  const edited = React.useMemo(() => {
     if (!full) return null;
     const g = collapse(full, expanded);
-    return { nodes: g.nodes, edges: g.edges.concat(sketchEdges(cfg)) };
+    let nodes = g.nodes;
+    let edges = g.edges;
+    // A copy is the same box under a new id, fed by the same inputs.
+    const copies = cfg.copies || [];
+    if (copies.length) {
+      nodes = nodes.slice();
+      edges = edges.slice();
+      copies.forEach((c) => {
+        const src = g.nodes.find((n) => n.id === c.of);
+        if (!src) return;
+        nodes.push({ ...src, id: c.id, label: src.label + ' (copy)', copyOf: c.of });
+        g.edges.forEach((e) => {
+          if (e.to !== c.of) return;
+          edges.push({ ...e, id: e.id + '@' + c.id, to: c.id,
+            parts: (e.parts || [{ from: e.from, to: e.to }]).map((p) => ({ ...p, to: p.to === c.of ? c.id : p.to })) });
+        });
+      });
+    }
+    // Boxes the user ADDED from the right-click menu.
+    if ((cfg.added || []).length) {
+      nodes = nodes.concat((cfg.added || []).map(makeAdded));
+    }
+    const deleted = cfg.deleted || {};
+    const cut = new Set(cfg.cutWires || []);
+    const labelOf = new Map(nodes.map((n) => [n.id, n.label]));
+    const name = (id) => labelOf.get(id) || id;
+    const out = new Map();
+    edges.forEach((e) => { if (!out.has(e.from)) out.set(e.from, []); out.get(e.from).push(e); });
+    const missing = new Map();
+    const queue = [];
+    const mark = (id, why) => {
+      if (deleted[id]) return;
+      if (!missing.has(id)) { missing.set(id, new Set()); queue.push(id); }
+      missing.get(id).add(why);
+    };
+    Object.keys(deleted).forEach((id) => (out.get(id) || []).forEach((e) => mark(e.to, name(id) + ' was deleted')));
+    edges.forEach((e) => (e.parts || [{ from: e.from, to: e.to }]).forEach((p) => {
+      if (cut.has(p.from + '>' + p.to)) mark(e.to, 'the wire from ' + name(p.from) + ' was cut');
+    }));
+    while (queue.length) {
+      const id = queue.shift();
+      (out.get(id) || []).forEach((e) => mark(e.to, name(id) + ' has missing data'));
+    }
+    const keptEdges = [];
+    edges.forEach((e) => {
+      if (deleted[e.from] || deleted[e.to]) return;
+      const parts = e.parts || [{ from: e.from, to: e.to }];
+      const keep = parts.filter((p) => !cut.has(p.from + '>' + p.to));
+      if (!keep.length) return;
+      keptEdges.push(keep.length === parts.length ? e : { ...e, parts: keep });
+    });
+    const baseOut = { nodes: nodes.filter((n) => !deleted[n.id]), edges: keptEdges.concat(sketchEdges(cfg)) };
+    // What is wired INTO each added box, for its live value.
+    const into = new Map();
+    baseOut.edges.forEach((x) => { if (!into.has(x.to)) into.set(x.to, []); into.get(x.to).push(x.from); });
+    userWires.current = { into, nodes: new Map(baseOut.nodes.map((n) => [n.id, n])) };
+    return { base: baseOut, missing };
   }, [full, expanded, cfg]);
+  const base = edited ? edited.base : null;
+  const missingOf = (id) => (edited && edited.missing.has(id) ? Array.from(edited.missing.get(id)) : null);
   const H = React.useMemo(() => (base ? hierarchy(cfg, base.nodes) : null), [base, cfg]);
+  const brokenGroups = React.useMemo(() => {
+    const m = new Map();
+    if (!edited || !H) return m;
+    edited.missing.forEach((why, id) => {
+      if (!H.nodeById.has(id)) return;
+      H.ancestors(id).forEach((g) => {
+        if (!m.has(g)) m.set(g, []);
+        if (m.get(g).length < 6) m.get(g).push((H.nodeById.get(id) || {}).label + ': ' + Array.from(why)[0]);
+      });
+    });
+    return m;
+  }, [edited, H]);
+  // A user flow's file holds the WHOLE arrangement, not only what the user
+  // changed: every box with its type and group, the groups, the wires. It is
+  // written once, when the flow is first opened - from then on the flow no
+  // longer follows the default's rules, it is its own.
+  React.useEffect(() => {
+    if (!base || !H || flowId === DEFAULT_FLOW) return;
+    if (activeFlow().arrangement) return;
+    const assign = {};
+    base.nodes.forEach((n) => { assign[n.id] = H.parentOf(n.id); });
+    H.engines.forEach((e, id) => { assign[id] = H.parentOf(id); });
+    const arrangement = {
+      savedAt: Date.now(),
+      groups: Array.from(H.engines.values()).map((e) => ({ id: e.id, label: e.label, parent: H.parentOf(e.id) })),
+      boxes: base.nodes.map((n) => ({ id: n.id, label: n.label, type: typeOf(n), group: H.parentOf(n.id) })),
+      wires: base.edges.filter((e) => e.kind !== 'sketch').map((e) => ({ from: e.from, to: e.to, kind: e.kind })),
+    };
+    const nextCfg = { ...cfgRef.current, assign: { ...assign, ...cfgRef.current.assign } };
+    cfgRef.current = nextCfg;
+    setCfgState(nextCfg);
+    updateFlow({ arrangement, cfg: nextCfg });
+  }, [base, H, flowId]);
+
   // A level that stopped existing (its engine was ungrouped) falls back up.
   const level = (() => {
     const l = path[path.length - 1];
     return l === ROOT || (H && H.engines.has(l)) ? l : ROOT;
   })();
 
+  // A calculation box is as tall as its working, which only the browser
+  // knows: each box reports its height and the layout makes room for it.
+  const [measured, setMeasured] = React.useState(() => new Map());
+  // A box setting changed (a filter's mode or count): redraw with the new values.
+  const [, setSettingsTick] = React.useState(0);
+  React.useEffect(() => subscribeSettings(() => setSettingsTick((t) => t + 1)), []);
+  const onMeasure = React.useCallback((id, h) => {
+    setMeasured((cur) => (Math.abs((cur.get(id) || 0) - h) < 2 ? cur : new Map(cur).set(id, h)));
+  }, []);
   const laid = React.useMemo(() => {
     if (!base || !H) return null;
+    const sized = (g) => ({
+      ...g,
+      nodes: g.nodes.map((n) => (n.uport ? { ...n, w: CONNECTOR_W, h: CONNECTOR_H }
+        : n.ported && n.kind === 'field' ? { ...n, w: CALC_W, h: measured.get(n.id) || n.h + 110 } : n)),
+    });
+    const lay = (g) => layout(sized(g));
     // Port rows in the order each engine's own inside lists them.
-    return orderPortsLikeInside(layout(viewGraph(base, H, level)), base, H, layout);
-  }, [base, H, level]);
+    return orderPortsLikeInside(lay(viewGraph(base, H, level)), base, H, lay);
+  }, [base, H, level, measured]);
 
   const byId = React.useMemo(
     () => new Map((laid ? laid.nodes : []).map((n) => [n.id, n])),
@@ -1292,12 +1943,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
   // folded inside a closed panel.
   const fullById = React.useMemo(
     () => new Map((full ? full.nodes : []).map((n) => [n.id, n])),
-    [full],
-  );
-  // Every field, folded or not: a file box reads them to say which provider
-  // fields land in it and which fields are read out of it.
-  const allFields = React.useMemo(
-    () => (full ? full.nodes.filter((n) => n.kind === 'field') : []),
     [full],
   );
 
@@ -1348,23 +1993,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
 
   /* ---- opening --------------------------------------------------------- */
 
-  /**
-   * How far open each card is, 0 to 1.
-   *
-   * Opening a box used to shove the rest of its column out of the way to
-   * make room. It no longer does: the map is a map, and a box that moves
-   * because something ELSE was opened is a box you then have to find again.
-   * An open card simply covers what is behind it and everything else stays
-   * exactly where it was - including anywhere the user dragged it to.
-   */
-  const growTargets = React.useMemo(() => {
-    const m = new Map();
-    if (laid) laid.nodes.forEach((n) => m.set(n.id, cards.has(n.id) ? 1 : 0));
-    return m;
-  }, [laid, cards]);
-
-  const grow = useTween(growTargets);
-  const growOf = React.useCallback((id) => grow.get(id) || 0, [grow]);
 
   /**
    * Where a box sits: the layout, plus wherever the user dragged it.
@@ -1478,6 +2106,11 @@ export default function FlowChart({ v, onJumpToMirror }) {
   /** The box under the pointer, for the end of a sketch wire. */
   const nodeAt = (cx, cy) => {
     const els = document.elementsFromPoint ? document.elementsFromPoint(cx, cy) : [];
+    // A group's inlet row that is a user INPUT takes the wire itself.
+    for (let i = 0; i < els.length; i += 1) {
+      const r = els[i].closest && els[i].closest('[data-inport]');
+      if (r && String(r.getAttribute('data-inport')).indexOf('add:') === 0) return r.getAttribute('data-inport');
+    }
     for (let i = 0; i < els.length; i += 1) {
       const t = els[i].closest && els[i].closest('[data-node-id]');
       if (t) return t.getAttribute('data-node-id');
@@ -1490,9 +2123,8 @@ export default function FlowChart({ v, onJumpToMirror }) {
     if (!H || String(id).indexOf('port:') === 0) return;
     if (H.parentOf(id) === target || !H.canMove(id, target)) return;
     setCfg((cur) => ({ ...cur, assign: { ...cur.assign, [id]: target } }));
-    // Its position and open card belonged to the level it just left.
+    // Its position belonged to the level it just left.
     setMoved((cur) => { const next = new Map(cur); next.delete(id); return next; });
-    setCards((cur) => { const next = new Set(cur); next.delete(id); return next; });
   };
 
   /** Start drawing a sketch wire from an outlet. `from` is the data's source box. */
@@ -1562,6 +2194,20 @@ export default function FlowChart({ v, onJumpToMirror }) {
   };
 
 
+  React.useEffect(() => {
+    if (!laid) return;
+    const want = (cfg.added || []).filter((a) => Number.isFinite(a.x) && !moved.has(a.id));
+    if (!want.length) return;
+    setMoved((cur) => {
+      const next = new Map(cur);
+      want.forEach((a) => {
+        const n = laid.nodes.find((x) => x.id === a.id);
+        if (n && !next.has(a.id)) next.set(a.id, { dx: a.x - n.x, dy: a.y - n.y });
+      });
+      return next;
+    });
+  }, [laid, cfg.added]);
+
   const fit = React.useCallback(() => {
     const el = wrapRef.current;
     if (!el || !laid) return;
@@ -1574,19 +2220,22 @@ export default function FlowChart({ v, onJumpToMirror }) {
   // Fit once, when the first layout lands - and only once the canvas has a
   // size. Fitting into a canvas that has not been laid out yet divided by a
   // near-zero width and opened the map at the 7% floor, a smudge in a corner.
-  const fitted = React.useRef(false);
+  // Holds the LEVEL last fitted, not a flag: a level change and the layout
+  // it produces land in the same render, and a flag reset by the level's own
+  // effect came too late for this one - climbing back up kept the deeper zoom.
+  const fitted = React.useRef(null);
   React.useEffect(() => {
-    if (!laid || fitted.current) return undefined;
+    if (!laid || fitted.current === level) return undefined;
     let raf = 0;
     const tryFit = (left) => {
       const el = wrapRef.current;
       const r = el && el.getBoundingClientRect();
-      if (r && r.width > 200 && r.height > 150) { fitted.current = true; fit(); return; }
+      if (r && r.width > 200 && r.height > 150) { fitted.current = level; fit(); return; }
       if (left > 0) raf = requestAnimationFrame(() => tryFit(left - 1));
     };
     tryFit(120);
     return () => cancelAnimationFrame(raf);
-  }, [laid, fit]);
+  }, [laid, fit, level]);
 
   /** Centre one node without changing the zoom - how search and the drawer move. */
   const centreOn = React.useCallback((id) => {
@@ -1615,12 +2264,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
    * from under you - the one place a jump is least wanted, because you were
    * already looking at the right thing.
    */
-  const pick = (id) => setCards((cur) => {
-    const next = new Set(cur);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    return next;
-  });
 
   /**
    * Go to a box somewhere else on the map: search, and the chips inside an
@@ -1645,7 +2288,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
       requestAnimationFrame(() => centreOn(id));
       return;
     }
-    setCards((cur) => (cur.has(id) ? cur : new Set(cur).add(id)));
     // Going to a box selects it too, so its wiring lights up on arrival.
     setSelected(id);
     setView((cur) => (cur.k >= READABLE ? cur : { ...cur, k: READABLE }));
@@ -1667,10 +2309,9 @@ export default function FlowChart({ v, onJumpToMirror }) {
   // unless a jump is about to centre on one box, which then wins.
   const pendingGo = React.useRef(null);
   React.useEffect(() => {
-    setCards(new Set());
-    setAnchors(new Map());
     setHoverEdge(null);
-    if (!pendingGo.current) fitted.current = false;
+    // A jump about to centre on one box wins over fitting the new level.
+    if (pendingGo.current) fitted.current = level;
   }, [level]);
   React.useEffect(() => {
     const id = pendingGo.current;
@@ -1727,21 +2368,127 @@ export default function FlowChart({ v, onJumpToMirror }) {
     setCfg((cur) => ({ ...cur, sketch: (cur.sketch || []).filter((s) => s.id !== sid) }));
     setPickedWire(null);
   };
-  // Delete / Backspace removes a picked sketch wire.
+
+  /* ---- EDITING: delete, copy, cut, paste ------------------------------
+     Every edit is part of the flow's config, so on a user's flow it is
+     saved and on DEFAULT it is a preview that a refresh undoes. */
+  const [clip, setClip] = React.useState(null);
+  const [menu, setMenu] = React.useState(null);
+  const openMenu = (ev, target) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    setMenu({ x: ev.clientX, y: ev.clientY, ...target });
+  };
   React.useEffect(() => {
-    if (!pickedWire) return undefined;
+    if (!menu) return undefined;
+    const close = () => setMenu(null);
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', onKey); };
+  }, [menu]);
+  const isCopy = (id) => (cfg.copies || []).some((c) => c.id === id);
+  const canEdit = (id) => Boolean(id) && String(id).indexOf('port:') !== 0;
+  const deleteBox = (id) => {
+    if (!H || !canEdit(id)) return;
+    if (String(id).indexOf('add:') === 0) {
+      // An added box goes for good, with the wires drawn to and from it.
+      setCfg((cur) => ({ ...cur, added: (cur.added || []).filter((a) => a.id !== id),
+        sketch: (cur.sketch || []).filter((s) => s.from !== id && s.to !== id) }));
+    } else if (isCopy(id)) {
+      setCfg((cur) => ({ ...cur, copies: (cur.copies || []).filter((c) => c.id !== id) }));
+    } else if (H.engines.has(id)) {
+      // A group goes with everything in it, groups inside it included.
+      const inside = base.nodes.map((n) => n.id).concat(Array.from(H.engines.keys()))
+        .filter((x) => x === id || H.ancestors(x).indexOf(id) !== -1);
+      setCfg((cur) => {
+        const deleted = { ...(cur.deleted || {}) };
+        inside.forEach((x) => { deleted[x] = true; });
+        return { ...cur, deleted };
+      });
+    } else {
+      setCfg((cur) => ({ ...cur, deleted: { ...(cur.deleted || {}), [id]: true } }));
+    }
+    if (selected === id) setSelected(null);
+  };
+  const cutWire = (e) => {
+    if (e.kind === 'sketch') { deleteWire(e.sketchId); return; }
+    const keys = (e.parts || [{ from: e.from, to: e.to }]).map((p) => p.from + '>' + p.to);
+    setCfg((cur) => ({ ...cur, cutWires: Array.from(new Set((cur.cutWires || []).concat(keys))) }));
+  };
+  const copyBox = (id) => { if (canEdit(id) && !H.engines.has(id)) setClip({ mode: 'copy', id }); };
+  const cutBox = (id) => { if (canEdit(id)) setClip({ mode: 'cut', id }); };
+  const paste = () => {
+    if (!clip) return;
+    if (clip.mode === 'cut') {
+      moveInto(clip.id, level);
+      setClip(null);
+      return;
+    }
+    const of = ((cfg.copies || []).find((c) => c.id === clip.id) || {}).of || clip.id;
+    const id = 'copy:' + Date.now().toString(36) + ':' + of;
+    setCfg((cur) => ({ ...cur, copies: (cur.copies || []).concat([{ id, of }]), assign: { ...cur.assign, [id]: level } }));
+    setSelected(id);
+  };
+  const restoreEdits = () => setCfg((cur) => ({ ...cur, deleted: {}, cutWires: [] }));
+
+  /** Rename an added box: a connector's name is also its dot's name on the group. */
+  const renameAdded = React.useCallback((id, label) => {
+    const clean = String(label || '').trim().toUpperCase();
+    if (!clean) return;
+    setCfg((cur) => ({ ...cur, added: (cur.added || []).map((a) => (a.id === id ? { ...a, label: clean } : a)) }));
+  }, [setCfg]);
+
+  /** Rename a group's IN / OUT connector: a display name over its data key, kept in the flow. */
+  const renamePort = (key, label) => {
+    const clean = String(label || '').trim().toUpperCase();
+    if (!clean) return;
+    setCfg((cur) => ({ ...cur, portNames: { ...(cur.portNames || {}), [key]: clean } }));
+  };
+
+  /** ADD: a standard box (or an empty group) where the menu was opened. */
+  const addBox = (item, at) => {
+    if (item.inGroup && level === ROOT) return;
+    const p = at ? toMap(at.x, at.y) : null;
+    const stamp = Date.now().toString(36);
+    if (item.type === 'group') {
+      const id = 'eng:u:' + stamp;
+      setCfg((cur) => ({ ...cur, engines: { ...cur.engines, [id]: { label: 'NEW GROUP', parent: level } } }));
+      return;
+    }
+    const id = 'add:' + stamp;
+    setCfg((cur) => ({
+      ...cur,
+      added: (cur.added || []).concat([{ id, type: item.type, op: item.op || null, label: item.label.toUpperCase(),
+        live: Boolean(item.live), x: p ? p.x : null, y: p ? p.y : null }]),
+      assign: { ...cur.assign, [id]: level },
+    }));
+    setSelected(id);
+  };
+  const editCount = Object.keys(cfg.deleted || {}).length + (cfg.cutWires || []).length;
+
+  // Keys: Delete removes the selected box (or a picked sketch wire); Ctrl+C /
+  // Ctrl+X / Ctrl+V copy, cut and paste it; Escape lets go.
+  React.useEffect(() => {
     const onKey = (e) => {
       const tag = e.target && e.target.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (e.key === 'Delete' || e.key === 'Backspace') deleteWire(pickedWire);
-      if (e.key === 'Escape') setPickedWire(null);
+      const mod = e.ctrlKey || e.metaKey;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (pickedWire) deleteWire(pickedWire);
+        else if (selected) deleteBox(selected);
+      } else if (mod && (e.key === 'c' || e.key === 'C') && selected) copyBox(selected);
+      else if (mod && (e.key === 'x' || e.key === 'X') && selected) cutBox(selected);
+      else if (mod && (e.key === 'v' || e.key === 'V')) paste();
+      else if (e.key === 'Escape') setPickedWire(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   });
   const [confirmReset, setConfirmReset] = React.useState(false);
   const cfgTouched = Object.keys(cfg.engines).length + Object.keys(cfg.assign).length +
-    Object.keys(cfg.renamed).length + Object.keys(cfg.removed).length + (cfg.sketch || []).length > 0;
+    Object.keys(cfg.renamed).length + Object.keys(cfg.removed).length + (cfg.sketch || []).length +
+    (cfg.copies || []).length > 0;
 
   const togglePanel = (id) => setExpanded((cur) => {
     const next = new Set(cur);
@@ -1754,83 +2501,38 @@ export default function FlowChart({ v, onJumpToMirror }) {
     return <div style={{ padding: 20, color: C.dim, fontSize: 11 }}>Building the map&hellip;</div>;
   }
 
-  // Includes the ones on their way shut, or closing would be a cut rather
-  // than the reverse of opening.
-  const openCards = laid.nodes.filter((n) => cards.has(n.id) || growOf(n.id) > 0.01);
-  const edgesOf = (id) => laid.edges.filter((e) => e.from === id || e.to === id);
-
-  /** The row inside an open card that this edge belongs to, if there is one. */
-  const anchorFor = (cardId, otherId, side, key) => {
-    const m = anchors.get(cardId);
-    if (!m) return null;
-    // A split line looks for its own link first; a whole arrow, and a split
-    // one whose card has not reported that row yet, fall back to the box.
-    return (key && m.get(key + ':' + side)) || m.get(otherId + ':' + side) || null;
+  /**
+   * A wire is NEUTRAL when data flows and RED when it does not - its data
+   * TYPE is on the port dots at either end, never on the line. Solid red: the
+   * box it leaves lost its inputs (something upstream was deleted or cut).
+   * Dashed red: nothing arrives on it this poll. Hover a red wire for why.
+   */
+  const wireState = (e) => {
+    if (e.kind === 'sketch') return { color: SKETCH_COLOR };
+    const parts = e.parts || [];
+    const brokenSrc = [e.src, e.from].concat(parts.map((p) => p.from)).find((id) => id && edited && edited.missing.has(id));
+    if (brokenSrc) return { color: WIRE_BAD, why: 'disconnected: ' + Array.from(edited.missing.get(brokenSrc))[0] };
+    const a = byId.get(e.from);
+    if (!a) return { color: WIRE_OK };
+    const vv = liveV.current;
+    let val = null;
+    let hasValue = false;
+    if (e.fromPort && e.fromPort !== a.id) {
+      const src = H && H.nodeById.get(e.fromPort);
+      const p = (a.outPorts || []).find((x) => x.key === e.fromPort);
+      const field = (src && src.kind === 'field' && src.field) || (p && p.field) || null;
+      if (field && field.value) { hasValue = true; val = boxValue({ kind: 'field', field }, vv); }
+    } else if ((a.kind === 'field' || a.kind === 'port') && a.field && a.field.value) {
+      hasValue = true;
+      val = boxValue(a, vv);
+    }
+    if (hasValue && val === null) return { color: WIRE_BAD, dash: '4 3', why: 'missing data: nothing arrives on this wire this poll' };
+    return { color: WIRE_OK };
   };
 
-  /**
-   * The lines to draw. While either end of an arrow is open, an arrow standing
-   * for several field-to-field links becomes one line per link - so four
-   * components send four values to RAW instead of one line carrying "4
-   * fields", and each line can be named by the DATA it carries rather than by
-   * the box it came from. Closed, they collapse back to one.
-   */
-  /**
-   * Which KEYS of a raw file each box reads out of it.
-   *
-   * A file-to-field arrow is one edge however many keys travel along it, so
-   * the parts that split a panel's arrow do not exist here. The record's own
-   * picks are that list, and they are what lets an open file card send one
-   * line per key from the dot beside it.
-   */
-  // Not a hook: this sits past an early return, and a conditional useMemo is
-  // "rendered more hooks than during the previous render". It walks ten file
-  // nodes, so there is nothing to memoise anyway.
-  const filePicks = (() => {
-    const out = new Map();
-    laid.nodes.forEach((n) => {
-      if (n.kind !== 'file') return;
-      const slot = slotOfPath(n.path);
-      if (!slot) return;
-      const r = recordReaders(allFields, slot, null);
-      if (r && r.picks.length) out.set(n.id, r.picks.filter((p) => p.toId));
-    });
-    return out;
-  })();
-
-  const drawEdges = [];
-  laid.edges.forEach((e) => {
-    const parts = e.parts || [];
-    const openEnd = growOf(e.from) > 0.01 || growOf(e.to) > 0.01;
-
-    // An OPEN file card: one line per key the target reads out of it.
-    if (growOf(e.from) > 0.01 && filePicks.has(e.from)) {
-      const mine = filePicks.get(e.from).filter((p) => p.toId === e.to);
-      if (mine.length) {
-        const seen = new Set();
-        mine.forEach((p) => {
-          const key = p.path + '>' + p.toId;
-          if (seen.has(key)) return;
-          seen.add(key);
-          drawEdges.push(Object.assign({}, e, {
-            id: e.id + '#' + key, anchorKey: key, keyPath: p.path, split: true,
-          }));
-        });
-        return;
-      }
-    }
-
-    if (!openEnd || parts.length < 2 || e.kind === 'contains') { drawEdges.push(e); return; }
-    const seen = new Set();
-    parts.forEach((part) => {
-      const key = partKey(part.from, part.to);
-      if (seen.has(key)) return;
-      seen.add(key);
-      drawEdges.push(Object.assign({}, e, {
-        id: e.id + '#' + key, anchorKey: key, parts: [part], split: true,
-      }));
-    });
-  });
+  // One line per wire. (Wires used to split per value while a box was open;
+  // no box opens now - every box shows its ports - so a wire is drawn whole.)
+  const drawEdges = laid.edges;
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>
@@ -1861,54 +2563,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
               );
             })}
           </div>
-        {/* GROUP: shift-click boxes, name them, make them one engine. */}
-        {groupSet.size > 0 && (
-          <>
-            <input value={groupName} onChange={(e) => setGroupName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') groupIntoEngine(); if (e.key === 'Escape') setGroupSet(new Set()); }}
-              placeholder={'name for ' + groupSet.size + ' boxes'} spellCheck={false}
-              style={{ background: '#0d1730', border: `1px solid ${C.pink}`, borderRadius: 999, color: C.text,
-                fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
-            <Button onClick={groupIntoEngine} active>GROUP {groupSet.size} INTO ENGINE</Button>
-            <Button onClick={() => setGroupSet(new Set())}>CLEAR</Button>
-          </>
-        )}
-        {/* The selected engine: open it, rename it, or take it apart. */}
-        {selected && H && H.engines.has(selected) && groupSet.size === 0 && (
-          <>
-            <Button onClick={() => dive(selected)} active>OPEN</Button>
-            <input value={rename} onChange={(e) => setRename(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') renameEngine(selected, rename); }}
-              placeholder={'rename ' + H.engines.get(selected).label.toLowerCase()} spellCheck={false}
-              style={{ background: '#0d1730', border: `1px solid ${C.border}`, borderRadius: 999, color: C.text,
-                fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
-            {rename.trim() && <Button onClick={() => renameEngine(selected, rename)}>RENAME</Button>}
-            <Button onClick={() => ungroup(selected)} title="move everything inside it up one level and remove the engine">
-              UNGROUP
-            </Button>
-          </>
-        )}
-        {pickedWire && (
-          <Button onClick={() => deleteWire(pickedWire)} active title="or press Delete">DELETE WIRE</Button>
-        )}
-        {cfgTouched && (
-          <Button onClick={() => {
-            if (!confirmReset) { setConfirmReset(true); return; }
-            setCfg(emptyConfig()); setPath([ROOT]); setConfirmReset(false);
-          }} title="drop your engines, moves, renames and sketch wires">
-            {confirmReset ? 'CLICK AGAIN TO RESET' : 'RESET ENGINES'}
-          </Button>
-        )}
-        {cards.size > 0 && (
-          <Button onClick={() => setCards(new Set())} title="close every open box">
-            CLOSE {cards.size} OPEN
-          </Button>
-        )}
-        {moved.size > 0 && (
-          <Button onClick={() => setMoved(new Map())} title="put every box back where the layout put it">
-            RESET {moved.size} MOVED
-          </Button>
-        )}
         {/* Navigation on the left, search pushed to the right. */}
         <div style={{ flex: 1 }} />
         <input
@@ -1947,7 +2601,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
             {matches.size ? matches.size + ' match' : 'enter: search inside engines'}
           </span>
         )}
-        <Legend />
       </div>
 
       {/* ---- canvas ----------------------------------------------------- */}
@@ -1956,6 +2609,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={endDrag}
+        onContextMenu={(ev) => openMenu(ev, { kind: 'canvas' })}
         // A click on the EMPTY map clears the selection (boxes and cards stop
         // their own clicks). Nothing else is closed by it.
         onClick={() => {
@@ -1971,6 +2625,68 @@ export default function FlowChart({ v, onJumpToMirror }) {
           background: 'radial-gradient(circle at 30% 20%, #0b1a3a 0%, #060d1f 70%)',
         }}
       >
+        {/* Actions on the map - group, rename, ungroup, delete a wire, reset -
+            float at its bottom-left, so the header holds only where you are
+            and the search. A press here is a click, never the start of a pan. */}
+        <div onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}
+          style={{
+            position: 'absolute', left: 12, bottom: 12, zIndex: 20, display: 'flex',
+            alignItems: 'center', gap: 8, flexWrap: 'wrap', maxWidth: 'calc(100% - 24px)',
+          }}>
+            {/* GROUP: shift-click boxes, name them, make them one engine. */}
+            {groupSet.size > 0 && (
+              <>
+                <input value={groupName} onChange={(e) => setGroupName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') groupIntoEngine(); if (e.key === 'Escape') setGroupSet(new Set()); }}
+                  placeholder={'name for ' + groupSet.size + ' boxes'} spellCheck={false}
+                  style={{ background: '#0d1730', border: `1px solid ${C.pink}`, borderRadius: 999, color: C.text,
+                    fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
+                <Button onClick={groupIntoEngine} active>GROUP {groupSet.size} INTO ENGINE</Button>
+                <Button onClick={() => setGroupSet(new Set())}>CLEAR</Button>
+              </>
+            )}
+            {/* The selected engine: open it, rename it, or take it apart. */}
+            {selected && H && H.engines.has(selected) && groupSet.size === 0 && (
+              <>
+                <Button onClick={() => dive(selected)} active>OPEN</Button>
+                <input value={rename} onChange={(e) => setRename(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') renameEngine(selected, rename); }}
+                  placeholder={'rename ' + H.engines.get(selected).label.toLowerCase()} spellCheck={false}
+                  style={{ background: '#0d1730', border: `1px solid ${C.border}`, borderRadius: 999, color: C.text,
+                    fontFamily: 'inherit', fontSize: 10, padding: '4px 10px', width: 150, outline: 'none' }} />
+                {rename.trim() && <Button onClick={() => renameEngine(selected, rename)}>RENAME</Button>}
+                <Button onClick={() => ungroup(selected)} title="move everything inside it up one level and remove the engine">
+                  UNGROUP
+                </Button>
+              </>
+            )}
+            {pickedWire && (
+              <Button onClick={() => deleteWire(pickedWire)} active title="or press Delete">DELETE WIRE</Button>
+            )}
+            {cfgTouched && (
+              <Button onClick={() => {
+                if (!confirmReset) { setConfirmReset(true); return; }
+                setCfg(emptyConfig()); setPath([ROOT]); setConfirmReset(false);
+              }} title="drop your engines, moves, renames and sketch wires">
+                {confirmReset ? 'CLICK AGAIN TO RESET' : 'RESET ENGINES'}
+              </Button>
+            )}
+            {moved.size > 0 && (
+              <Button onClick={() => setMoved(new Map())} title="put every box back where the layout put it">
+                RESET {moved.size} MOVED
+              </Button>
+            )}
+            {editCount > 0 && (
+              <Button onClick={restoreEdits} title="bring back every deleted box and cut wire">
+                RESTORE {editCount} DELETED
+              </Button>
+            )}
+            {clip && (
+              <Button onClick={paste} active title={'paste here (Ctrl+V)'}>
+                PASTE {clip.mode === 'cut' ? 'MOVE' : 'COPY'}
+              </Button>
+            )}
+        </div>
         <div style={{
           position: 'absolute', left: 0, top: 0,
           transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})`,
@@ -1987,10 +2703,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
           >
             <defs>
               <style>{'@keyframes vsEdgeFlow { to { stroke-dashoffset: -12; } }'}</style>
-              {Array.from(new Set(laid.edges.map((e) => {
-                const a = byId.get(e.from);
-                return a ? nodeColor(a) : C.dim;
-              }).concat([SKETCH_COLOR]))).map((color) => (
+              {[WIRE_OK, WIRE_BAD, SKETCH_COLOR].map((color) => (
                 <marker key={color} id={markerId(color)} viewBox="0 0 8 8" refX="7" refY="4"
                   markerWidth="5" markerHeight="5" orient="auto-start-reverse">
                   <path d="M 0 1 L 8 4 L 0 7 z" fill={color} />
@@ -2005,30 +2718,16 @@ export default function FlowChart({ v, onJumpToMirror }) {
               // The box it comes OUT of decides the colour - except a sketch
               // wire, which is always the user's own colour.
               const isSketch = e.kind === 'sketch';
-              const color = isSketch ? SKETCH_COLOR : nodeColor(a);
-              // When either end is open, the line goes to the ROW that names
-              // the other end rather than to the middle of the box.
+              const ws = wireState(e);
+              const color = ws.color;
+              // From the right edge of one box to the left edge of the next -
+              // or, on a box with ports, from / to the ROW of the value carried.
               const pa = posOf(a);
               const pb = posOf(b);
-              const outA = anchorFor(a.id, b.id, 'out', e.anchorKey);
-              const inB = anchorFor(b.id, a.id, 'in', e.anchorKey);
-              // Eased from the box’s own centre to its row as the card opens,
-              // rather than switched over at the end: a gate made every arrow
-              // jump at once the moment the growth finished.
-              const ga = growOf(a.id);
-              const gb = growOf(b.id);
-              // An open card is wider than its box: leave from the card's edge.
-              const ca = { x: pa.x + a.w + (Math.max(a.w, CARD_W) - a.w) * ga, y: pa.y + a.h / 2 };
-              const cb = { x: pb.x, y: pb.y + b.h / 2 };
-              let p1 = outA
-                ? { x: ca.x + (outA.edgeX - ca.x) * ga, y: ca.y + (outA.y - ca.y) * ga }
-                : ca;
-              let p2 = inB
-                ? { x: cb.x + (inB.edgeX - cb.x) * gb, y: cb.y + (inB.y - cb.y) * gb }
-                : cb;
-              // An engine's line leaves from / arrives at its own PORT row.
-              if (e.fromPort && a.kind === 'engine') p1 = portPoint(a, pa, 'out', e.fromPort);
-              if (e.toPort && b.kind === 'engine') p2 = portPoint(b, pb, 'in', e.toPort);
+              let p1 = { x: pa.x + a.w, y: pa.y + a.h / 2 };
+              let p2 = { x: pb.x, y: pb.y + b.h / 2 };
+              if (e.fromPort && (a.kind === 'engine' || (a.ported && !a.uport))) p1 = portPoint(a, pa, 'out', e.fromPort);
+              if (e.toPort && (b.kind === 'engine' || (b.ported && !b.uport))) p2 = portPoint(b, pb, 'in', e.toPort);
               // Hovering BRIGHTENS the path it belongs to. It used to fade
               // everything else to near-invisible, which answered the question
               // by hiding the diagram rather than by pointing at part of it.
@@ -2050,12 +2749,13 @@ export default function FlowChart({ v, onJumpToMirror }) {
                     fill="none"
                     stroke={color}
                     strokeWidth={hot ? 2.6 : sel ? 2.2 : onPath ? 1.8 : 1}
-                    strokeDasharray={s.dash || undefined}
+                    strokeDasharray={ws.dash || s.dash || undefined}
                     markerEnd={`url(#${markerId(color)})`}
-                    opacity={lit ? 1 : onPath ? 0.95 : 0.35}
+                    opacity={lit || color === WIRE_BAD ? 1 : onPath ? 0.95 : 0.35}
                     style={lit ? { filter: `drop-shadow(0 0 3px ${color})` } : undefined}
                   />
                   {/* Data moving along a hovered or selected line, source to target. */}
+                  {ws.why && <title>{ws.why}</title>}
                   {lit && (
                     <path d={d} fill="none" stroke="#ffffff" strokeWidth={1.6}
                       strokeDasharray="2 10" strokeLinecap="round" opacity={0.9}
@@ -2074,6 +2774,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
                     // A sketch wire is picked by clicking it, then deleted.
                     onClick={isSketch ? (ev) => { ev.stopPropagation(); setPickedWire(e.sketchId); } : undefined}
                     onMouseDown={isSketch ? (ev) => ev.stopPropagation() : undefined}
+                    onContextMenu={(ev) => openMenu(ev, { kind: 'wire', edge: e })}
                     onMouseEnter={track}
                     onMouseMove={track}
                     onMouseLeave={() => setHoverEdge((cur) => (cur && cur.id === e.id ? null : cur))}
@@ -2092,9 +2793,9 @@ export default function FlowChart({ v, onJumpToMirror }) {
                 per box, drawn from posOf like everything else. */}
             <g>
               {laid.nodes.map((n) => {
-                if (cards.has(n.id) || growOf(n.id) > 0.01) return null;
-                // An engine draws its own frame (it has port rows inside it).
-                if (n.kind === 'engine') return null;
+                // An engine draws its own frame (it has port rows inside it),
+                // and so does a closed panel drawn the same way.
+                if (n.kind === 'engine' || n.ported || n.kind === 'port') return null;
                 if (groupSet.has(n.id)) {
                   const gp = posOf(n);
                   return (
@@ -2122,9 +2823,6 @@ export default function FlowChart({ v, onJumpToMirror }) {
           </svg>
 
           {laid.nodes.map((n) => {
-            // The opened box replaces its own collapsed one rather than
-            // sitting on top of it, or the title would show through twice.
-            if (cards.has(n.id) || growOf(n.id) > 0.01) return null;
             const col = nodeColor(n);
             // Only a SEARCH dims boxes - that is what a search is for. Hovering
             // leaves every box exactly as it was.
@@ -2141,10 +2839,49 @@ export default function FlowChart({ v, onJumpToMirror }) {
                 setGroupSet((cur) => { const next = new Set(cur); if (next.has(n.id)) next.delete(n.id); else next.add(n.id); return next; });
                 return;
               }
-              if (n.kind !== 'engine' && n.kind !== 'port') pick(n.id);
               setSelected(n.id);
               setPickedWire(null);
             };
+            if (n.uport || n.kind === 'port') {
+              const side = n.uport ? n.uport : n.side;
+              const key = n.uport ? n.id : n.src;
+              let val = null;
+              try { val = n.field && n.field.value ? boxValue(n, liveV.current) : null; } catch (err) { val = null; }
+              return (
+                <ConnectorNode key={n.id} n={n} pos={pos} col={col} dim={dim} isSel={n.id === selected} v={liveV.current}
+                  side={side} label={n.label} value={val}
+                  onRename={(name) => (n.uport ? renameAdded(n.id, name) : renamePort(key, name))}
+                  onMouseDown={startNodeDrag(n.id)} onClick={onBoxClick}
+                  onDoubleClick={(e) => { e.stopPropagation(); if (n.kind === 'port') goTo(n.src); }}
+                  onHover={(on) => setHover(on ? n.id : null)}
+                  onStartWire={startWire(key)}
+                  onContextMenu={(ev) => openMenu(ev, { kind: 'box', id: n.id })} />
+              );
+            }
+            if (n.ported && n.kind === 'field') {
+              return (
+                <CalcBox key={n.id} n={n} pos={pos} col={col} dim={dim}
+                  isSel={n.id === selected} isNear={Boolean(selNear && selNear.has(n.id))}
+                  inGroup={groupSet.has(n.id)}
+                  onMouseDown={startNodeDrag(n.id)} onClick={onBoxClick}
+                  onHover={(on) => setHover(on ? n.id : null)}
+                  onStartWire={startWire} v={liveV.current} nodeById={H ? H.nodeById : null}
+                  onMeasure={onMeasure} alert={missingOf(n.id)}
+                  onContextMenu={(ev) => openMenu(ev, { kind: 'box', id: n.id })} />
+              );
+            }
+            if (n.ported) {
+              return (
+                <EngineBox key={n.id} n={n} pos={pos} col={col} dim={dim}
+                  isSel={n.id === selected} isNear={Boolean(selNear && selNear.has(n.id))}
+                  inGroup={groupSet.has(n.id)}
+                  onMouseDown={startNodeDrag(n.id)} onClick={onBoxClick}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                  onHover={(on) => setHover(on ? n.id : null)}
+                  onStartWire={startWire} v={liveV.current} nodeById={H ? H.nodeById : null}
+                  alert={missingOf(n.id)} onContextMenu={(ev) => openMenu(ev, { kind: 'box', id: n.id })} />
+              );
+            }
             if (n.kind === 'engine') {
               return (
                 <EngineBox key={n.id} n={n} pos={pos} col={col} dim={dim}
@@ -2153,7 +2890,8 @@ export default function FlowChart({ v, onJumpToMirror }) {
                   onMouseDown={startNodeDrag(n.id)} onClick={onBoxClick}
                   onDoubleClick={(e) => { e.stopPropagation(); dive(n.id); }}
                   onHover={(on) => setHover(on ? n.id : null)}
-                  onStartWire={startWire} v={liveV.current} nodeById={H ? H.nodeById : null} />
+                  onStartWire={startWire} v={liveV.current} nodeById={H ? H.nodeById : null}
+                  alert={brokenGroups.get(n.id) || null} onContextMenu={(ev) => openMenu(ev, { kind: 'box', id: n.id })} />
               );
             }
             return (
@@ -2164,6 +2902,7 @@ export default function FlowChart({ v, onJumpToMirror }) {
                 onMouseLeave={() => setHover(null)}
                 onMouseDown={startNodeDrag(n.id)}
                 onClick={onBoxClick}
+                onContextMenu={(ev) => openMenu(ev, { kind: 'box', id: n.id })}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
                   if (n.kind === 'panel') togglePanel(n.id);
@@ -2227,7 +2966,10 @@ export default function FlowChart({ v, onJumpToMirror }) {
           {/* Column headers - the step each column IS - and a caption over
               each run of one tab's panels. Both come from the layout, which is
               the one place that knows where a column and a run begin. */}
-          {(laid.captions || []).map((c, i) => (c.kind === 'stage' ? (
+          {/* Column titles with a subline ("3 · ENGINES / for the selected token")
+              are not drawn: the groups and boxes name themselves. Only the
+              short IN / OUT over a group's connectors stay. */}
+          {(laid.captions || []).filter((c) => !(c.kind === 'stage' && c.sub)).map((c, i) => (c.kind === 'stage' ? (
             <div key={'c' + i} style={{
               position: 'absolute', left: c.x, top: c.y, width: c.w, pointerEvents: 'none',
               borderTop: `2px solid ${c.color}`, paddingTop: 5,
@@ -2241,36 +2983,69 @@ export default function FlowChart({ v, onJumpToMirror }) {
               fontWeight: 700, color: c.color, opacity: 0.8, pointerEvents: 'none',
             }}>{c.text}</div>
           )))}
-          {/* The opened box sits in the same coordinate space as the node it
-              grew from, so panning and zooming carry it along. */}
-          <SelCtx.Provider value={{ selected, near: selNear }}>
-            {openCards.map((node) => (
-              // Capture phase: the card stops its own clicks from reaching the
-              // map, so selecting it has to happen on the way IN.
-              <div key={node.id} style={{ display: 'contents' }} data-node-id={node.id}
-                onClickCapture={() => setSelected(node.id)}>
-                <NodeCard
-                  node={node}
-                  at={posOf(node)}
-                  grow={growOf(node.id)}
-                  onDragStart={startNodeDrag(node.id)}
-                  onAnchors={reportAnchors}
-                  fullById={fullById}
-                  edges={edgesOf(node.id)}
-                  byId={byId}
-                  allFields={allFields}
-                  v={liveV.current}
-                  onClose={() => {
-                    setCards((cur) => { const next = new Set(cur); next.delete(node.id); return next; });
-                  }}
-                  onPick={goTo}
-                  isOpen={expanded.has(node.id)}
-                  onJumpToMirror={onJumpToMirror}
-                />
-              </div>
-            ))}
-          </SelCtx.Provider>
         </div>
+        {menu && (() => {
+          const item = (label, run, enabled, key) => (
+            <div key={label} onMouseDown={(ev) => { ev.stopPropagation(); if (!enabled) return; run(); setMenu(null); }}
+              style={{ display: 'flex', justifyContent: 'space-between', gap: 18, padding: '6px 12px', fontSize: 10.5,
+                cursor: enabled ? 'pointer' : 'default', color: enabled ? C.text : C.grey }}
+              onMouseEnter={(ev) => { if (enabled) ev.currentTarget.style.background = 'rgba(227,95,242,0.12)'; }}
+              onMouseLeave={(ev) => { ev.currentTarget.style.background = 'transparent'; }}>
+              <span>{label}</span><span style={{ color: C.faint, fontSize: 9 }}>{key}</span>
+            </div>
+          );
+          const isGroup = menu.kind === 'box' && H && H.engines.has(menu.id);
+          const editable = menu.kind === 'box' && canEdit(menu.id);
+          return (
+            <div onMouseDown={(ev) => ev.stopPropagation()} onContextMenu={(ev) => ev.preventDefault()} style={{
+              position: 'fixed', left: menu.x, top: menu.y, zIndex: 300, minWidth: 170, padding: '4px 0',
+              background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, boxShadow: '0 14px 40px rgba(0,0,0,0.6)',
+            }}>
+              {menu.kind === 'box' && (
+                <div style={{ padding: '4px 12px 6px', fontSize: 8.5, fontWeight: 700, letterSpacing: 0.8, color: C.dim,
+                  borderBottom: `1px solid ${C.line}`, marginBottom: 2, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {((byId.get(menu.id) || {}).label || '').toUpperCase()}
+                </div>
+              )}
+              {menu.kind === 'box' && item(isGroup ? 'Delete group and contents' : 'Delete', () => deleteBox(menu.id), editable, 'Del')}
+              {menu.kind === 'box' && item('Copy', () => copyBox(menu.id), editable && !isGroup, 'Ctrl+C')}
+              {menu.kind === 'box' && item('Cut', () => cutBox(menu.id), editable, 'Ctrl+X')}
+              {item(clip ? 'Paste ' + (clip.mode === 'cut' ? '(move here)' : '(a copy)') : 'Paste', paste, Boolean(clip), 'Ctrl+V')}
+              {menu.kind === 'canvas' && (
+                <div onMouseEnter={() => setMenu((m) => (m ? { ...m, sub: true } : m))}
+                  style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', padding: '6px 12px', fontSize: 10.5,
+                    cursor: 'pointer', color: C.white, borderTop: `1px solid ${C.line}`, marginTop: 2,
+                    background: menu.sub ? 'rgba(227,95,242,0.12)' : 'transparent' }}>
+                  <span>Add</span><span style={{ color: C.faint }}>&#9656;</span>
+                  {menu.sub && (
+                    <div onMouseDown={(ev) => ev.stopPropagation()} style={{
+                      position: 'absolute', left: '100%', top: -6, marginLeft: 4, width: 210, padding: '4px 0', maxHeight: 420, overflowY: 'auto',
+                      background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, boxShadow: '0 14px 40px rgba(0,0,0,0.6)',
+                    }}>
+                      {ADD_CATALOG.map((group) => (
+                        <div key={group.cat}>
+                          <div style={{ padding: '6px 12px 3px', fontSize: 8, fontWeight: 800, letterSpacing: 1, color: C.dim }}>{group.cat}</div>
+                          {group.items.map((it) => (
+                            <div key={it.label}
+                              onMouseDown={(ev) => { ev.stopPropagation(); if (it.inGroup && level === ROOT) return; addBox(it, { x: menu.x, y: menu.y }); setMenu(null); }}
+                              onMouseEnter={(ev) => { ev.currentTarget.style.background = 'rgba(227,95,242,0.12)'; }}
+                              onMouseLeave={(ev) => { ev.currentTarget.style.background = 'transparent'; }}
+                              style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '5px 12px', fontSize: 10.5, color: C.text, cursor: 'pointer' }}>
+                              <span>{it.label}</span>
+                              {!it.live && <span style={{ fontSize: 8, color: C.faint }}>draft</span>}
+                              {it.inGroup && level === ROOT && <span style={{ fontSize: 8, color: C.faint }}>inside a group</span>}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {menu.kind === 'wire' && item('Delete wire', () => cutWire(menu.edge), true, 'Del')}
+            </div>
+          );
+        })()}
         {hoverEdge && (() => {
           const e = laid.edges.find((x) => x.id === hoverEdge.id);
           if (!e) return null;
@@ -2366,518 +3141,5 @@ function EdgeTip({ edge, at, byId, fullById, v }) {
         <div style={{ color: C.grey, marginTop: 3 }}>+{rows.length - MAX} more</div>
       )}
     </div>
-  );
-}
-
-/**
- * `anchors` maps a field's label to the ids of the boxes that read it, and the
- * row's VALUE carries them. That is what lets an arrow leave the formula that
- * produced it instead of a "USED BY" list underneath the card: on a panel of
- * several formulas, one shared list could only say that something downstream
- * reads something inside, never which number went where.
- */
-function Working({ fields, v, onPick, page, bare, names, accent, anchors }) {
-  if (!fields || !fields.length) return null;
-  const jump = (p, label) => onPick('f:' + p + ':' + label);
-  return (
-    <div style={{ marginTop: bare ? 0 : 12 }}>
-      {/* Inside a flow's middle block the block itself is the heading. */}
-      {!bare && (
-        <div style={{
-          fontSize: 8, letterSpacing: 1, fontWeight: 700, color: C.grey, marginBottom: 6,
-        }}>WHAT IT COMPUTES</div>
-      )}
-      {fields.map((f, i) => {
-        let value;
-        try { value = f.value ? f.value(v) : undefined; } catch (e) { value = undefined; }
-        const direct = Boolean(f.fetch) && !f.calc;
-        const worked = typeof f.equation === 'function';
-        let eq = null;
-        if (worked) { try { eq = f.equation(v); } catch (e) { eq = null; } }
-        return (
-          <div key={f.label + i} style={{
-            marginBottom: 7, paddingBottom: 6,
-            borderBottom: i === fields.length - 1 ? 'none' : `1px solid ${C.line}`,
-          }}>
-            <div style={{
-              display: 'flex', alignItems: 'baseline', gap: 6,
-              // An output pill straddles the FORMULA block's edge, so the row
-              // needs somewhere to hang it from and room not to run under it.
-              position: 'relative',
-              paddingRight: anchors && anchors[f.label] ? 20 : 0,
-            }}>
-              <span
-                onClick={() => jump(page, f.label)}
-                title="open this number on the map"
-                style={{
-                  cursor: 'pointer', fontSize: 9, letterSpacing: 0.6, fontWeight: 700,
-                  color: C.dim, flex: 1, minWidth: 0,
-                }}>{f.label}</span>
-              {f.weight && <span style={{ fontSize: 8.5, color: C.faint }}>{f.weight}</span>}
-              <span
-                data-anchor={(anchors && anchors[f.label]) || undefined}
-                data-side={anchors && anchors[f.label] ? 'out' : undefined}
-                style={{
-                  fontSize: 11, fontWeight: 800, color: C.white,
-                  // Only a row something actually reads is drawn as an output
-                  // node; the rest stay plain numbers.
-                  //
-                  // An output sits ASTRIDE the formula block's right edge -
-                  // half in, half out - the same way the collapsed box wears
-                  // its count. -8px clears the block's 7px padding and 1px
-                  // border, and translateX(50%) centres the pill on it.
-                  ...(anchors && anchors[f.label] ? {
-                    position: 'absolute', right: -8, top: '50%',
-                    transform: 'translate(50%, -50%)',
-                    padding: '1px 7px', borderRadius: 6, flexShrink: 0,
-                    background: C.bg, border: `1px solid ${accent}aa`,
-                    boxShadow: `0 0 0 2px ${C.bg}`, whiteSpace: 'nowrap',
-                  } : null),
-                }}>
-                {value === null || value === undefined || value === '' ? '\u2014' : String(value)}
-              </span>
-            </div>
-            <div style={{ marginTop: 3 }}>
-              {/* A computing panel (SCORE DECOMPOSITION): each component by its
-                  formula, by NAME - the inputs and their values are the panel's
-                  input rows - then this token's calculation, stopping short of
-                  the value already printed beside the label. */}
-              {!worked && (
-                <div style={{
-                  fontSize: 7.5, letterSpacing: 0.8, fontWeight: 700, color: C.grey, marginBottom: 2,
-                }}>{direct ? 'FETCHED DIRECT' : 'COMPUTED'}</div>
-              )}
-              <Expression tokens={direct ? f.fetch : f.calc} onJump={jump} v={v} names={Boolean(names)} />
-              {worked && eq && (
-                <div style={{ marginTop: 4 }}>
-                  <WorkedSteps text={eq} accent={accent}
-                    result={typeof value === 'string' || typeof value === 'number' ? String(value) : null} />
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-/* -------------------------------------------------------- opened box --- */
-
-function NodeCard({ node, at, grow, onDragStart, onAnchors, edges, byId, fullById, allFields, v, onClose, onPick, isOpen, onJumpToMirror }) {
-  const upstream = edges.filter((e) => e.to === node.id).map((e) => byId.get(e.from)).filter(Boolean);
-  const downstream = edges.filter((e) => e.from === node.id).map((e) => byId.get(e.to)).filter(Boolean);
-  const accent = nodeColor(node);
-  const vals = fieldValues(v);
-  const valOf = (n) => (n && n.kind === 'field' ? flowShort(vals.get(n.page + '|' + n.label)) : null);
-  const edgeTo = (from, to) => edges.find((e) => e.from === from && e.to === to);
-  // A folded panel stands for several fields: name the one an arrow is for,
-  // or how many it carries.
-  const partLabel = (id) => String(id).split(':').slice(2).join(':');
-  const partsSummary = (e, pick) => {
-    const parts = (e && e.parts) || [];
-    if (!parts.length) return null;
-    // A generated card can be built before its label exists; it names nothing.
-    const names = Array.from(new Set(parts.map((p) => partLabel(pick(p)))))
-      .filter((s) => s && s !== 'undefined' && s !== 'null');
-    if (!names.length) return null;
-    return names.length === 1 ? names[0] : names.length + ' fields';
-  };
-  const jump = (page, label) => {
-    const id = 'f:' + page + ':' + label;
-    if (byId.has(id)) onPick(id);
-    else if (onJumpToMirror) onJumpToMirror(page, label);
-  };
-  const tabLink = onJumpToMirror && (node.kind === 'field' || node.kind === 'panel') ? (
-    <div onClick={() => onJumpToMirror(node.page, node.label)} style={{
-      marginTop: 10, cursor: 'pointer', fontSize: 9.5, color: C.blue,
-    }}>open on the {MAP_ONLY_PAGES.has(node.page) ? 'SCORE PIPELINE' : PAGE_TITLES[node.page]} tab &rarr;</div>
-  ) : null;
-
-  /** How a downstream box uses this one: a ref's own caption beyond the label (" ×13"), or the field it lands in. */
-  const outRow = (d) => {
-    if (d.kind === 'store') return { node: d, carries: 'saved' };
-    if (d.kind === 'panel') return { node: d, carries: partsSummary(edgeTo(node.id, d.id), (p) => p.to) };
-    if (d.kind === 'field' && d.field) {
-      const t = inTokens(d.field).find((x) => x.t === 'ref' && x.page === node.page && x.field === node.label);
-      const extra = t && t.label && t.label !== t.field ? t.label.replace(node.label, '').trim() : '';
-      return { node: d, carries: extra || null };
-    }
-    return { node: d, carries: null };
-  };
-
-  /* ---- a field: in, the working, out ----------------------------------- */
-  if (node.kind === 'field') {
-    const card = node.field.shows
-      ? node.field
-      : { ...node.field, shows: showsForField(node.page, node.label) };
-    let value;
-    try { value = node.field.value ? node.field.value(v) : undefined; } catch (e) { value = undefined; }
-    const f = card;
-    const placeholder = f.status === 'placeholder';
-    const live = (x) => {
-      if (typeof x !== 'function') return x;
-      try { return x(v); } catch (e) { return null; }
-    };
-    const evidence = live(f.evidence);
-    const equation = live(f.equation);
-    const info = (evidence || f.freshness || f.note || f.where || f.shows) ? (
-      <>
-        {f.shows && <ShowsList shows={f.shows} accent={accent} />}
-        {evidence && <div style={{ marginTop: 6 }}>{evidence}</div>}
-        {f.freshness && <div style={{ marginTop: 6, color: C.dim }}>fresh: {f.freshness}</div>}
-        {f.note && (
-          <div style={{
-            marginTop: 6, paddingLeft: 7, borderLeft: `2px solid ${placeholder ? C.hot : C.grey}`,
-            color: placeholder ? '#ff9ac8' : C.faint,
-          }}>{f.note}</div>
-        )}
-        {f.where && (
-          <div style={{ marginTop: 6, fontSize: 9, fontFamily: MONO_STACK, color: C.grey, wordBreak: 'break-all' }}>
-            {f.where}
-          </div>
-        )}
-      </>
-    ) : null;
-
-    const toks = inTokens(f);
-    // One row per LINK, not per box. An arrow from a panel of four formulas
-    // is four values arriving, and a single row saying "DEMAND ENGINE · 4
-    // fields" cannot say which of them this box actually reads. Each row
-    // carries the link's own anchor, so its line lands on that row.
-    const splitIn = (u) => {
-      const e = edgeTo(u.id, node.id);
-      const ps = (e && e.parts) || [];
-      if (u.kind !== 'panel' || !ps.length) return null;
-      const seen = new Set();
-      const rows = [];
-      ps.forEach((pt) => {
-        const key = partKey(pt.from, pt.to);
-        if (seen.has(key)) return;
-        seen.add(key);
-        const src = (fullById && fullById.get(pt.from)) || byId.get(pt.from);
-        const label = src && src.label ? src.label : partLabel(pt.from);
-        rows.push({
-          node: u, label,
-          // Only a SPLIT line has a key to be found by. A single link is still
-          // one arrow, anchored the ordinary way - it just gets to be named
-          // after the value it carries rather than after the box it left.
-          anchorKey: ps.length > 1 ? key : undefined,
-          carries: src && src.kind === 'field' ? vals.get(src.page + '|' + src.label) : null,
-        });
-      });
-      return rows.length ? rows : null;
-    };
-
-    const ins = [].concat(...upstream.map((u) => {
-      const split = splitIn(u);
-      if (split) return split;
-      let carries = null;
-      if (u.kind === 'field') carries = valOf(u);
-      else if (u.kind === 'provider') {
-        carries = toks.filter((t) => t.t === 'ext' && t.source === u.source).map((t) => t.field).filter(Boolean).join(' · ') || null;
-      } else if (u.kind === 'file') {
-        const t = toks.find((x) => x.t === 'api' && x.path === u.path);
-        carries = (t && t.field) || 'read';
-      } else if (u.kind === 'panel') carries = partsSummary(edgeTo(u.id, node.id), (p) => p.from);
-      else if (u.kind === 'store') carries = 'restored';
-      return [{ node: u, carries }];
-    }));
-
-    const direct = Boolean(f.fetch) && !f.calc;
-    // The same card as the SCORE PIPELINE tab's: the formula, then the DATA -
-    // an input step's raw record or a calculation's inputs, highlighted keys
-    // wired to what they become - then this token's arithmetic.
-    const raw = f.raw && rawRecordOf(f, v);
-    // Inputs are near-white; a near-white highlight on a near-white key reads
-    // as nothing, so the data view takes the file teal instead.
-    const dataCol = accent === '#e2e8f0' ? C.teal : accent;
-    // With the record on screen, the FILE is named once - on the caption right
-    // above the data it delivered - and the map's arrow from that file lands
-    // there. It used to be named three times: a FROM row, a VIA chip, and the
-    // caption.
-    const fileIn = raw ? upstream.find((u) => u.kind === 'file') || null : null;
-    const anchor = fileIn ? { id: fileIn.id, color: nodeColor(fileIn) } : null;
-    const flowIns = fileIn ? ins.filter((r) => r.node.id !== fileIn.id) : ins;
-    // A record with ONE output is its own output node: the extracted value IS
-    // the step's result, so it carries the outgoing arrows itself rather than
-    // being printed a second time as "= value" below it.
-    const singleOut = Boolean(raw && f.raw.outs && f.raw.outs.length === 1);
-    // The result as the output node prints it, so the calculation can stop
-    // short of repeating it.
-    const shownValue = value === null || value === undefined || value === '' ? null
-      : (typeof value === 'string' || typeof value === 'number' ? String(value) : null);
-    const machine = (
-      <Machine accent={accent}
-        title={raw ? 'RAW RECORD \u2192 EXTRACTED' : (direct ? 'FETCHED \u00b7 first source that answers' : 'COMPUTED')}
-        right={<>
-          {f.weight && <span style={{ fontSize: 8.5, color: C.faint }}>{f.weight}</span>}
-          <Badge status={f.status || 'live'} />
-        </>}>
-        {raw ? (
-          <RawData field={f} v={v} accent={dataCol} anchor={anchor}
-            outAnchor={singleOut ? downstream.map((d) => d.id) : null} />
-        ) : (
-          <>
-            {/* The formula by NAME: each input's value is on its IN row already. */}
-            <div style={{ fontSize: 7, letterSpacing: 1, fontWeight: 700, color: C.grey, marginBottom: 3 }}>FORMULA</div>
-            <Expression tokens={direct ? f.fetch : f.calc} onJump={jump} v={v} names />
-            {f.via && (
-              <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 5 }}>
-                <span style={{ fontSize: 7.5, letterSpacing: 1, fontWeight: 700, color: C.grey }}>VIA</span>
-                <Expression tokens={[f.via]} onJump={jump} v={v} />
-              </div>
-            )}
-            {equation && (
-              <div style={{ marginTop: 7, paddingTop: 5, borderTop: `1px solid ${accent}33` }}>
-                <div style={{ fontSize: 7, letterSpacing: 1, fontWeight: 700, color: C.grey, marginBottom: 3 }}>
-                  CALCULATION, THIS TOKEN
-                </div>
-                {typeof f.equation === 'function'
-                  ? <WorkedSteps text={equation} accent={dataCol} result={shownValue} />
-                  : <div style={{ fontSize: 9, fontFamily: MONO_STACK, color: C.faint }}>{equation}</div>}
-              </div>
-            )}
-          </>
-        )}
-      </Machine>
-    );
-
-    const shown = value === null || value === undefined || value === '' ? '\u2014'
-      : (typeof value === 'string' || typeof value === 'number' ? String(value) : '\u2014');
-    return (
-      <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors}
-        title={node.label} accent={accent} onClose={onClose} info={info}>
-        <FlowBody ins={flowIns} outs={singleOut ? [] : downstream.map(outRow)} accent={accent} onPick={onPick}
-          inTitle={direct ? 'FROM' : 'INPUTS'} machine={machine}
-          result={singleOut ? null : '= ' + shown} single />
-        {tabLink}
-      </CardShell>
-    );
-  }
-
-  /* ---- a panel: what it shows, and what is inside it ------------------ */
-  if (node.kind === 'panel') {
-    const shows = node.shows || showsForPanel(node.page, node.group);
-    const inner = Array.from(byId.values())
-      .filter((n) => n.kind === 'field' && n.page === node.page && n.group === node.group);
-    const ins = upstream.map((u) => ({
-      node: u,
-      carries: u.kind === 'field' ? valOf(u) : partsSummary(edgeTo(u.id, node.id), (p) => p.to),
-    }));
-    // A pipeline panel COMPUTES its fields (SCORE DECOMPOSITION computes the
-    // components); a dashboard panel only SHOWS what the pipeline computed.
-    const computes = node.page === 'pipe';
-    const dataCol = accent === '#e2e8f0' ? C.teal : accent;
-
-    // Which boxes read WHICH formula in here. A collapsed arrow keeps the
-    // field-level links it stands for as `parts`, so the panel can hand each
-    // row the ids of its own readers and the arrow leaves that row's value.
-    const anchors = {};
-    downstream.forEach((d) => {
-      const e = edgeTo(node.id, d.id);
-      ((e && e.parts) || []).forEach((part) => {
-        const src = byId.get(part.from);
-        const label = src && src.label ? src.label : partLabel(part.from);
-        if (!label) return;
-        const key = partKey(part.from, part.to);
-        anchors[label] = anchors[label] ? anchors[label] + ',' + key : key;
-      });
-    });
-
-    const hasOutPills = Object.keys(anchors).length > 0;
-    const machine = node.fields && node.fields.length ? (
-      <div style={{ paddingRight: hasOutPills ? PILL_ROOM : 0 }}>
-      <Machine accent={accent}
-        title={(computes ? 'COMPUTES · ' : 'SHOWS · ') + node.fields.length + (computes ? ' COMPONENTS' : ' FIELDS')}>
-        <Working fields={node.fields} v={v} onPick={onPick} page={node.page} bare
-          names={computes && ins.length > 0} accent={dataCol} anchors={anchors} />
-      </Machine>
-      </div>
-    ) : null;
-    return (
-      <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors}
-        title={node.label} accent={accent} onClose={onClose}
-        info={shows ? <ShowsList shows={shows} accent={accent} /> : null}>
-        {/* No USED BY list: every outgoing arrow leaves the value of the
-            formula that produced it, anchored on its own row above. A reader
-            no row claimed (a panel-level link with no field behind it) falls
-            back to the card's edge, as it did before. */}
-        <FlowBody ins={ins} outs={[]} accent={accent} onPick={onPick}
-          inTitle="READS" machine={machine} />
-        {isOpen && <Neighbours accent={accent} title="FIELDS" side="out" list={inner} onPick={onPick} />}
-        {tabLink}
-      </CardShell>
-    );
-  }
-
-  /**
-   * The fields each provider writes into each file, read off the cards that
-   * name both - a card that says `ext(goplus, holder_count)` via `intel.json`
-   * is the evidence that GoPlus's holder_count lands in that file.
-   */
-  const writes = (source, path) => {
-    const out = new Set();
-    (allFields || []).forEach((fn) => {
-      const t = inTokens(fn.field || {});
-      if (!t.some((x) => x.t === 'api' && x.path === path)) return;
-      t.forEach((x) => { if (x.t === 'ext' && x.source === source && x.field) out.add(x.field); });
-    });
-    const list = Array.from(out);
-    if (!list.length) return null;
-    // Joined with a dot, not a comma: some field names carry commas of their own.
-    return list.length > 2 ? list.slice(0, 2).join(' · ') + ' +' + (list.length - 2) : list.join(' · ');
-  };
-
-  /* ---- a provider ----------------------------------------------------- */
-  if (node.kind === 'provider') {
-    const src = SOURCE_BY_ID[node.source] || {};
-    const info = (
-      <>
-        {src.provides && <div>{src.provides}</div>}
-        {src.role && <div style={{ color: C.faint, marginTop: 6 }}>{src.role}</div>}
-        <div style={{ marginTop: 8, fontSize: 9, color: C.dim, lineHeight: 1.7 }}>
-          {src.chains && <div>chains: {src.chains}</div>}
-          {src.limit && <div>rate limit: {src.limit}</div>}
-          {(src.endpoints || []).map((e) => (
-            <div key={e} style={{ fontFamily: MONO_STACK, color: C.faint }}>{e}</div>
-          ))}
-        </div>
-        {src.url && <OutLink url={src.url} />}
-      </>
-    );
-    const outs = downstream.map((d) => ({
-      node: d,
-      carries: d.kind === 'file' ? writes(node.source, d.path) : null,
-    }));
-    // What this provider answered for THIS token: its own part of the token's
-    // records, each key the pipeline reads wired to the step reading it.
-    const parts = (PROVIDER_PARTS[node.source] || []).map(([slot, prefix]) => ({
-      slot, prefix,
-      rec: v && v.pipe && v.pipe.raw ? v.pipe.raw[slot] : null,
-      readers: recordReaders(allFields, slot, prefix),
-    })).filter((p) => p.readers.picks.length);
-    const providerMachine = parts.length ? (
-      <Machine accent={accent} title="ITS ANSWER FOR THIS TOKEN → READ BY">
-        {parts.map((p, i) => (
-          <div key={p.slot + p.prefix} style={{ marginTop: i ? 8 : 0 }}>
-            <RecordView rec={p.rec} spec={p.readers} v={v} accent={accent}
-              caption={RAW_RECORD[p.slot] + ' · ' + p.prefix} />
-          </div>
-        ))}
-      </Machine>
-    ) : null;
-    return (
-      <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors} title={node.label} accent={accent} onClose={onClose} info={info}>
-        <FlowBody ins={[]} outs={outs} accent={accent} onPick={onPick} outTitle="WRITTEN INTO"
-          machine={providerMachine} />
-      </CardShell>
-    );
-  }
-
-  /* ---- a file in the raw store ---------------------------------------- */
-  if (node.kind === 'file') {
-    const url = API_ORIGIN + node.path.replace('<chain>', 'solana').replace('<pool>', '<pool>');
-    const info = (
-      <>
-        <div>
-          Written by the server&rsquo;s collectors on their own clock and read by the app. The
-          server never answers a request from the app and nothing the app computes is ever
-          written back here.
-        </div>
-        {node.path.indexOf('<') === -1 && <OutLink url={url} mono />}
-      </>
-    );
-    const ins = upstream.map((u) => ({
-      node: u,
-      carries: u.kind === 'provider' ? writes(u.source, node.path) : null,
-    }));
-    const outs = downstream.map((d) => {
-      if (d.kind === 'field' && d.field) {
-        const t = inTokens(d.field).find((x) => x.t === 'api' && x.path === node.path);
-        return { node: d, carries: (t && t.field) || null };
-      }
-      if (d.kind === 'panel') return { node: d, carries: partsSummary(edgeTo(node.id, d.id), (p) => p.to) };
-      return { node: d, carries: null };
-    });
-    const clock = clockOf(node.path);
-    // This token's record in the file, every key the pipeline reads out of it
-    // highlighted and wired to the step that reads it.
-    const slot = slotOfPath(node.path);
-    const readers = slot ? recordReaders(allFields, slot, null) : null;
-    const rec = slot && v && v.pipe && v.pipe.raw ? v.pipe.raw[slot] : null;
-    // No record for this token yet is not a reason to show a different card.
-    const declaredShape = v && v.pipe && v.pipe.raw && v.pipe.raw.shapes
-      ? v.pipe.raw.shapes[slot] : null;
-    const skeleton = readers && readers.picks.length
-      ? skeletonOf(declaredShape, readers.picks) : null;
-    const record = rec || skeleton;
-    const shows = Boolean(readers && readers.picks.length && record);
-    // A file holds values; it computes nothing. So the card is the record and
-    // its ports, with no COMPUTED block around it: what comes in names the
-    // collector and the selection, and every key in the record is its own
-    // output. The old READ BY list said "2 fields" and left you tracing a
-    // wire to find out which.
-    const token = v && v.pipe && v.pipe.s ? (v.pipe.s.symbol || null) : null;
-    // The token picker is a real input here - it decides WHICH record this
-    // card shows - so it arrives through `ins` like any other upstream. It is
-    // named for what it carries, the symbol, rather than for its box.
-    const portRows = ins.map((r) => (r.node.id === TOKEN_PICKER_ID
-      ? { key: 'Selected token', value: token || r.node.label, id: r.node.id, color: nodeColor(r.node) }
-      : { key: 'Source', value: r.node.label, id: r.node.id, color: nodeColor(r.node) }));
-    return (
-      <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors} title={node.label} accent={accent} onClose={onClose} info={info}>
-        {portRows.map((r) => (
-          <div key={r.id + r.key} style={{
-            position: 'relative', margin: '0 0 4px', padding: '2px 6px', borderRadius: 4,
-            background: r.color + '14', border: '1px solid ' + r.color + '33',
-            fontSize: 8.5, fontFamily: MONO_STACK, whiteSpace: 'nowrap',
-            overflow: 'hidden', textOverflow: 'ellipsis',
-          }}>
-            <span style={{ color: r.color }}>{r.key}</span>
-            <span style={{ color: C.grey }}>: </span>
-            <span style={{ color: C.white }}>&ldquo;{r.value}&rdquo;</span>
-            {/* The port, astride the card's left edge where its arrow lands. */}
-            <span
-              data-anchor={r.id}
-              data-side="in"
-              onClick={() => onPick(r.id)}
-              title={r.value}
-              style={{
-                position: 'absolute', left: -9, top: '50%',
-                transform: 'translate(-50%, -50%)', cursor: 'pointer',
-                width: 7, height: 7, borderRadius: '50%', boxSizing: 'border-box',
-                background: r.color, border: '1px solid ' + r.color,
-                boxShadow: '0 0 0 2px ' + C.panel,
-              }} />
-          </div>
-        ))}
-        {clock && (
-          <div style={{ fontSize: 8, color: C.grey, margin: '2px 0 5px' }}>written {clock}</div>
-        )}
-        {shows ? (
-          <RecordView rec={record} spec={readers} v={v} accent={accent} caption={null} perLine
-            waiting={!rec} />
-        ) : (
-          <>
-            <div style={{ fontSize: 9, fontFamily: MONO_STACK, color: C.text, wordBreak: 'break-all', marginBottom: 6 }}>{node.path}</div>
-            <FlowRows side="out" rows={outs} accent={accent} onPick={onPick} title="READ BY" />
-          </>
-        )}
-      </CardShell>
-    );
-  }
-
-  /* ---- browser storage ------------------------------------------------ */
-  const spec = STORES[node.id] || {};
-  return (
-    <CardShell node={node} at={at} grow={grow} onDragStart={onDragStart} onAnchors={onAnchors} title={node.label} accent={accent} onClose={onClose}
-      info={spec.detail ? <div>{spec.detail}</div> : null}>
-      <FlowBody
-        ins={upstream.map((u) => ({ node: u, carries: valOf(u) }))}
-        outs={downstream.map((d) => ({ node: d, carries: 'restored' }))}
-        accent={accent} onPick={onPick} inTitle="WRITTEN BY" outTitle="READ BACK BY"
-        machine={<Machine accent={accent} title={(spec.backend || 'browser storage').toUpperCase()} />} />
-    </CardShell>
   );
 }

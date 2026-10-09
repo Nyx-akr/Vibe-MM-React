@@ -19,8 +19,10 @@
  */
 
 import { PAGES, SOURCE_BY_ID } from './provenance';
+import { dashboardItems } from './dashboard-items';
+import { SHOWN_PAGES } from './pipeline-shown';
 // Registers PAGES.pipe - the score pipeline - before anything walks PAGES.
-import './pipeline';
+import { RAW } from './pipeline';
 
 /* ------------------------------------------------------------- stores --- */
 
@@ -91,6 +93,7 @@ export const STORES = {
  * rather than inferred.
  */
 export const STORE_LINKS = [
+  // The services' own memory.
   // services/api.js fetchLiveMarketData(): recordScore() and recordTrail() run
   // on every evaluated row, with the settled score, stage and flags.
   { store: 'idb:score-journal', page: 'pipe', field: 'FINAL', dir: 'w' },
@@ -98,15 +101,19 @@ export const STORE_LINKS = [
   // persistDerived(): saveStageMemory() / saveScoreWindow().
   { store: 'idb:stage-memory', page: 'pipe', field: 'STAGE', dir: 'w' },
   { store: 'idb:score-window', page: 'pipe', field: 'FINAL', dir: 'w' },
-  { store: 'idb:wallet-memory', page: 'wallets', field: 'WALLET INTEL', dir: 'w' },
-  { store: 'idb:wallet-snapshots', page: 'wallets', field: 'WALLET INTEL', dir: 'w' },
-  { store: 'idb:social-memory', page: 'social', field: 'BASELINE', dir: 'w' },
+  { store: 'idb:wallet-memory', page: 'pipe', field: 'WALLET INTEL', dir: 'w' },
+  { store: 'idb:wallet-snapshots', page: 'pipe', field: 'WALLET INTEL', dir: 'w' },
+  { store: 'idb:social-memory', page: 'pipe', field: 'SOCIAL BASELINE', dir: 'w' },
+  // The journal of FINAL scores, read back to grade them.
+  { store: 'idb:score-journal', page: 'pipe', field: 'FORWARD RETURNS', dir: 'r' },
+  { store: 'idb:score-journal', page: 'pipe', field: 'TOP 20 HIT RATE', dir: 'r' },
+  { store: 'idb:score-journal', page: 'pipe', field: 'SCORE EVALUATION', dir: 'r' },
 ];
 
 /* -------------------------------------------------------------- pages --- */
 
 export const PAGE_TITLES = {
-  pipe: 'SCORE PIPELINE',
+  pipe: 'SCORE',
   live: 'LIVE OPPORTUNITIES', detail: 'ASSET DETAIL', social: 'SOCIAL SCANNER',
   wallets: 'WALLETS', rotation: 'ROTATION', market: 'MARKET ROTATION', alerts: 'ALERT CARDS',
   eval: 'EVALUATION', health: 'SYSTEM HEALTH',
@@ -173,6 +180,38 @@ const panelId = (page, group) => 'p:' + page + ':' + group;
 const fileId = (path) => 'file:' + path;
 const extId = (source) => 'ext:' + source;
 
+/*
+ * WHO FILLS EACH RAW FILE - read off the server (server.js collectors and
+ * lib/providers.js), not off the cards: a card names only the API a value
+ * came from, so a file whose cards name none would show no input at all.
+ * Every file the server builds from APIs gets those APIs wired into it.
+ * A file built from another file says so with a file -> file wire.
+ */
+export const FILE_SOURCES = {
+  '/raw/<chain>/market.json': ['dexscreener', 'geckoterminal', 'jupiter'],
+  // Sampled from the same market collection, every 15s / 60s.
+  '/raw/<chain>/history.json': ['dexscreener', 'geckoterminal'],
+  '/raw/<chain>/observations.json': ['dexscreener', 'geckoterminal'],
+  '/raw/<chain>/trades.json': ['geckoterminal'],
+  '/raw/<chain>/bars15/<pool>.json': ['geckoterminal'],
+  '/raw/<chain>/intel.json': ['goplus', 'rugcheck', 'honeypot', 'kyberswap', 'jupiter', 'defillama'],
+  '/raw/reference.json': ['binance-spot', 'coinbase', 'cex'],
+  '/raw/<chain>/promotion.json': ['dexscreener'],
+  '/raw/perps.json': ['hyperliquid', 'binance', 'aster', 'okx', 'bybit'],
+  '/raw/ethos.json': ['ethos'],
+  '/raw/social.json': ['reddit', '4chan', 'mastodon', 'warpcast', 'bluesky'],
+};
+/** Files the server builds from another file rather than from an API. */
+const FILE_FROM_FILE = [
+  ['/raw/<chain>/observations.json', '/raw/<chain>/observations-48h.json'],
+];
+/** APIs the catalogue does not list (the social feeds, the spot price venues). */
+const MORE_SOURCES = {
+  'binance-spot': 'Binance spot', coinbase: 'Coinbase', reddit: 'Reddit', '4chan': '4chan /biz/',
+  mastodon: 'Mastodon', warpcast: 'Farcaster', bluesky: 'Bluesky',
+};
+const sourceLabel = (id) => (SOURCE_BY_ID[id] && SOURCE_BY_ID[id].label) || MORE_SOURCES[id] || id;
+
 /** Every token in a card that could be an edge, in one flat list. */
 function tokensOf(field) {
   const out = [];
@@ -196,7 +235,10 @@ function tokensOf(field) {
  * roughly doubled the boxes without saying anything about one token's score.
  * Their mirror tabs are unchanged.
  */
-export const EXCLUDED_PAGES = new Set(['market', 'alerts', 'eval', 'health']);
+export const EXCLUDED_PAGES = new Set(['market', 'alerts', 'eval', 'health',
+  // The token tabs: the DASHBOARD group draws their panels as display-only
+  // items (dashboard-items.js); the cards' arithmetic lives in the flow.
+  'live', 'detail', 'wallets', 'social', 'rotation']);
 
 /**
  * Walks provenance.js and returns every node and edge in the system.
@@ -214,7 +256,9 @@ export function buildGraph(v) {
   const add = (node) => { if (!nodes.has(node.id)) nodes.set(node.id, { ...node, seq: seq++ }); return nodes.get(node.id); };
   const link = (from, to, kind, label) => {
     if (!from || !to || from === to) return;
-    edges.push({ id: from + '>' + to + ':' + kind, from, to, kind, label });
+    // Two readings out of one file into one box are two values, so the
+    // reading is part of the arrow's identity.
+    edges.push({ id: from + '>' + to + ':' + kind + (label ? '#' + label : ''), from, to, kind, label });
   };
 
   Object.keys(PAGES).forEach((page) => {
@@ -234,7 +278,14 @@ export function buildGraph(v) {
       // A FLAT group (the score pipeline) has no panel box: each of its
       // fields is one step of the calculation, and folding twelve components
       // into one box is exactly what hid how the score is made.
-      if (!group.flat) {
+      // A pipeline group is not a panel box either: its calculations are boxes
+      // of their own, and the GROUP is an engine that holds them (engines.js
+      // groupEngines) - opened like any group, not expanded like a card.
+      // A group with `into` is no group on the map: its boxes sit straight
+      // in that engine.
+      const calcGroup = page === 'pipe' && !group.flat && !group.into ? group.group : null;
+      const home = group.into || null;
+      if (!group.flat && !calcGroup && !home) {
         add({
           id: panelId(page, group.group), kind: 'panel', page,
           label: group.group, group: group.group, count: fields.length,
@@ -250,10 +301,42 @@ export function buildGraph(v) {
 
       fields.forEach((field) => {
         const fid = fieldId(page, field.label);
+        // A box with an OPERATION GRAPH (pipeline.js ops) is a group of
+        // operator boxes: its result is the last operator, under the box's own
+        // id so every reader still wires to it, and the others sit beside it.
+        if (field.ops && field.ops.nodes && field.ops.nodes.length) {
+          const opId = (id) => (id === field.ops.out ? fid : fid + '§' + id);
+          field.ops.nodes.forEach((o) => {
+            add({
+              id: opId(o.id), kind: 'field', page, group: group.group,
+              label: o.id === field.ops.out ? field.label : o.label, status: 'live',
+              field: { label: o.label, status: 'live', opSpec: o, calc: (o.in || []).filter((t) => typeof t !== 'string'),
+                value: o.id === field.ops.out ? field.value : o.value, note: o.note || null,
+                weight: o.id === field.ops.out ? field.weight : null },
+              stage: group.stage || null, flat: true, calcGroup, home,
+              calcParent: calcGroup ? group.parent || null : null,
+              opGroup: fid, opGroupLabel: field.label,
+            });
+          });
+          field.ops.nodes.forEach((o) => {
+            (o.in || []).forEach((t) => {
+              if (typeof t === 'string' && t.charAt(0) === '@') { link(opId(t.slice(1)), opId(o.id), 'field'); return; }
+              if (!t || typeof t !== 'object') return;
+              if (t.t === 'ref') link(fieldId(t.page, t.field), opId(o.id), 'field');
+              else if (t.t === 'api' && RAW[t.field]) link(fieldId('pipe', t.field), opId(o.id), 'field');
+              else if (t.t === 'api') {
+                add({ id: fileId(t.path), kind: 'file', label: t.path, path: t.path });
+                link(fileId(t.path), opId(o.id), 'file', t.field || null);
+              }
+            });
+          });
+          return;
+        }
         add({
           id: fid, kind: 'field', page, group: group.group,
           label: field.label, status: field.status || 'live', field,
-          stage: group.stage || null, flat: Boolean(group.flat),
+          stage: group.stage || null, flat: Boolean(group.flat || calcGroup || home), calcGroup, home,
+          calcParent: calcGroup ? group.parent || null : null,
         });
 
         const toks = tokensOf(field);
@@ -270,6 +353,13 @@ export function buildGraph(v) {
             else link(fid, other, 'field');
             return;
           }
+          // A READING is picked out of its file by an EXTRACT box (pipeline.js),
+          // and every other box reads the value from that box - so the step
+          // from file to value is drawn, not just named on a wire.
+          if (t.t === 'api' && RAW[t.field] && t.field !== field.label) {
+            if (dir === 'in') link(fieldId('pipe', t.field), fid, 'field');
+            return;
+          }
           if (t.t === 'api') {
             add({ id: fileId(t.path), kind: 'file', label: t.path, path: t.path });
             // Which RECORD a file card shows is decided by the token picker,
@@ -283,15 +373,18 @@ export function buildGraph(v) {
             // collector, from the same upstream - not that the app wrote it.
             // Drawing that as an arrow out of the app would contradict the
             // one rule the whole storage split rests on.
-            if (dir === 'in') link(fileId(t.path), fid, 'file');
+            if (dir === 'in') link(fileId(t.path), fid, 'file', t.field || null);
             return;
           }
           if (t.t === 'ext') {
             const src = SOURCE_BY_ID[t.source] || { label: t.source };
-            add({ id: extId(t.source), kind: 'provider', label: src.label, source: t.source });
             if (files.length) {
+              // The API is a box of its own (cloud icon) and sends what it
+              // fetches into the raw file the server writes.
+              add({ id: extId(t.source), kind: 'provider', label: src.label, source: t.source });
               files.forEach((p) => link(extId(t.source), fileId(p), 'collect'));
             } else {
+              add({ id: extId(t.source), kind: 'provider', label: src.label, source: t.source });
               // No file named on this card. The data still arrives through the
               // raw store, so the edge is drawn dashed rather than pretending
               // the browser called the provider.
@@ -301,6 +394,50 @@ export function buildGraph(v) {
         });
       });
     });
+  });
+
+  // THE DASHBOARD: tab › panel › DASHBOARD ITEM. An item only displays, so
+  // its wires come straight from the flow box (or file, or store) it shows.
+  const shown = (page, label) => {
+    for (const grp of ((SHOWN_PAGES[page] || {}).groups || [])) {
+      const f = (grp.fields || []).find((x) => x.label === label);
+      if (f && f.value) return f.value;
+    }
+    return null;
+  };
+  dashboardItems().forEach((it) => {
+    const id = fieldId('dash', it.tab + ' › ' + it.panel + ' › ' + it.label);
+    const value = it.show ? shown(it.show[0], it.show[1]) : null;
+    add({
+      id, kind: 'field', page: 'dash', group: it.panel, label: it.label, status: 'live',
+      field: { label: it.label, status: 'live', display: it.display, from: it.from, value: value || (() => null) },
+      flat: true, dashTab: it.tab,
+      calcGroup: 'dash:' + it.tab + ' › ' + it.panel, calcGroupLabel: it.panel, calcParent: 'eng:t:' + it.tab,
+    });
+    it.from.forEach((t) => {
+      if (t.t === 'ref') link(fieldId(t.page, t.field), id, 'field');
+      else if (t.t === 'store') {
+        const spec = STORES[t.id];
+        add({ id: t.id, kind: 'store', label: spec.label, backend: spec.backend, detail: spec.detail });
+        link(t.id, id, 'store-read');
+      } else if (t.t === 'api' && t.field && RAW[t.field]) link(fieldId('pipe', t.field), id, 'field');
+      else if (t.t === 'api') {
+        add({ id: fileId(t.path), kind: 'file', label: t.path, path: t.path });
+        link(fileId(t.path), id, 'file', t.field || null);
+      }
+    });
+  });
+
+  // Every file on the map gets the APIs that fill it.
+  Object.keys(FILE_SOURCES).forEach((path) => {
+    if (!nodes.has(fileId(path))) return;
+    FILE_SOURCES[path].forEach((id) => {
+      add({ id: extId(id), kind: 'provider', label: sourceLabel(id), source: id });
+      link(extId(id), fileId(path), 'collect');
+    });
+  });
+  FILE_FROM_FILE.forEach(([a, b]) => {
+    if (nodes.has(fileId(a)) && nodes.has(fileId(b))) link(fileId(a), fileId(b), 'collect');
   });
 
   // The browser stores the score writes to and reads back. The server-target
@@ -362,7 +499,7 @@ export function collapse(graph, expandedPanels) {
     // Every field-level edge an arrow stands for is kept on it as `parts`,
     // so hovering a panel-to-panel line can say WHICH values travel along
     // it rather than only that something does.
-    const part = { from: e.from, to: e.to };
+    const part = { from: e.from, to: e.to, label: e.label || null };
     if (seen.has(id)) { seen.get(id).parts.push(part); return; }
     const edge = { id, from, to, kind: e.kind, rolled: from !== e.from || to !== e.to, parts: [part] };
     seen.set(id, edge);
@@ -400,9 +537,13 @@ export const SIZES = {
 };
 
 // An engine sizes itself (its height follows its port count); a boundary port is a slim box.
+/** Every connector - a group's IN / OUT and a user's INPUT / OUTPUT - is this size. */
+export const CONNECTOR_W = 176;
+export const CONNECTOR_H = 26;
+
 export const sizeOf = (n) => {
-  if (n.kind === 'engine') return { w: n.w, h: n.h };
-  if (n.kind === 'port') return { w: 200, h: 28 };
+  if (n.kind === 'engine' || n.ported) return { w: n.w, h: n.h };
+  if (n.kind === 'port') return { w: CONNECTOR_W, h: CONNECTOR_H };
   return n.kind === 'field' && n.flat ? SIZES.step : SIZES[n.kind];
 };
 
@@ -606,8 +747,8 @@ export function layout(graph) {
 
   // One header per BLOCK, spanning all of its sub-columns.
   const head = (b) => {
-    if (b === -1) return { text: 'INLETS', sub: 'data coming into this engine', color: '#e7edff' };
-    if (b === 9) return { text: 'OUTLETS', sub: 'data this engine hands on', color: '#e7edff' };
+    // Inlets and outlets need no title: each connector names itself.
+    if (b === -1 || b === 9) return null;
     if (b === 0) return { text: 'SOURCES', sub: 'what the server fetches', color: KIND_COLORS.provider };
     if (b === 1) return { text: 'RAW STORE', sub: 'files the app reads every 5s', color: KIND_COLORS.file };
     if (b >= 2 && b <= 6) {

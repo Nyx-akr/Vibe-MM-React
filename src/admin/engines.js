@@ -26,6 +26,20 @@
  */
 
 import { STAGES } from './graph';
+import { activeFlow, updateFlow } from './flow-store';
+import { RAW } from './pipeline';
+
+/**
+ * The DATA one link carries, as a port key. A reading out of a raw file is
+ * the file plus the reading ('file:/raw/<chain>/market.json#POOL AGE'), so a
+ * file sends POOL AGE and LIQUIDITY as two values, not as "market.json"
+ * twice; anything else is keyed by the box that produced the value.
+ */
+export const dataKey = (p) => (isReading(p.label) ? p.from + '#' + p.label : p.from);
+// Only a READING names a port (RAW holds the keys it extracts). Some cards
+// name a file with a description ("top 30 rows per chain") - that is prose
+// about the file, not a value out of it, so those stay keyed by the file.
+const isReading = (label) => Boolean(label && RAW[label]);
 
 export const ROOT = 'root';
 
@@ -37,49 +51,91 @@ export const ROOT = 'root';
 const stepName = (k) => String((STAGES[k] || {}).title || '').replace(/^\s*\d+\s*·\s*/, '');
 
 /**
- * One engine per pipeline step. `of` decides, by rule, which boxes it holds.
- * The ids are stable (saved configs point at them); labels may follow the steps.
+ * One engine per pipeline step. `of` decides, by rule, which boxes it holds;
+ * `parent` nests an engine inside another (default: the MAP itself). The ids
+ * are stable (saved configs point at them); labels may follow the steps.
  */
+/** The RAW box - the weighted sum of the components. */
+const isRaw = (n) => n.id === 'f:pipe:RAW';
+
 export const DEFAULT_ENGINES = [
   { id: 'eng:ingest', label: 'INGEST', sub: 'providers → raw files', color: '#2ec4b6',
     of: (n) => n.kind === 'provider' || n.kind === 'file' },
-  // Steps 1-3 in one engine: the token list, its readings and the engines
-  // that turn them into components are one calculation, read left to right.
-  { id: 'eng:decomp', label: 'SCORE DECOMPOSITION', sub: 'token list → readings → components', color: '#f43f5e',
-    of: (n) => n.page === 'pipe' && n.stage >= 1 && n.stage <= 3 },
+  // The board and the token picked from it: what every per-token box reads.
+  // Inside SCORE DECOMPOSITION: its options carry each token's FINAL score
+  // or VETO, so it reads the score it starts.
+  { id: 'eng:token', label: 'TOKEN SELECTOR', sub: 'the board → the picked token', color: '#e2e8f0', parent: 'eng:decomp',
+    of: (n) => n.page === 'pipe' && n.stage === 1 },
+  // The whole score in one engine: the readings and the engines that turn
+  // them into components sit in it, and each component group, the gates and
+  // the combine step sit in it as groups of their own - so the score reads
+  // MAP › SCORE DECOMPOSITION › DEMAND ENGINE, one level deeper per step.
+  { id: 'eng:decomp', label: 'SCORE DECOMPOSITION', sub: 'readings → components → gates → score', color: '#f43f5e',
+    // RAW too: it is the weighted sum of the components, so it sits beside
+    // them and hands its one number into the SCORE group.
+    of: (n) => n.page === 'pipe' && ((n.stage >= 2 && n.stage <= 3) || isRaw(n)) },
   // After the engines: the wash gate reads one of their outputs.
-  { id: 'eng:measures', label: stepName(4), sub: 'checks a token must pass', color: '#94a3b8',
+  { id: 'eng:measures', label: stepName(4), sub: 'checks a token must pass', color: '#94a3b8', parent: 'eng:decomp',
     of: (n) => n.page === 'pipe' && n.stage === 4 },
-  { id: 'eng:score', label: 'SCORE', sub: 'raw → penalty → final → stage', color: '#ffd60a',
-    of: (n) => n.page === 'pipe' && n.stage === 5 },
+  { id: 'eng:score', label: 'SCORE', sub: 'penalty → right now → final → stage', color: '#ffd60a', parent: 'eng:decomp',
+    of: (n) => n.page === 'pipe' && n.stage === 5 && !isRaw(n) },
+  // The background jobs (wallet intel, rotation, social, evaluation, alerts).
+  { id: 'eng:services', label: 'SERVICES', sub: 'always-on jobs that keep memory', color: '#fbbf24',
+    of: () => false },
   { id: 'eng:dashboard', label: 'DASHBOARD', sub: 'the panels that show it', color: '#3b82f6',
     of: (n) => n.kind === 'panel' || (n.kind === 'field' && n.page !== 'pipe') },
+  // What the dashboard keeps for the next visit: part of the dashboard.
+  // Beside the dashboard, not in it: the dashboard holds only its panels.
   { id: 'eng:storage', label: 'BROWSER STORAGE', sub: 'kept for the next visit', color: '#b06bff',
     of: (n) => n.kind === 'store' },
 ];
+
+/** A component group's engine id. */
+const groupId = (group) => 'eng:g:' + group;
+/** The group a box's operation graph becomes. */
+const opEngineId = (fieldNodeId) => 'eng:o:' + fieldNodeId;
+
+/**
+ * The pipeline's component groups as engines, each inside SCORE
+ * DECOMPOSITION. A group used to be a PANEL - a third kind of box that
+ * expanded in place. As a group it is opened like any other, and inside it
+ * every component is a calculation box of its own.
+ */
+function groupEngines(nodes) {
+  const seen = new Map();
+  nodes.forEach((n) => {
+    // A dashboard TAB: a group inside DASHBOARD holding its panels.
+    if (n.dashTab && !seen.has('tab:' + n.dashTab)) {
+      seen.set('tab:' + n.dashTab, { id: 'eng:t:' + n.dashTab, label: n.dashTab, parent: 'eng:dashboard',
+        sub: 'a frontend tab', color: '#3b82f6' });
+    }
+    if (!n.calcGroup || seen.has(n.calcGroup)) return;
+    seen.set(n.calcGroup, {
+      id: groupId(n.calcGroup), label: n.calcGroupLabel || n.calcGroup, parent: n.calcParent || 'eng:decomp',
+      sub: n.dashTab ? 'a panel' : 'a group of calculations', color: n.dashTab ? '#3b82f6' : '#f43f5e',
+    });
+  });
+  return Array.from(seen.values());
+}
 
 /** A user-made engine's colour - none of the step or tab hues. */
 export const USER_ENGINE_COLOR = '#c4b5fd';
 
 /* ------------------------------------------------------------ config -- */
 
-const KEY = 'vs.admin.engines.v1';
 
 /** The user's layer: their engines, moves, renames, removals and sketch wires. */
-export const emptyConfig = () => ({ engines: {}, assign: {}, renamed: {}, removed: {}, sketch: [] });
+export const emptyConfig = () => ({ engines: {}, assign: {}, renamed: {}, removed: {}, sketch: [],
+  deleted: {}, cutWires: [], copies: [], added: [], portNames: {} });
 
+/** The user's layer of the ACTIVE flow (flow-store.js). */
 export function loadConfig() {
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return emptyConfig();
-    return Object.assign(emptyConfig(), JSON.parse(raw));
-  } catch (e) {
-    return emptyConfig();
-  }
+  return Object.assign(emptyConfig(), activeFlow().cfg || {});
 }
 
+/** Saved into the active flow: kept in a user's file, a preview on DEFAULT. */
 export function saveConfig(cfg) {
-  try { window.localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (e) { /* private window */ }
+  updateFlow({ cfg });
 }
 
 /* --------------------------------------------------------- hierarchy -- */
@@ -94,25 +150,59 @@ export function saveConfig(cfg) {
  */
 export function hierarchy(cfg, nodes) {
   const engines = new Map();
+  const gone = (id) => cfg.removed[id] || (cfg.deleted || {})[id];
   DEFAULT_ENGINES.forEach((d) => {
-    if (cfg.removed[d.id]) return;
+    if (gone(d.id)) return;
     engines.set(d.id, { id: d.id, label: cfg.renamed[d.id] || d.label, sub: d.sub, color: d.color, user: false });
   });
   Object.keys(cfg.engines).forEach((id) => {
+    if (gone(id)) return;
     const e = cfg.engines[id];
     engines.set(id, { id, label: cfg.renamed[id] || e.label, sub: 'your engine', color: USER_ENGINE_COLOR, user: true });
   });
+  // One group per pipeline component group (DEMAND ENGINE, HOLDERS ENGINE...),
+  // derived from the boxes, so a group added to the catalogue appears here.
+  const groups = groupEngines(nodes);
+  groups.forEach((d) => {
+    if (gone(d.id)) return;
+    engines.set(d.id, { id: d.id, label: cfg.renamed[d.id] || d.label, sub: d.sub, color: d.color, user: false });
+  });
 
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  // Where a box would sit with no operation graph: its component group, or
+  // its pipeline step's engine.
+  const baseParent = (n) => {
+    if (n.calcGroup && engines.has(groupId(n.calcGroup))) return groupId(n.calcGroup);
+    if (n.home && engines.has(n.home)) return n.home;
+    const d = DEFAULT_ENGINES.find((x) => !cfg.removed[x.id] && x.of(n));
+    return d ? d.id : ROOT;
+  };
+  // A box with an operation graph is a GROUP of operator boxes, sitting where
+  // the box itself would have sat: FINAL inside SCORE, Net demand inside
+  // DEMAND ENGINE. Double-click it to see the operators.
+  const opGroups = [];
+  nodes.forEach((n) => {
+    if (!n.opGroup || n.id !== n.opGroup) return;
+    const id = opEngineId(n.opGroup);
+    if (gone(id)) return;
+    opGroups.push({ id, parent: baseParent(n) });
+    engines.set(id, { id, label: cfg.renamed[id] || n.opGroupLabel, sub: 'its operations', color: '#f43f5e', user: false });
+  });
   const exists = (id) => id === ROOT || engines.has(id);
 
   const defaultParent = (id) => {
     if (engines.has(id)) {
       const own = cfg.engines[id];
-      return own && exists(own.parent) ? own.parent : ROOT;
+      if (own) return exists(own.parent) ? own.parent : ROOT;
+      const d = DEFAULT_ENGINES.find((x) => x.id === id) || groups.find((x) => x.id === id)
+        || opGroups.find((x) => x.id === id);
+      return d && d.parent && exists(d.parent) ? d.parent : ROOT;
     }
     const n = nodeById.get(id);
     if (!n) return ROOT;
+    if (n.opGroup && exists(opEngineId(n.opGroup))) return opEngineId(n.opGroup);
+    if (n.calcGroup && exists(groupId(n.calcGroup))) return groupId(n.calcGroup);
+    if (n.home && exists(n.home)) return n.home;
     const d = DEFAULT_ENGINES.find((x) => !cfg.removed[x.id] && x.of(n));
     return d ? d.id : ROOT;
   };
@@ -145,7 +235,8 @@ export function hierarchy(cfg, nodes) {
     return ancestors(target).indexOf(id) === -1;
   };
 
-  return { engines, parentOf, ancestors, canMove, nodeById };
+  // Names a user gave connectors (a display label on top of the data key).
+  return { engines, parentOf, ancestors, canMove, nodeById, portNames: cfg.portNames || {} };
 }
 
 /* --------------------------------------------------------- the view --- */
@@ -160,6 +251,10 @@ const blockOfBase = (n) => {
 };
 
 export const ENGINE = { W: 236, HEAD: 30, ROW: 16, PAD: 6 };
+/** The room under an API box's rows for its health and its sample. */
+export const PROVIDER_BODY = 168;
+/** Where a box's port rows start: under its title. */
+export const rowsTop = () => ENGINE.HEAD;
 
 /**
  * What one level shows: its own boxes, its child engines (with ports), and -
@@ -199,6 +294,9 @@ export function viewGraph(base, H, level) {
     return panel ? panel.fields.find((f) => f.label === m[2]) : null;
   };
   const labelOf = (id) => {
+    if (H.portNames && H.portNames[id]) return H.portNames[id];
+    const hash = String(id).indexOf('#');
+    if (hash !== -1) return String(id).slice(hash + 1);
     if (H.engines.has(id)) return H.engines.get(id).label;
     const n = nodeOf.get(id);
     if (n) return n.label;
@@ -228,6 +326,9 @@ export function viewGraph(base, H, level) {
     if (!map.has(eng)) map.set(eng, new Map());
     map.get(eng).set(key, labelOf(key));
   };
+  // The field a port carries, for its live value - a box at this level, or a
+  // field folded into a closed panel.
+  const fieldOf = (key) => (nodeOf.get(key) || {}).field || foldedField(key) || readingField(key) || null;
   const add = (from, fromPort, to, toPort, e) => {
     const id = from + '|' + (fromPort || '') + '>' + to + '|' + (toPort || '') + ':' + e.kind;
     const hit = edges.get(id);
@@ -245,21 +346,31 @@ export function viewGraph(base, H, level) {
   const carried = [];
   base.edges.forEach((e) => {
     const from = nodeOf.get(e.from);
-    const parts = e.parts || [];
-    if (!from || from.kind !== 'panel' || !e.rolled || !parts.some((p) => p.from !== e.from)) {
-      carried.push({ e, key: e.from });
-      return;
-    }
+    const parts = e.parts && e.parts.length ? e.parts : [{ from: e.from, to: e.to }];
+    const rolledPanel = from && from.kind === 'panel' && e.rolled;
     const by = new Map();
-    parts.forEach((p) => { if (!by.has(p.from)) by.set(p.from, []); by.get(p.from).push(p); });
-    by.forEach((ps, src) => carried.push({ e: { ...e, parts: ps }, key: src }));
+    parts.forEach((p) => {
+      // A closed panel's arrow carries its fields' values; a file's carries
+      // its readings; any other box's carries its own value.
+      const key = isReading(p.label) ? dataKey(p) : (rolledPanel ? p.from : e.from);
+      if (!by.has(key)) by.set(key, []);
+      by.get(key).push(p);
+    });
+    by.forEach((ps, key) => carried.push({ e: { ...e, parts: ps }, key }));
   });
 
-  carried.forEach(({ e, key }) => {
+  // A user's INPUT / OUTPUT box is a group's named connector: a wire INTO an
+  // input crosses the group's edge under the INPUT's name, and inside the
+  // group the box itself is the entry/exit - no extra IN/OUT dot for it.
+  const uportOf = (id) => { const n = nodeOf.get(id); return n && n.uport ? n.uport : null; };
+  carried.forEach(({ e, key: dataKey0 }) => {
+    const key = uportOf(e.to) === 'in' ? e.to : dataKey0;
     const ra = childOf(e.from);
     const rb = childOf(e.to);
     if (!ra && !rb) return;
     if (ra && rb && ra === rb) return; // inside one child engine: its business
+    if (!ra && rb === e.to && uportOf(e.to) === 'in') return;
+    if (!rb && ra === e.from && uportOf(e.from) === 'out') return;
     const fromIsEngine = ra && H.engines.has(ra) && ra !== e.from;
     const toIsEngine = rb && H.engines.has(rb) && rb !== e.to;
     if (!ra) {
@@ -279,11 +390,20 @@ export function viewGraph(base, H, level) {
     add(ra, fromIsEngine ? key : null, rb, toIsEngine ? key : null, e);
   });
 
+  // Every INPUT / OUTPUT declares its dot on the group it sits in, wired or
+  // not - adding one is what gives the group a new connector.
+  nodeOf.forEach((n) => {
+    if (!n.uport) return;
+    const c = childOf(n.id);
+    if (!c || c === n.id || !H.engines.has(c) || H.parentOf(n.id) !== c) return;
+    port(n.uport === 'in' ? inPorts : outPorts, c, n.id);
+  });
+
   // The engine boxes themselves.
   engineCount.forEach((count, id) => {
     const eng = H.engines.get(id);
-    const ins = Array.from((inPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label }));
-    const outs = Array.from((outPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label }));
+    const ins = Array.from((inPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key) }));
+    const outs = Array.from((outPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key) }));
     const rows = Math.max(ins.length, outs.length, 1);
     nodes.push({
       id, kind: 'engine', label: eng.label, sub: eng.sub, color: eng.color, user: eng.user,
@@ -302,7 +422,6 @@ export function viewGraph(base, H, level) {
   });
 
   // Boundary ports, inside an engine.
-  const fieldOf = (key) => (nodeOf.get(key) || {}).field || foldedField(key) || null;
   boundaryIn.forEach((label, key) => {
     nodes.push({ id: 'port:in:' + key, kind: 'port', side: 'in', label, src: key, srcNode: nodeOf.get(key) || null,
       field: fieldOf(key) });
@@ -312,7 +431,93 @@ export function viewGraph(base, H, level) {
       field: fieldOf(key) });
   });
 
+  portPanels(nodes, edges, labelOf, fieldOf);
   return { nodes, edges: Array.from(edges.values()) };
+}
+
+/**
+ * A reading out of a raw file, as something with a live value: the value the
+ * pipeline extracts for it (RAW[reading].outs), when it extracts ONE.
+ */
+function readingField(key) {
+  const hash = String(key).indexOf('#');
+  if (hash === -1) return null;
+  const spec = RAW[String(key).slice(hash + 1)];
+  if (!spec || !spec.outs || spec.outs.length !== 1) return null;
+  return {
+    label: String(key).slice(hash + 1),
+    value: (v) => spec.outs[0].value(v, v && v.pipe && v.pipe.raw ? v.pipe.raw[spec.from] : null),
+  };
+}
+
+/**
+ * EVERY box draws like an engine: one inlet per value it reads, one
+ * outlet per value it hands on, each named after its data and showing it.
+ * So does every other box - a calculation step, a raw file (one outlet per
+ * reading), a provider, a store - so the whole map reads the same way.
+ * A box that only said "DEMAND ENGINE" on its edge could not say WHICH
+ * values entered it or left it - the open card was the only place to find
+ * out. Its arrows are split the same way, one per value, onto its port rows.
+ *
+ * An OPEN panel is left alone: its fields are boxes of their own then, and
+ * the panel keeps its "contains" lines to them.
+ */
+const PORTED_KINDS = new Set(['panel', 'field', 'file', 'provider', 'store']);
+
+function portPanels(nodes, edges, labelOf, fieldOf) {
+  const panels = new Set(nodes.filter((n) => PORTED_KINDS.has(n.kind)).map((n) => n.id));
+  edges.forEach((x) => { if (x.kind === 'contains') { panels.delete(x.from); panels.delete(x.to); } });
+  if (!panels.size) return;
+
+  const pIn = new Map();
+  const pOut = new Map();
+  const addPort = (m, id, key) => {
+    if (!m.has(id)) m.set(id, new Map());
+    if (!m.get(id).has(key)) m.get(id).set(key, { key, label: labelOf(key), field: fieldOf(key) });
+  };
+  const next = new Map();
+  edges.forEach((x) => {
+    const fromP = panels.has(x.from);
+    const toP = panels.has(x.to);
+    if (!fromP && !toP) { next.set(x.id, x); return; }
+    const parts = x.parts && x.parts.length ? x.parts : [{ from: x.from, to: x.to }];
+    // The data a wire carries is its SOURCE value; an engine port upstream
+    // is already keyed by that same id, so the two ends name one thing.
+    const by = new Map();
+    parts.forEach((p) => {
+      const src = x.fromPort && !fromP ? x.fromPort : dataKey(p);
+      if (!by.has(src)) by.set(src, []);
+      by.get(src).push(p);
+    });
+    by.forEach((ps, src) => {
+      const fromPort = fromP ? src : x.fromPort || null;
+      const toPort = toP ? src : x.toPort || null;
+      if (fromP) addPort(pOut, x.from, src);
+      if (toP) addPort(pIn, x.to, src);
+      const id = x.from + '|' + (fromPort || '') + '>' + x.to + '|' + (toPort || '') + ':' + x.kind;
+      const hit = next.get(id);
+      if (hit) hit.parts = hit.parts.concat(ps);
+      else next.set(id, { ...x, id, parts: ps.slice(), fromPort, toPort });
+    });
+  });
+  edges.clear();
+  next.forEach((x, id) => edges.set(id, x));
+
+  nodes.forEach((n, i) => {
+    if (!panels.has(n.id)) return;
+    // Outlets in the panel's own field order, so they read like its card.
+    const order = new Map((n.fields || []).map((f, k) => ['f:' + n.page + ':' + f.label, k]));
+    const outs = Array.from((pOut.get(n.id) || new Map()).values())
+      .sort((a, b) => (order.has(a.key) ? order.get(a.key) : 99) - (order.has(b.key) ? order.get(b.key) : 99));
+    const ins = Array.from((pIn.get(n.id) || new Map()).values());
+    // Every calculation has an outlet, wired or not - it is where a new
+    // wire is dragged from.
+    if (!outs.length && n.kind === 'field') outs.push({ key: n.id, label: n.label, field: n.field });
+    const rows = Math.max(ins.length, outs.length, 1);
+    nodes[i] = { ...n, ported: true, inPorts: ins, outPorts: outs,
+      // An API box carries its health and a sample of what it fetched.
+      w: ENGINE.W, h: ENGINE.HEAD + rows * ENGINE.ROW + ENGINE.PAD + (n.kind === 'provider' ? PROVIDER_BODY : 0) };
+  });
 }
 
 /**
@@ -374,7 +579,7 @@ export function portPoint(n, pos, side, key) {
   const i = Math.max(0, list.findIndex((p) => p.key === key));
   return {
     x: side === 'in' ? pos.x : pos.x + n.w,
-    y: pos.y + ENGINE.HEAD + i * ENGINE.ROW + ENGINE.ROW / 2,
+    y: pos.y + rowsTop(n) + i * ENGINE.ROW + ENGINE.ROW / 2,
   };
 }
 

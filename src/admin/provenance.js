@@ -621,13 +621,11 @@ export function fieldValues(v) {
  * The tabs the admin rail still mirrors as pages of cards.
  *
  * LIVE, DETAIL, SOCIAL, WALLETS and ROTATION were removed from the rail on
- * 2026-10-05: the SCORE PIPELINE tab and DATA FLOW now show how one token is
- * fetched, scored and displayed, and those five pages repeated it a panel at a
- * time. Their catalogues moved to admin/pipeline-shown.js as the pipeline's
- * step 6, SHOWN ON THE DASHBOARD: listed at the foot of the SCORE PIPELINE tab
- * and drawn as the map's last column.
+ * 2026-10-05, and the SCORE PIPELINE tab on 2026-10-08: DATA FLOW shows how
+ * one token is fetched, scored and displayed, box by box. Their catalogues
+ * stay (pipeline.js, pipeline-shown.js) - they are what the map draws.
  */
-export const MIRROR_PAGES = ['pipe', 'market', 'alerts', 'eval', 'health'];
+export const MIRROR_PAGES = ['market', 'alerts', 'eval', 'health'];
 
 /** The token tabs, now step 6 of the pipeline rather than pages of their own. */
 export const MAP_ONLY_PAGES = new Set(['live', 'detail', 'social', 'wallets', 'rotation']);

@@ -10,8 +10,8 @@
  */
 import React from 'react';
 import {
-  fetchAdminStore, fetchCatalog, API_ORIGIN, API_BASES,
-  initApiBase, setApiTarget, apiTarget, probeLocalApi,
+  fetchAdminStore, fetchCatalog, API_ORIGIN,
+  initApiBase,
 } from '../services/api';
 // The STORAGE tab is the one section here that is NOT server-only: storage has
 // three halves and two of them live in this browser. AdminPanel extends App, so
@@ -167,29 +167,16 @@ export default class AdminOps extends React.Component {
       data: null, catalog: null, error: null, loading: true,
       collection: 'poolHistory', probe: null, scan: null,
       token: params.get('token') || '', tab: props.initialTab || 'server',
-      // Which server this page is reading, and whether the local one is up.
-      // The panel used to import API_ORIGIN and never call initApiBase(), so
-      // it always read the deployed server even with a local one running and
-      // the dashboard beside it reading from that local one.
-      target: apiTarget(), localUp: null
     };
   }
 
   async componentDidMount() {
     // Settle on a server BEFORE the first request, exactly as App does.
     await initApiBase();
-    this.setState({ target: apiTarget(), localUp: await probeLocalApi() });
     this.load();
     this.timer = setInterval(() => this.load(), 15000);
   }
 
-  /** Pin this page - and the dashboard - to one server, or hand it to the probe. */
-  pickServer = async (next) => {
-    if (next === this.state.target) return;
-    this.setState({ loading: true, error: null, data: null, probe: null });
-    await setApiTarget(next);
-    this.setState({ target: apiTarget(), localUp: await probeLocalApi() }, () => this.load());
-  };
   componentWillUnmount() { clearInterval(this.timer); }
 
   // The rail in the admin shell picks the section, so the prop is the tab.
@@ -279,10 +266,7 @@ export default class AdminOps extends React.Component {
           <Section title="CONNECTION">
             <div style={{ color: C.hot, fontSize: 12 }}>
               {error} at <span style={{ color: C.blue }}>{API_ORIGIN}</span>.{' '}
-              {this.state.target === 'local'
-                ? 'Nothing is answering on that port - start the local server, or switch to DEPLOYED.'
-                : 'If the Render instance was asleep it may take 30-60s to wake. A local server is ' +
-                  (this.state.localUp ? 'up - switch to LOCAL.' : 'not running.')}
+              Start the local server (start-server.cmd) and reload.
             </div>
           </Section>
         )}

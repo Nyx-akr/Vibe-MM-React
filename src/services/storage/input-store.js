@@ -27,9 +27,8 @@ const PREFIX = 'vs_';
 const INPUTS = {
   watchlist:     { key: 'vs_watchlist',       fallback: () => ({}), valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
   walletRegistry:{ key: 'vs_wallet_registry', fallback: () => null, valid: (v) => Array.isArray(v) },
-  // Only the two pinned targets are ever stored; 'auto' is the ABSENCE of a
-  // preference, so it is removal rather than a value. Accepting any string
-  // here would let a typo sit in storage looking valid.
+  // RETIRED 2026-10-08 with the AUTO / LOCAL / DEPLOYED switch. Kept only so
+  // services/api.js can clear a value an old browser still holds.
   apiTarget:     { key: 'vs_api_target',      fallback: () => null, valid: (v) => v === 'local' || v === 'remote' },
   // The board's chain chips: { SOL: true, ETH: true, ... }. Absent means ALL.
   chainSelection:{ key: 'vs_chain_selection', fallback: () => null, valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },

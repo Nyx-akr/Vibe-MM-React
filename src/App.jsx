@@ -46,7 +46,7 @@ function restoreChains(saved) {
   return Object.keys(kept).length ? kept : allChains();
 }
 
-/** Remembers the chips across reloads. ALL is stored as nothing, like apiTarget's 'auto'. */
+/** Remembers the chips across reloads. ALL is stored as nothing. */
 function saveChains(sel) {
   setInput('chainSelection', isAllChains(sel) ? null : sel);
   return sel;
@@ -90,7 +90,6 @@ import { fetchTokenOutcomes,
   fetchLiveOhlcv,
   initApiBase,
   usingLocalApi,
-  apiTarget,
   API_ORIGIN,
   fetchPrecisionInputs,
   fetchStorageTimeline,
@@ -373,7 +372,7 @@ class App extends React.Component {
     // first round of requests goes to the deployed server regardless and the
     // intel services below capture the wrong base for their whole lifetime.
     this.apiReady = initApiBase().then(async (base) => {
-      this.setState({ apiBase: base, apiIsLocal: usingLocalApi(), apiTarget: apiTarget() });
+      this.setState({ apiBase: base, apiIsLocal: usingLocalApi() });
 
       // The app store is asynchronous, and everything that scores reads its
       // memory the moment it starts: the intel services, the journal, and the
@@ -1064,7 +1063,7 @@ class App extends React.Component {
       liveLabel: st.serverError ? 'STORE OFFLINE'
         : storeStale ? 'STORE STALE · ' + Math.round(st.storeAgeMs / 1000) + 's'
           : (live ? 'LIVE' : 'PAUSED'),
-      serverError: st.serverError, apiIsLocal: st.apiIsLocal, apiTarget: st.apiTarget,
+      serverError: st.serverError, apiIsLocal: st.apiIsLocal,
       hasSelection: Boolean(sel),
       // The identity bar belongs to the asset-scoped tabs only - the same set
       // the sidebar nests under ASSET DETAIL. ALERT CARDS, EVALUATION and
@@ -1155,15 +1154,7 @@ class App extends React.Component {
                       play, "the server" is ambiguous. */}
                   No raw store at <span style={{ color: '#4fc3f7' }}>{API_ORIGIN}/raw</span>
                   {v.apiIsLocal ? ' (local)' : ' (deployed)'}. Retrying automatically every 5s...
-                  {/* A PINNED target skips the probe entirely, so "start the
-                      collector" is the wrong advice - it can already be running
-                      and this screen would still show. Say which it is. */}
-                  {!v.apiIsLocal && v.apiTarget === 'remote' && (
-                    <> This is pinned to <span style={{ color: '#ffb454' }}>DEPLOYED</span>, so a local
-                    collector would not be tried even if one were running. Switch to AUTO or LOCAL in
-                    /admin, or run <span style={{ color: '#c6d1ea' }}>localStorage.removeItem('vs_api_target')</span> and reload.</>
-                  )}
-                  {!v.apiIsLocal && v.apiTarget !== 'remote' && (
+                  {!v.apiIsLocal && (
                     <> Start the local collector and reload to use it instead.</>
                   )}
                 </div>

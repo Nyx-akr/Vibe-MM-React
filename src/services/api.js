@@ -16,7 +16,7 @@
  */
 
 import { chainKeys, chainKeyToName } from '../data/chains';
-import { getInput, setInput } from './storage/input-store';
+import { setInput } from './storage/input-store';
 import { readRaw, readRawQuiet, setRawOrigin, probeRawStore, ageOf } from './storage/raw-store';
 import { payload as catalogPayload } from '../data/catalog';
 import {
@@ -51,24 +51,10 @@ let BASE_URL = REMOTE_BASE;
 export let API_ORIGIN = REMOTE_BASE;
 setRawOrigin(REMOTE_BASE);
 
-/** Both stores this app can read from, for anything that offers the choice. */
-export const API_BASES = { local: LOCAL_BASE, remote: REMOTE_BASE };
-
-/*
- * Which store to read from, as a preference rather than a fact:
- *
- *   'auto'   - probe in dev, deployed in production (the behaviour below)
- *   'local'  - pinned to LOCAL_BASE by a human, in any build
- *   'remote' - pinned to REMOTE_BASE by a human, in any build
- *
- * The admin panel's switch writes this, and it survives a reload.
- */
-let target = readTarget();
-
-function readTarget() {
-  const saved = getInput('apiTarget');
-  return saved === 'local' || saved === 'remote' ? saved : 'auto';
-}
+// There is no manual server switch any more (removed 2026-10-08): the store
+// is chosen automatically, below. A preference left over from the old AUTO /
+// LOCAL / DEPLOYED switch is cleared so it can never pin the app again.
+setInput('apiTarget', null);
 
 function apply(base) {
   BASE_URL = base;
@@ -87,7 +73,7 @@ function apply(base) {
  * the answer means nothing, and the attempt makes Chrome ask them to let
  * marketmonitor.site "access other apps and services on this device".
  */
-export async function probeLocalApi() {
+async function probeLocalApi() {
   if (sharedOrigin()) return false;
   return probeRawStore(LOCAL_BASE);
 }
@@ -95,15 +81,11 @@ export async function probeLocalApi() {
 /**
  * Settle on a store. Call once, before the first read; safe to call again.
  *
- * A pinned target wins outright. Otherwise, in DEV ONLY, prefer a local store
- * when one is being served. Auto-probing is not done in production: on Vercel
- * the probe would run on the VISITOR'S machine, where localhost is their
- * computer, never the collector.
+ * In DEV ONLY, prefer a local store when one is being served. Auto-probing is
+ * not done in production: on Vercel the probe would run on the VISITOR'S
+ * machine, where localhost is their computer, never the collector.
  */
 export async function initApiBase() {
-  if (target === 'local') return apply(LOCAL_BASE);
-  if (target === 'remote') return apply(REMOTE_BASE);
-
   // Someone else's view of a shared link: the collector serves the app, so the
   // store is the origin this page came from. Probed, not assumed - an app
   // served from anywhere that is not also the collector falls through to the
@@ -117,17 +99,6 @@ export async function initApiBase() {
   if (!import.meta.env.DEV) return apply(REMOTE_BASE);
   return apply((await probeLocalApi()) ? LOCAL_BASE : REMOTE_BASE);
 }
-
-/** Pin the app to one store, or hand it back to the probe with 'auto'. */
-export async function setApiTarget(next) {
-  target = next === 'local' || next === 'remote' ? next : 'auto';
-  // 'auto' is the absence of a preference, so it is stored as nothing.
-  setInput('apiTarget', target === 'auto' ? null : target);
-  return initApiBase();
-}
-
-/** The preference, which is not the same question as which base is in force. */
-export const apiTarget = () => target;
 
 /** Which store the app settled on, for anything that wants to say so. */
 export const usingLocalApi = () => BASE_URL === LOCAL_BASE;

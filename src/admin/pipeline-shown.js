@@ -4,7 +4,7 @@
  * Every panel of the token-facing tabs - LIVE OPPORTUNITIES, ASSET DETAIL,
  * WALLETS, SOCIAL SCANNER, ROTATION - and what each number on it is read
  * from. They used to be five mirror tabs of their own on the admin rail; the
- * SCORE PIPELINE and DATA FLOW now show the whole path, fetch to screen, so
+ * DATA FLOW now shows the whole path, fetch to screen, so
  * these are the pipeline's last step rather than pages beside it.
  *
  * Kept under their tab keys (`live`, `detail`, ...): a field is identified as
@@ -78,7 +78,7 @@ export const SHOWN_PAGES = {
               return t ? t.value + (t.sub ? '  (' + t.sub + ')' : '') : undefined;
             },
             calc: [op('of the'), num(20), op('highest-ranked tokens at a past moment, the share that rose by'),
-              op('the horizon - marks from'), api('/raw/app/journal.json', 'the archived score journal'),
+              op('the horizon - marks from the score journal (IndexedDB in this browser)'),
               op('priced against'), api('/raw/<chain>/observations-48h.json', 'the archived price series')],
             note: 'Three rules keep it honest. Coverage is NEVER multiplied into the value - a 0.70 ' +
               'measured across half a day would print as 0.35 and read as a bad model rather than a ' +
@@ -263,7 +263,7 @@ export const SHOWN_PAGES = {
           {
             label: 'CONFIDENCE', status: 'live',
             value: (v) => v.d && v.d.conf,
-            calc: [op('components measured'), op('/'), num(11)],
+            calc: [ref('pipe', 'Data quality', 'components measured'), op('/'), num(11)],
             note: 'The model has twelve components plus two modifiers, so a fully resolved ' +
               'token reads above 1.00. The divisor and the model have drifted apart.',
             feeds: [ref('live', 'CONF')],
@@ -379,11 +379,16 @@ export const SHOWN_PAGES = {
         group: 'OUTCOME TRACKING',
         fields: [
           {
-            label: 'FORWARD RETURNS', status: 'placeholder',
+            label: 'FORWARD RETURNS', status: 'live',
             value: (v) => ((v.d && v.d.outcomes) || []).map((o) => o.k + ' ' + o.v).join('  '),
-            calc: [op('every horizon hard-coded to an em dash')],
-            note: 'The EVALUATION tab does measure forward returns, by joining the score ' +
-              'journal to the server observation series. This panel is not reading it.',
+            // What this token did AFTER we scored it: the score journal (every
+            // FINAL we recorded, in browser storage) joined to the price
+            // series, excess over the board's median at each horizon.
+            calc: [op('scoreOutcomes( the score journal ×'), api('/raw/<chain>/observations.json', 'the 60s observation series'),
+              op('+'), api('/raw/<chain>/observations-48h.json', 'the archived price series'),
+              op(') → excess return at 1H / 6H / 24H, this token only')],
+            note: 'The same scoreOutcomes() the EVALUATION tab runs, kept to this token. Excess, ' +
+              'not raw return: memecoins move together, so the board median is subtracted.',
             feeds: [],
             where: 'tabs-modules/ASSET-DETAIL.jsx detailVals(), outcomes',
           },
@@ -438,7 +443,7 @@ export const SHOWN_PAGES = {
           {
             label: 'BUYERS / SELLERS', status: 'live',
             value: (v) => tile(v.walletStats, 'BUYERS / SELLERS'),
-            calc: [op('count( wallets with any buy )'), op('/'), op('count( wallets with any sell )')],
+            calc: [ref('wallets', 'WALLET INTEL'), op('count( wallets with any buy ) / count( wallets with any sell )')],
             note: 'A wallet that did both counts on both sides - which is the point: ' +
               'round-tripping is what the organic read is looking for.',
             feeds: [ref('detail', 'Organic flow')],
@@ -447,7 +452,7 @@ export const SHOWN_PAGES = {
           {
             label: 'TOP WALLET SHARE', status: 'live',
             value: (v) => tile(v.walletStats, 'TOP WALLET SHARE'),
-            calc: [op('largest wallet |USD|'), op('/'), op('total window volume x'), num(100)],
+            calc: [ref('wallets', 'WALLET INTEL'), op('largest wallet |USD| / total window volume x'), num(100)],
             feeds: [ref('wallets', 'WALLET QUALITY')],
             where: 'services/wallet-intel.js, flow.topWalletSharePct',
           },
@@ -498,6 +503,8 @@ export const SHOWN_PAGES = {
           {
             label: 'WALLET INTEL', status: 'live',
             value: (v) => v.intelLine,
+            service: { every: '5s', keeps: 'pools watched, wallets in memory, clusters logged (IndexedDB)',
+              costs: 'nothing - it re-reads the samples the server holds' },
             calc: [op('pools watched, wallets in memory, clusters logged - all re-read from'),
               api('/raw/<chain>/trades.json', 'samples the server already holds')],
             note: 'It issues no extra upstream calls of its own - 5s means processing, not ' +
@@ -548,7 +555,7 @@ export const SHOWN_PAGES = {
           {
             label: 'ACCOUNT KIND', status: 'live',
             value: () => (v.ethos && v.ethos.kind) || '—',
-            calc: [op('x.com/<handle>'), op('\u2192'), op('"profile"'),
+            calc: [api('/raw/ethos.json', 'ETHOS (PROJECT X)'), op('x.com/<handle>'), op('\u2192'), op('"profile"'),
               op('\u2502 x.com/<handle>/status/<id>'), op('\u2192'), op('"post"')],
             note: 'A /status/ URL names whoever wrote that post, often not the project, so ' +
               'only a profile handle is presented as the account belonging to the token.',
@@ -600,6 +607,7 @@ export const SHOWN_PAGES = {
           {
             label: 'BASELINE', status: 'live',
             value: (v) => v.socialBaselineNote,
+            service: { every: '1 min', keeps: 'each token’s mention history, kept with the tab closed (IndexedDB)' },
             calc: [op('rolling mean and z of'), ref('social', 'MENTIONS'),
               op(', one sample a minute, kept with the tab closed')],
             feeds: [ref('social', 'VS BASELINE')],
@@ -689,6 +697,8 @@ export const SHOWN_PAGES = {
           {
             label: 'ROTATION SERVICE', status: 'live',
             value: (v) => v.rotService,
+            service: { every: 'each wallet sample', keeps: 'chains held and pools connected',
+              costs: 'nothing - it rides the wallet sample' },
             calc: [op('chains held and pools connected, built on top of'),
               ref('wallets', 'WALLET INTEL')],
             note: 'It polls nothing itself - it rides the wallet sample, so it costs no ' +
