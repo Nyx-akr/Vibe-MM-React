@@ -26,7 +26,7 @@ import {
   providerHealth, summarize,
 } from '../calculations/core';
 import {
-  evaluateAsset, deriveIntel, usdReferenceMedian,
+  evaluateAsset, deriveIntel, usdReferenceMedian, scoreAsset,
   SCORE_MODEL, hydrateStages, stageSnapshot,
   hydrateScoreHistory, scoreHistorySnapshot,
 } from '../calculations/asset-detail';
@@ -35,6 +35,7 @@ import {
   loadStageMemory, saveStageMemory, loadScoreWindow, saveScoreWindow,
 } from './score-journal';
 import { walletIntelForPool } from './wallet-intel';
+import { flowScore } from '../flow/score-flow';
 import { ethosFor } from './ethos-intel';
 import { sharedOrigin } from './shared-origin';
 import { recordTrail, flushTrail, readTrail } from './score-trail';
@@ -401,7 +402,7 @@ export async function fetchLiveMarketData(chains = chainKeys) {
       function scoreRow(row) {
         // One evaluation per token, owned by calculations/asset-detail.js.
         // The board renders what comes back; it decides nothing itself.
-        const full = evaluateAsset(row, {
+        const inputs = {
           samples: raw.samples,
           walletSets: raw.walletSets,
           // The same intel file the detail page reads, so the table and the
@@ -419,7 +420,16 @@ export async function fetchLiveMarketData(chains = chainKeys) {
           ethos: ethosFor(chainKey, row.tokenAddress),
           // Perp venues and paid promotion, for the listing components.
           listing: listingFor(perps, promotion, row),
-        });
+        };
+        // THE DATA FLOW computes the score: every box of the default flow,
+        // run for this token, with the map's edits obeyed (flow/score-flow.js).
+        const full = evaluateAsset(row, inputs, flowScore);
+        // Golden check (admin): the old scorer beside it, without touching its
+        // memory, so any difference between the flow and the old code shows.
+        if (typeof window !== 'undefined' && window.__flowCheck) {
+          const old = evaluateAsset(row, inputs, (r, ex) => scoreAsset(r, { ...ex, trackStage: false }));
+          (window.__flowDiffs = window.__flowDiffs || []).push({ sym: row.symbol, chain: chainKey, flow: full, old });
+        }
         // Remember what we scored it at, so Evaluation can grade it later.
         // This lives in the app store only - it never goes to the server.
         recordScore(chainKey, row.tokenAddress, {

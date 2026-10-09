@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node test/precision.test.js && node test/outcomes.test.js"
+    "test": "node test/precision.test.js && node test/outcomes.test.js && node test/wire-types.test.js"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",

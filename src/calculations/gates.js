@@ -26,6 +26,8 @@ export const GATE_RULES = {
   minOrganicFlow: 40,
 };
 
+import { gateRules } from '../flow/params.js';
+
 const fin = Number.isFinite;
 
 const usd = (n) => {
@@ -49,6 +51,9 @@ const checkOf = (intel, re) => {
 };
 
 /** The gates, in the order they are drawn and logged. */
+/** The rules in force: the flow's PARAMETERS boxes, else the defaults above. */
+const R = () => gateRules(GATE_RULES);
+
 export const GATES = [
   { key: 'sellable', label: 'SELLABLE',
     test: (row, x) => checkOf(x.intel, /honeypot|sell/i) },
@@ -56,25 +61,25 @@ export const GATES = [
     test: (row, x) => checkOf(x.intel, /tax/i) },
   { key: 'major', label: 'NOT A MAJOR',
     test: (row) => (fin(row.marketCapUsd)
-      ? { ok: row.marketCapUsd < GATE_RULES.majorMarketCapUsd,
-          detail: usd(row.marketCapUsd) + ' < ' + usd(GATE_RULES.majorMarketCapUsd) + ' ? ' +
-            (row.marketCapUsd < GATE_RULES.majorMarketCapUsd ? 'yes' : 'no') }
+      ? { ok: row.marketCapUsd < R().majorMarketCapUsd,
+          detail: usd(row.marketCapUsd) + ' < ' + usd(R().majorMarketCapUsd) + ' ? ' +
+            (row.marketCapUsd < R().majorMarketCapUsd ? 'yes' : 'no') }
       : null) },
   // screenRows() already drops stables, wrapped natives and majors, so every
   // row that reaches scoring has passed this one.
   { key: 'ticker', label: 'REAL TICKER',
     test: (row) => ({ ok: true, detail: (row.symbol || '?') + ' is not on the stable / wrapped / major list' }) },
   { key: 'age', label: 'AGE FLOOR',
-    test: (row) => atLeast(row.poolAgeHours, GATE_RULES.minAgeHours, (h) => (Math.round(h / 2.4) / 10) + ' days') },
+    test: (row) => atLeast(row.poolAgeHours, R().minAgeHours, (h) => (Math.round(h / 2.4) / 10) + ' days') },
   { key: 'liquidity', label: 'LIQUIDITY FLOOR',
-    test: (row) => atLeast(row.liquidityUsd, GATE_RULES.minLiquidityUsd, usd) },
+    test: (row) => atLeast(row.liquidityUsd, R().minLiquidityUsd, usd) },
   { key: 'volume', label: 'VOLUME FLOOR',
-    test: (row) => atLeast(row.volume24hUsd, GATE_RULES.minVolume24hUsd, usd) },
+    test: (row) => atLeast(row.volume24hUsd, R().minVolume24hUsd, usd) },
   { key: 'wash', label: 'NOT WASH-FLAGGED',
     test: (row, x) => (fin(x.organicFlow)
-      ? { ok: x.organicFlow >= GATE_RULES.minOrganicFlow,
-          detail: 'organic ' + x.organicFlow + ' ≥ ' + GATE_RULES.minOrganicFlow + ' ? ' +
-            (x.organicFlow >= GATE_RULES.minOrganicFlow ? 'yes' : 'no') }
+      ? { ok: x.organicFlow >= R().minOrganicFlow,
+          detail: 'organic ' + x.organicFlow + ' ≥ ' + R().minOrganicFlow + ' ? ' +
+            (x.organicFlow >= R().minOrganicFlow ? 'yes' : 'no') }
       : null) },
 ];
 

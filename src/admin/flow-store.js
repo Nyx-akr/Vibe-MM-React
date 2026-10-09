@@ -156,18 +156,93 @@ export function addUser(name) {
  */
 export function updateFlow(patch) {
   const doc = activeFlow();
-  const next = { ...doc, ...(typeof patch === 'function' ? patch(doc) : patch), updatedAt: Date.now() };
-  state.docs[doc.id] = next;
-  if (doc.id !== DEFAULT_FLOW) {
-    write(LS_DOC(doc.id), next);
+  const change = typeof patch === 'function' ? patch(doc) : patch;
+  // A write that changes nothing (the map re-saving its positions after an
+  // undo) is not an edit: it must not become an undo step or clear redo.
+  if (!Object.keys(change || {}).some((k) => JSON.stringify(change[k]) !== JSON.stringify(doc[k]))) return;
+  const next = { ...doc, ...change, updatedAt: Date.now() };
+  remember(doc);
+  commit(next);
+}
+
+function commit(next) {
+  state.docs[next.id] = next;
+  if (next.id !== DEFAULT_FLOW) {
+    write(LS_DOC(next.id), next);
     pushToServer(next);
   }
   emit();
 }
 
+/* ------------------------------------------------------- undo / redo -- */
+
+/*
+ * The last UNDO_STEPS versions of each flow, so Ctrl+Z steps back one edit
+ * and Ctrl+Y steps forward again. Edits closer together than COALESCE_MS
+ * (typing a number, one drag) count as one step.
+ */
+const UNDO_STEPS = 10;
+const COALESCE_MS = 600;
+const history = new Map(); // flow id -> { past: [doc], future: [doc], at }
+let historyVersion = 0;
+const historyOf = (id) => {
+  if (!history.has(id)) history.set(id, { past: [], future: [], at: 0 });
+  return history.get(id);
+};
+function remember(doc) {
+  const h = historyOf(doc.id);
+  const now = Date.now();
+  if (now - h.at > COALESCE_MS) {
+    h.past.push(doc);
+    if (h.past.length > UNDO_STEPS) h.past.shift();
+  }
+  h.at = now;
+  h.future = [];
+}
+/** Bumped by undo and redo, so the map knows to reload the flow. */
+export const flowHistoryVersion = () => historyVersion;
+export const canUndo = () => historyOf(activeFlowId()).past.length > 0;
+export const canRedo = () => historyOf(activeFlowId()).future.length > 0;
+
+/** Back one edit. Returns false when there is nothing to undo. */
+export function undoFlow() {
+  const h = historyOf(activeFlowId());
+  if (!h.past.length) return false;
+  const cur = activeFlow();
+  h.future.push(cur);
+  h.at = 0;
+  historyVersion += 1;
+  commit({ ...h.past.pop(), updatedAt: Date.now() });
+  return true;
+}
+
+/** Forward one undone edit. */
+export function redoFlow() {
+  const h = historyOf(activeFlowId());
+  if (!h.future.length) return false;
+  h.past.push(activeFlow());
+  h.at = 0;
+  historyVersion += 1;
+  commit({ ...h.future.pop(), updatedAt: Date.now() });
+  return true;
+}
+
 // The keys the map used before flows existed: its settings and its groups
 // now live in the active flow, so the old copies are cleared.
 try { ['vs.admin.boxsettings.v1', 'vs.admin.engines.v1'].forEach((k) => window.localStorage.removeItem(k)); } catch (e) { /* private window */ }
+
+// Another tab changed a flow (the admin map, while the frontend is open): take
+// its copy, so the score in this tab uses the same parameters on its next poll.
+try {
+  window.addEventListener('storage', (e) => {
+    if (!e.key) return;
+    if (e.key === LS_ACTIVE) state.active = read(LS_ACTIVE, DEFAULT_FLOW);
+    else if (e.key === LS_USERS) state.users = read(LS_USERS, []);
+    else if (e.key.indexOf(LS_DOC('')) === 0) delete state.docs[e.key.slice(LS_DOC('').length)];
+    else return;
+    emit();
+  });
+} catch (err) { /* not a browser */ }
 
 pullUsers();
 if (activeFlowId() !== DEFAULT_FLOW) pullDoc(activeFlowId());

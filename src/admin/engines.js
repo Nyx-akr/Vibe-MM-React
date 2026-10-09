@@ -322,20 +322,29 @@ export function viewGraph(base, H, level) {
   const outPorts = new Map();
   const boundaryIn = new Map(); // src id -> label
   const boundaryOut = new Map();
-  const port = (map, eng, key) => {
+  // A dot is CUT while every wire through it is cut: it stays, unconnected.
+  const cutOf = new Map();
+  const viaOf = new Map();
+  const port = (map, eng, key, cut, via) => {
     if (!map.has(eng)) map.set(eng, new Map());
     map.get(eng).set(key, labelOf(key));
+    const k = (map === inPorts ? 'in|' : 'out|') + eng + '|' + key;
+    cutOf.set(k, (cutOf.has(k) ? cutOf.get(k) : true) && Boolean(cut));
+    if (via && !cut) viaOf.set(k, via);
   };
+  const isCut = (side, eng, key) => cutOf.get(side + '|' + eng + '|' + key) === true;
   // The field a port carries, for its live value - a box at this level, or a
   // field folded into a closed panel.
   const fieldOf = (key) => (nodeOf.get(key) || {}).field || foldedField(key) || readingField(key) || null;
   const add = (from, fromPort, to, toPort, e) => {
     const id = from + '|' + (fromPort || '') + '>' + to + '|' + (toPort || '') + ':' + e.kind;
     const hit = edges.get(id);
-    if (hit) { hit.parts = hit.parts.concat(e.parts || [{ from: e.from, to: e.to }]); return; }
+    // A wire is cut only while every wire folded into it is cut.
+    if (hit) { hit.parts = hit.parts.concat(e.parts || [{ from: e.from, to: e.to }]); hit.cut = Boolean(hit.cut && e.cut); return; }
     edges.set(id, {
       id, from, to, fromPort: fromPort || null, toPort: toPort || null, kind: e.kind,
       parts: (e.parts || [{ from: e.from, to: e.to }]).slice(), src: e.from, sketchId: e.sketchId || null,
+      ...(e.cut ? { cut: true } : {}),
     });
   };
 
@@ -352,21 +361,28 @@ export function viewGraph(base, H, level) {
     parts.forEach((p) => {
       // A closed panel's arrow carries its fields' values; a file's carries
       // its readings; any other box's carries its own value.
-      const key = isReading(p.label) ? dataKey(p) : (rolledPanel ? p.from : e.from);
-      if (!by.has(key)) by.set(key, []);
-      by.get(key).push(p);
+      // The value's own name where it LEAVES (srcKey); a wire the user drew
+      // into a dot ARRIVES under that dot's name (portKey).
+      const srcKey = isReading(p.label) ? dataKey(p) : (rolledPanel ? p.from : e.from);
+      const key = p.portKey || srcKey;
+      const k = key + '>>' + srcKey;
+      if (!by.has(k)) by.set(k, { key, srcKey, ps: [] });
+      by.get(k).ps.push(p);
     });
-    by.forEach((ps, key) => carried.push({ e: { ...e, parts: ps }, key }));
+    by.forEach(({ key, srcKey, ps }) => carried.push({ e: { ...e, parts: ps }, key, srcKey }));
   });
 
   // A user's INPUT / OUTPUT box is a group's named connector: a wire INTO an
   // input crosses the group's edge under the INPUT's name, and inside the
   // group the box itself is the entry/exit - no extra IN/OUT dot for it.
   const uportOf = (id) => { const n = nodeOf.get(id); return n && n.uport ? n.uport : null; };
-  carried.forEach(({ e, key: dataKey0 }) => {
+  carried.forEach(({ e, key: dataKey0, srcKey }) => {
     const key = uportOf(e.to) === 'in' ? e.to : dataKey0;
+    // Where the wire leaves: the source's own value, not the dot it feeds.
+    const outKey = srcKey || dataKey0;
     const ra = childOf(e.from);
     const rb = childOf(e.to);
+    const via = (e.parts || []).map((p) => (p.portKey && p.from !== p.portKey ? p.from : null)).find(Boolean) || null;
     if (!ra && !rb) return;
     if (ra && rb && ra === rb) return; // inside one child engine: its business
     if (!ra && rb === e.to && uportOf(e.to) === 'in') return;
@@ -375,19 +391,19 @@ export function viewGraph(base, H, level) {
     const toIsEngine = rb && H.engines.has(rb) && rb !== e.to;
     if (!ra) {
       boundaryIn.set(key, labelOf(key));
-      if (toIsEngine) port(inPorts, rb, key);
+      if (toIsEngine) port(inPorts, rb, key, e.cut, via);
       add('port:in:' + key, null, rb, toIsEngine ? key : null, e);
       return;
     }
     if (!rb) {
-      boundaryOut.set(key, labelOf(key));
-      if (fromIsEngine) port(outPorts, ra, key);
-      add(ra, fromIsEngine ? key : null, 'port:out:' + key, null, e);
+      boundaryOut.set(outKey, labelOf(outKey));
+      if (fromIsEngine) port(outPorts, ra, outKey, e.cut);
+      add(ra, fromIsEngine ? outKey : null, 'port:out:' + outKey, null, e);
       return;
     }
-    if (fromIsEngine) port(outPorts, ra, key);
-    if (toIsEngine) port(inPorts, rb, key);
-    add(ra, fromIsEngine ? key : null, rb, toIsEngine ? key : null, e);
+    if (fromIsEngine) port(outPorts, ra, outKey, e.cut);
+    if (toIsEngine) port(inPorts, rb, key, e.cut, via);
+    add(ra, fromIsEngine ? outKey : null, rb, toIsEngine ? key : null, e);
   });
 
   // Every INPUT / OUTPUT declares its dot on the group it sits in, wired or
@@ -402,8 +418,8 @@ export function viewGraph(base, H, level) {
   // The engine boxes themselves.
   engineCount.forEach((count, id) => {
     const eng = H.engines.get(id);
-    const ins = Array.from((inPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key) }));
-    const outs = Array.from((outPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key) }));
+    const ins = Array.from((inPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key), cut: isCut('in', id, key), via: viaOf.get('in|' + id + '|' + key) || null }));
+    const outs = Array.from((outPorts.get(id) || new Map()).entries()).map(([key, label]) => ({ key, label, field: fieldOf(key), cut: isCut('out', id, key) }));
     const rows = Math.max(ins.length, outs.length, 1);
     nodes.push({
       id, kind: 'engine', label: eng.label, sub: eng.sub, color: eng.color, user: eng.user,
@@ -471,9 +487,11 @@ function portPanels(nodes, edges, labelOf, fieldOf) {
 
   const pIn = new Map();
   const pOut = new Map();
-  const addPort = (m, id, key) => {
+  const addPort = (m, id, key, cut, via) => {
     if (!m.has(id)) m.set(id, new Map());
-    if (!m.get(id).has(key)) m.get(id).set(key, { key, label: labelOf(key), field: fieldOf(key) });
+    const hit = m.get(id).get(key);
+    if (!hit) m.get(id).set(key, { key, label: labelOf(key), field: fieldOf(key), cut: Boolean(cut), via: via || null });
+    else { hit.cut = Boolean(hit.cut && cut); if (via && !cut) hit.via = via; }
   };
   const next = new Map();
   edges.forEach((x) => {
@@ -490,14 +508,15 @@ function portPanels(nodes, edges, labelOf, fieldOf) {
       by.get(src).push(p);
     });
     by.forEach((ps, src) => {
+      // A drawn wire lands on the dot it was dropped on (portKey), fed by src.
+      const inKey = ps[0].portKey || src;
       const fromPort = fromP ? src : x.fromPort || null;
-      const toPort = toP ? src : x.toPort || null;
-      if (fromP) addPort(pOut, x.from, src);
-      if (toP) addPort(pIn, x.to, src);
+      const toPort = toP ? inKey : x.toPort || null;
+      if (fromP) addPort(pOut, x.from, src, x.cut);
+      if (toP) addPort(pIn, x.to, inKey, x.cut, inKey !== src ? src : null);
       const id = x.from + '|' + (fromPort || '') + '>' + x.to + '|' + (toPort || '') + ':' + x.kind;
       const hit = next.get(id);
-      if (hit) hit.parts = hit.parts.concat(ps);
-      else next.set(id, { ...x, id, parts: ps.slice(), fromPort, toPort });
+      if (hit) { hit.parts = hit.parts.concat(ps); hit.cut = Boolean(hit.cut && x.cut); } else next.set(id, { ...x, id, parts: ps.slice(), fromPort, toPort });
     });
   });
   edges.clear();
@@ -584,6 +603,8 @@ export function portPoint(n, pos, side, key) {
 }
 
 /** Sketch wires as graph edges, so they flow through the same folding. */
-export const sketchEdges = (cfg) => (cfg.sketch || []).map((s) => ({
+// A wire drawn INTO an input dot is not a sketch: it is real wiring
+// (flow/wires.js), drawn as the wire it makes.
+export const sketchEdges = (cfg) => (cfg.sketch || []).filter((s) => !s.toPort).map((s) => ({
   id: 'sk:' + s.id, from: s.from, to: s.to, kind: 'sketch', parts: [{ from: s.from, to: s.to }], sketchId: s.id,
 }));

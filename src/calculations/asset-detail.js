@@ -19,6 +19,7 @@
  */
 
 import { evaluateGates } from './gates.js';
+import { weightOf, scoreWindowMs } from '../flow/params.js';
 import {
   toNumber, clamp01, to100, multipleScore, logScore, statsFor, normalizeJupiterToken,
   zScoresFrom, bucketBaselines, rotationFor, walletQualityScore, organicFlowScore,
@@ -720,7 +721,7 @@ const scoreHistory = new Map();
 
 export function hydrateScoreHistory(saved) {
   if (!saved) return;
-  const cutoff = Date.now() - SCORE_WINDOW_MS;
+  const cutoff = Date.now() - scoreWindowMs(SCORE_WINDOW_MS);
   Object.keys(saved).forEach((key) => {
     const kept = (saved[key] || []).filter((m) => m && m.t >= cutoff);
     if (kept.length) scoreHistory.set(key, kept);
@@ -738,12 +739,12 @@ export function scoreHistorySnapshot() {
  * Rounded to whole points, because that is how it is displayed and a stage
  * boundary must not turn on a hundredth.
  */
-function settledScore(chainKey, tokenAddress, momentary, now) {
+export function settledScore(chainKey, tokenAddress, momentary, now) {
   const key = chainKey + ':' + tokenAddress;
   const series = scoreHistory.get(key) || [];
   series.push({ t: now, v: momentary });
 
-  const cutoff = now - SCORE_WINDOW_MS;
+  const cutoff = now - scoreWindowMs(SCORE_WINDOW_MS);
   let kept = series.filter((m) => m.t >= cutoff);
   if (kept.length > SCORE_SAMPLES_MAX) kept = kept.slice(-SCORE_SAMPLES_MAX);
   scoreHistory.set(key, kept);
@@ -831,9 +832,11 @@ export function scoreAsset(row, extras) {
   const breakdown = SCORE_MODEL.map((c) => {
     const value = parts[c.key];
     const present = Number.isFinite(value);
-    if (present) { weighted += value * c.weight; weightUsed += c.weight; }
+    // The weight is the flow's WEIGHT box for this component (flow/params.js).
+    const weight = weightOf(c);
+    if (present) { weighted += value * weight; weightUsed += weight; }
     return {
-      key: c.key, label: c.label, weight: c.weight,
+      key: c.key, label: c.label, weight,
       value: present ? value : null,
       pending: !present,
       evidence: evidence[c.key] || null,
@@ -879,7 +882,7 @@ export function scoreAsset(row, extras) {
     scoreNow,
     scoreSamples: settled.samples,
     scoreObservedMs: settled.observedMs,
-    scoreWindowMs: SCORE_WINDOW_MS,
+    scoreWindowMs: scoreWindowMs(SCORE_WINDOW_MS),
     scoreMin: settled.min,
     scoreMax: settled.max,
     stage: stage.stage,
@@ -927,7 +930,7 @@ export function scoreAsset(row, extras) {
  *                them yet; the score is computed on fewer inputs when we do not
  *   reference  - the quote token's price across CEX venues
  */
-export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel, ethos, listing } = {}) {
+export function evaluateAsset(row, { samples, walletSets, intel, reference, walletIntel, ethos, listing } = {}, scorer = scoreAsset) {
   const poolSamples = (samples && samples[row.poolAddress]) || [];
   const fromSamples = zScoresFrom(poolSamples);
   const own = walletSets && walletSets.get(row.poolAddress);
@@ -950,9 +953,14 @@ export function evaluateAsset(row, { samples, walletSets, intel, reference, wall
     ethos: ethos || null,
     // Perp venues and paid promotion, for the listing components.
     listing: listing || null,
+    // The raw inputs themselves, for a scorer that builds its own baselines
+    // and rotation from them (the DATA FLOW - flow/score-flow.js).
+    samples: poolSamples,
+    own: own || null,
+    walletSets: walletSets || null,
   };
 
-  const scored = scoreAsset(row, extras);
+  const scored = scorer(row, extras);
   const organic = (scored.scoreModifiers || []).find((m) => m.key === 'organicFlow');
   const organicValue = organic && !organic.pending ? organic.value : null;
   // Which source answered. Anything aggregating this number across tokens has

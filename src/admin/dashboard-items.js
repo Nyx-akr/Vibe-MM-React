@@ -24,6 +24,24 @@ const market = (field) => api('/raw/<chain>/market.json', field);
 
 export const DASHBOARD = [
   {
+    // On every tab: the header bar and its filters.
+    tab: 'HEADER',
+    panels: [
+      { panel: 'TOP BAR', items: [
+        { label: 'MARKET REGIME', display: 'text', from: [pipe('MARKET REGIME')] },
+        { label: 'ALERTS NOW', display: 'number', from: [pipe('ALERTS NOW')] },
+        { label: 'TOKEN PICKER', display: 'list', from: [pipe('TOKEN LIST'), pipe('FINAL')] },
+      ] },
+      { panel: 'FILTERS', items: [
+        { label: 'STAGES BAR', display: 'chart', from: [pipe('STAGE COUNTS')] },
+      ] },
+      { panel: 'ALERT FEED', items: [
+        { label: 'LIVE TAPE', display: 'list', from: [pipe('ALERT ENGINE')] },
+        { label: 'TOASTS', display: 'list', from: [pipe('ALERT ENGINE')] },
+      ] },
+    ],
+  },
+  {
     tab: 'LIVE OPPORTUNITIES',
     panels: [
       { panel: 'HEADER STATS', items: [
@@ -60,6 +78,7 @@ export const DASHBOARD = [
       { panel: 'SCORE', items: [
         { label: 'SCORE GAUGE', display: 'chart', from: [pipe('FINAL')], show: ['detail', 'FINAL'] },
         { label: 'STAGE', display: 'text', from: [pipe('STAGE')] },
+        { label: 'SCORE SPARKLINE', display: 'chart', from: [pipe('RIGHT NOW, 15 MIN MEAN')] },
       ] },
       { panel: 'PRICE & SCORE', items: [
         { label: 'CANDLES', display: 'chart', from: [api('/raw/<chain>/bars15/<pool>.json')], show: ['detail', 'CANDLES'] },
@@ -72,6 +91,9 @@ export const DASHBOARD = [
         { label: 'BUYERS 24H', display: 'number', from: [market('BUYERS 24H')] },
         { label: 'BUY/SELL 24H', display: 'number', from: [market('BUY/SELL 24H')] },
         { label: 'VENUES', display: 'number', from: [market('VENUES')] },
+        { label: 'MARKET CAP', display: 'number', from: [market('MARKET CAP')] },
+        { label: 'FDV', display: 'number', from: [market('FDV')] },
+        { label: 'DELTA 5M', display: 'number', from: [market('PRICE CHANGE 5M')] },
         { label: 'POOL AGE', display: 'number', from: [pipe('SURVIVAL')] },
       ] },
       { panel: 'WHAT MOVES THIS SCORE', items: [
@@ -105,6 +127,13 @@ export const DASHBOARD = [
         { label: 'TOP WALLET SHARE', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'TOP WALLET SHARE'] },
         { label: 'CO-ENTRY WALLETS', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'CO-ENTRY WALLETS'] },
       ] },
+      { panel: 'WALLET GROUPS', items: [
+        { label: 'ACCUMULATING / EXITING / CHURN / ROTATING / CO-ENTRY', display: 'list', from: [pipe('WALLET INTEL')] },
+        { label: 'CO-ORDINATED ENTRY', display: 'list', from: [pipe('WALLET INTEL')] },
+      ] },
+      { panel: 'YOUR TRACKED WALLETS', items: [
+        { label: 'TRACKED WALLETS', display: 'list', from: [pipe('WALLET INTEL')] },
+      ] },
       { panel: 'WALLET MAP', items: [
         { label: 'BUBBLE MAP', display: 'chart', from: [pipe('WALLET INTEL')] },
       ] },
@@ -120,9 +149,14 @@ export const DASHBOARD = [
     tab: 'SOCIAL',
     panels: [
       { panel: 'SOCIAL STATS', items: [
-        { label: 'MENTIONS', display: 'number', from: [pipe('SOCIAL BASELINE')] },
-        { label: 'VS BASELINE', display: 'number', from: [pipe('SOCIAL BASELINE')] },
+        { label: 'MENTIONS', display: 'number', from: [pipe('MENTIONS')] },
+        { label: 'UNIQUE AUTHORS', display: 'number', from: [pipe('UNIQUE AUTHORS')] },
+        { label: 'PER AUTHOR', display: 'number', from: [pipe('MENTIONS PER AUTHOR')] },
+        { label: 'VS BASELINE', display: 'number', from: [pipe('VS SOCIAL BASELINE')] },
         { label: 'POSTS SCANNED', display: 'number', from: [api('/raw/social.json')] },
+      ] },
+      { panel: 'SOCIAL FEED', items: [
+        { label: 'POSTS', display: 'list', from: [api('/raw/social.json')] },
       ] },
       { panel: 'SOURCES', items: [
         { label: 'SOURCES ANSWERING', display: 'table', from: [api('/raw/social.json')], show: ['social', 'SOURCES ANSWERING'] },
@@ -172,6 +206,32 @@ export const DASHBOARD = [
       ] },
       { panel: 'HOW EACH GROUP DID', items: [
         { label: 'BY STAGE', display: 'table', from: [pipe('SCORE EVALUATION')] },
+        { label: 'RUG RATE', display: 'number', from: [pipe('SCORE EVALUATION')] },
+        { label: 'WARNING FLAGS', display: 'table', from: [pipe('SCORE EVALUATION')] },
+      ] },
+      { panel: 'RANK IC · EACH 15-MIN MOMENT', items: [
+        { label: 'RANK IC SERIES', display: 'chart', from: [pipe('SCORE EVALUATION')] },
+      ] },
+    ],
+  },
+  {
+    tab: 'HEALTH',
+    panels: [
+      { panel: 'DATA SOURCES', items: [
+        { label: 'PROVIDER STATUS', display: 'table', from: [pipe('SYSTEM HEALTH')] },
+      ] },
+      { panel: 'CHAINS', items: [
+        { label: 'CHAIN FRESHNESS', display: 'table', from: [pipe('SYSTEM HEALTH')] },
+      ] },
+      { panel: 'BACKGROUND JOBS', items: [
+        { label: 'JOBS', display: 'table', from: [pipe('WALLET INTEL'), pipe('ROTATION SERVICE'), pipe('SOCIAL BASELINE')] },
+      ] },
+      { panel: 'THIS BROWSER', items: [
+        { label: 'STORES', display: 'table', from: [store('idb:score-journal'), store('idb:trails'), store('idb:wallet-memory'), store('idb:social-memory')] },
+      ] },
+      { panel: 'SERVER & ARCHIVE', items: [
+        { label: 'SERVER', display: 'table', from: [pipe('SYSTEM HEALTH')] },
+        { label: 'ARCHIVE PER DAY', display: 'chart', from: [pipe('SYSTEM HEALTH')] },
       ] },
     ],
   },

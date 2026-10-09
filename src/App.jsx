@@ -118,6 +118,9 @@ import SelectAssetPrompt from './components/SelectAssetPrompt';
 import SideNav from './components/SideNav';
 import AlertToasts from './components/AlertToasts';
 import AssetBar from './components/AssetBar';
+import { gateAssets, gateStats, gateDetail } from './flow/runtime';
+import { runBoardFlow, boardValues } from './flow/board-flow';
+import { subscribeFlows } from './admin/flow-store';
 /** The one selected-state palette shared by every filter chip. */
 // Opaque, not translucent. A semi-transparent fill composites over the page's
 // near-black gradient and lands DARKER than the unselected #0a1226, which made
@@ -314,7 +317,10 @@ class App extends React.Component {
     try {
       const liveAssets = await fetchLiveMarketData(chainKeys);
       if (liveAssets && liveAssets.length > 0) {
-        this.assets = liveAssets;
+        // What the DATA FLOW delivers: a value cut off on the map is empty here.
+        this.ungatedAssets = liveAssets;
+        this.runBoard(liveAssets);
+        this.assets = gateAssets(liveAssets);
 
         const picked = selectedChains(this.state.chainSel);
         const chain = picked.length === 1 ? (chainNameToKey[picked[0]] || 'solana') : 'solana';
@@ -365,6 +371,11 @@ class App extends React.Component {
   }
 
   componentDidMount() {
+    // A box deleted or a wire cut on the DATA FLOW (or undone) shows at once.
+    this.unsubFlows = subscribeFlows(() => {
+      if (this.ungatedAssets) { this.runBoard(this.ungatedAssets); this.assets = gateAssets(this.ungatedAssets); }
+      this.forceUpdate();
+    });
     const clockFn = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); this.setState({ clock: p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) }); };
     clockFn(); this.clockTimer = setInterval(clockFn, 1000);
     this.simTimer = setInterval(() => this.simTick(), 2400 / Math.max(1, this.props.simSpeed ?? 2));
@@ -599,6 +610,7 @@ class App extends React.Component {
   }
 
   componentWillUnmount() {
+    if (this.unsubFlows) this.unsubFlows();
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
     clearInterval(this.apiTimer);
@@ -986,7 +998,8 @@ class App extends React.Component {
     const gradeCounts = { STRONG: 0, FAIR: 0, WEAK: 0 };
     ours.forEach((o) => { gradeCounts[gradeOf(o.score).name] += 1; });
     const organicTile = {
-      label: 'AVG ORGANIC SCORE', value: organicAvg == null ? '—' : organicAvg + '%', mid: true,
+      // The DATA FLOW's AVG ORGANIC SCORE box.
+      label: 'AVG ORGANIC SCORE', value: boardValues()['f:pipe:AVG ORGANIC SCORE'] == null ? '—' : boardValues()['f:pipe:AVG ORGANIC SCORE'] + '%', mid: true,
       color: organicAvg == null ? '#3a4568' : gradeOf(organicAvg).color,
       verdict: organicAvg == null ? null : gradeOf(organicAvg).name.toLowerCase(),
       subLine: ours.length ? [{ text: ours.length + ' of ' + this.assets.length + ' sampled' }] : null,
@@ -1007,7 +1020,8 @@ class App extends React.Component {
     const perClass = {};
     this.assets.forEach((x) => { perClass[x.cls] = (perClass[x.cls] || 0) + 1; });
     const boardTile = {
-      label: 'TOKENS TRACKED', value: 'ALL ' + this.assets.length, color: '#ffffff', wide: true, inlineValue: true,
+      // The DATA FLOW's TOKENS TRACKED box.
+      label: 'TOKENS TRACKED', value: boardValues()['f:pipe:TOKENS TRACKED'] == null ? '—' : 'ALL ' + boardValues()['f:pipe:TOKENS TRACKED'], color: '#ffffff', wide: true, inlineValue: true,
       rows: [
         {
           name: 'CHAIN',
@@ -1073,7 +1087,7 @@ class App extends React.Component {
       needsSelection: !sel && Boolean(SELECTION_TABS[st.page]),
       selectionTabLabel: SELECTION_TABS[st.page] || '',
       isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
-      goLive: nav('live'), stats, headers, rows, tape, d, rowCount: rows.length,
+      goLive: nav('live'), stats: gateStats(stats), headers, rows, tape, d: gateDetail(d), rowCount: rows.length,
       views, chainFilters,
       searchQ: st.searchQ,
       onSearch: (e) => this.setState({ searchQ: e.target.value }),
@@ -1094,11 +1108,42 @@ class App extends React.Component {
       chepeStats: [{ k: 'Hard vetoes today', v: '14' }, { k: 'Honeypots blocked', v: '6' }, { k: 'Fake stock tokens', v: '2' }, { k: 'Wash clusters flagged', v: '5' }],
       chepeLast: 'Last veto — $SAFEGEM2 (BNB): honeypot, sell path reverts. Chepe says no.',
       ...this.chepePickVals(),
+      // The header's ALERTS: the alert cards on the board now (the DATA FLOW's
+      // ALERTS NOW box) - it used to be a fixed 47.
+      alertsNow: boardValues()['f:pipe:ALERTS NOW'],
       ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...marketRotationVals(this), ...evalVals(this), ...healthVals(this)
     };
   }
 
 
+
+  /** The DATA FLOW's board boxes, over every token (flow/board-flow.js). */
+  runBoard(assets) {
+    const prev = this.assets;
+    this.assets = assets;
+    try {
+      const st = this.state || {};
+      const sel = this.selectedAsset && this.selectedAsset();
+      let socialStats = null;
+      let evalOutcome = null;
+      try { socialStats = socialVals(this, sel).socialStats; } catch (e) { socialStats = null; }
+      try { evalOutcome = evalVals(this).outcome; } catch (e) { evalOutcome = null; }
+      let health = null;
+      try { health = healthVals(this).health; } catch (e) { health = null; }
+      runBoardFlow(assets, {
+        alertColumns: alertsVals(this).alertColumns || [],
+        dailyPick: this.chepePickVals().chepePickSym,
+        precision: st.precision || null,
+        outcomes: st.tokenOutcomes || null,
+        socialStats,
+        evalOutcome,
+        health,
+        selected: sel ? sel.sym : null,
+      });
+    } finally {
+      this.assets = prev;
+    }
+  }
 
   chepePickVals() {
     const day = new Date().toISOString().slice(0, 10);

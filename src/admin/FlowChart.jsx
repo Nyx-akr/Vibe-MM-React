@@ -1,7 +1,11 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
 import { getSetting, setSetting, clearSetting, subscribeSettings, applyFilter, filterSetting, FILTER_MODES } from './box-settings';
-import { activeFlow, activeFlowId, updateFlow, subscribeFlows, DEFAULT_FLOW } from './flow-store';
+import { activeFlow, activeFlowId, updateFlow, subscribeFlows, DEFAULT_FLOW, flowHistoryVersion, undoFlow, redoFlow } from './flow-store';
+import { userWires as applyUserWires } from '../flow/wires';
+import { WIRE_TYPES, typeOfValue, showValue, describeValue, coerce } from '../flow/types';
+import { boardValues } from '../flow/board-flow';
+import { NODE_TYPES } from '../flow/score-flow';
 import { buildGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, STORES, STAGES, CONNECTOR_W, CONNECTOR_H } from './graph';
 import { C, WorkedSteps } from './Explain';
 import { fieldValues } from './provenance';
@@ -104,64 +108,91 @@ function edgePath(p1, p2) {
 export const GROUP_COLOR = '#8fa3ff';
 
 /**
- * What kind of number a value is, from the value itself and its box: a wire
- * is coloured by what it CARRIES (dollars, a ratio, a 0-100 score, a verdict)
- * rather than by the box it left.
+ * WIRE TYPES - every dot is coloured by the STANDARD type its wire carries
+ * (flow/types.js): number, bool, text, list, dict. A box's name says what the
+ * value means; the dot only says what it is, as in Max/MSP.
+ *
+ * What a dot EXPECTS is its box's declared type (the engine's NODE_TYPES, or
+ * the box type's own); what it is RECEIVING is the type of the value on the
+ * wire right now, for the selected token. Hovering shows both.
  */
-export const UNIT_COLORS = {
-  usd: '#34d399', ratio: '#fbbf24', percent: '#f472b6', score: '#c084fc',
-  count: '#60a5fa', verdict: '#f87171', text: '#8b96b8', list: '#22d3ee', record: '#64748b',
+export const UNIT_COLORS = Object.fromEntries(Object.entries(WIRE_TYPES).map(([k, x]) => [k, x.color]));
+export const UNIT_NAMES = Object.fromEntries(Object.entries(WIRE_TYPES).map(([k, x]) => [k, x.name]));
+/** The selected token's wire values (score-flow flowValues), set each render. */
+let WIRE_VALUES = {};
+/** The inputs the user re-fed on the map (flow/wires.js), set by the edits. */
+let REROUTE = new Map();
+const ITEM_TYPE = { number: 'number' };
+/**
+ * The value on a box's outgoing wire, raw: the flow's own value where it ran
+ * one, and for a DASHBOARD ITEM the value arriving on its wire, converted to
+ * what it shows (a number item takes a list as its length).
+ */
+const wireOf = (n) => {
+  const id = n.kind === 'port' ? n.src : n.id;
+  if (Object.prototype.hasOwnProperty.call(WIRE_VALUES, id)) return { has: true, x: WIRE_VALUES[id] };
+  if (n.page === 'dash' && n.field && n.field.from) {
+    const fed = REROUTE.get(n.id) || {};
+    const srcs = n.field.from.map((t) => (t.t === 'ref' ? 'f:' + t.page + ':' + t.field
+      : t.t === 'api' && t.field ? 'f:pipe:' + t.field : null)).filter(Boolean);
+    for (const k of srcs) {
+      const src = fed[k] || k;
+      if (Object.prototype.hasOwnProperty.call(WIRE_VALUES, src)) {
+        const want = ITEM_TYPE[n.field.display] || null;
+        return { has: true, x: want ? coerce(WIRE_VALUES[src], want) : WIRE_VALUES[src] };
+      }
+    }
+  }
+  return { has: false, x: null };
 };
-export const UNIT_NAMES = {
-  usd: 'USD', ratio: 'ratio (×)', percent: 'percent', score: 'score 0-100',
-  count: 'count', verdict: 'pass / fail', text: 'text', list: 'list', record: 'a whole file (a record)',
+/** The type a box SENDS, declared: the engine's, else its box type's. */
+const declaredType = (id, meta) => {
+  if (NODE_TYPES[id]) return NODE_TYPES[id];
+  const n = meta && meta.kind ? meta : null;
+  if (!n) return null;
+  if (n.kind === 'file' || n.kind === 'store' || n.kind === 'provider' || n.kind === 'panel') return 'dict';
+  const t = typeOf(n);
+  if (t === 'service') return 'dict';
+  if (t === 'list' || t === 'filter') return 'list';
+  if (t === 'condition') return (n.field && n.field.opSpec && n.field.opSpec.sym === 'IF') ? 'number' : 'bool';
+  if (t === 'join') return 'bool';
+  if (t === 'selector') return 'text';
+  return 'number';
 };
 export function unitOf(val, meta) {
   if (val === null || val === undefined || val === '') return null;
-  const s = String(val).trim();
-  if (/^(pass|veto|clean|taken|open|unknown|not paying|boost|profile)/i.test(s)) return 'verdict';
-  if (/^-?\$/.test(s)) return 'usd';
-  if (/^-?[\d.]+x$/.test(s)) return 'ratio';
-  if (/%$/.test(s)) return 'percent';
-  // A list: "160 rows", "300 trades", "819 samples", "820 × 15s"...
-  if (/^\d[\d,]*\s*(rows|samples|trades|tokens|wallets|points|quotes|venue quotes|× 15s)/.test(s)) return 'list';
-  if (/^[+-]?[\d.,]+$/.test(s)) {
-    const f = (meta && meta.field) || meta || {};
-    const scored = f.weight || (meta && meta.stage === 5) || f.curve;
-    return scored ? 'score' : 'count';
+  return declaredType(meta && meta.id, meta) || 'number';
+}
+export function portType(key, val, meta, carries = true, via = null) {
+  const expected = declaredType(key, meta);
+  // The value actually on the wire, where the flow computed one.
+  const src = via || key;
+  const wire = Object.prototype.hasOwnProperty.call(WIRE_VALUES, src) ? WIRE_VALUES[src] : undefined;
+  let receiving = wire !== undefined ? typeOfValue(wire) : null;
+  if (wire === undefined) {
+    // Not an engine box: a whole file / service state is a dict that is
+    // there, a value that shows is its declared type.
+    if (!carries) receiving = expected || 'dict';
+    else if (val !== null && val !== undefined && val !== '') receiving = expected || 'number';
   }
-  return 'text';
+  // A re-fed dot receives the value converted to the type it expects.
+  const arrives = via && expected && wire !== undefined ? coerce(wire, expected) : wire;
+  const shown = arrives !== undefined && arrives !== null ? showValue(arrives) : (wire !== undefined ? null : val);
+  const words = arrives !== undefined && arrives !== null ? describeValue(arrives) : shown;
+  return { expected: expected || receiving || null, receiving, val: shown, words };
 }
-
-/**
- * A port's DATA TYPE. What a port EXPECTS is the type it has carried before
- * (learned the first time a value arrives, per data key); what it is
- * RECEIVING is the type of the value on it right now. The dot is coloured by
- * the expected type; hovering it shows both, and an empty one says the data is
- * missing.
- */
-const EXPECTED = new Map();
-export function portType(key, val, meta, carries = true) {
-  // A port that carries a whole FILE (a record) has no single value to show -
-  // that is what it is, not missing data.
-  if (!carries) return { expected: 'record', receiving: 'record', val: null, record: true };
-  const got = unitOf(val, meta);
-  if (got && !EXPECTED.has(key)) EXPECTED.set(key, got);
-  return { expected: EXPECTED.get(key) || got || null, receiving: got, val };
-}
-const typeTitle = (label, t, side) => (t.record
-  ? label + '\na whole file (a record), not one value - it arrives as the file the server wrote'
-  : label + '\n' +
-  (side === 'in' ? 'expects: ' : 'gives: ') + (t.expected ? UNIT_NAMES[t.expected] : 'unknown yet') + '\n' +
-  (side === 'in' ? 'receiving: ' : 'sending: ') +
-  (t.receiving ? UNIT_NAMES[t.receiving] + ' · ' + t.val : 'nothing - missing data'));
+const typeTitle = (label, t, side) => label + '\n' +
+  (side === 'in' ? 'expects: ' : 'sends: ') + (t.expected ? UNIT_NAMES[t.expected] : 'unknown yet') + '\n' +
+  (side === 'in' ? 'receiving: ' : 'sending now: ') +
+  (t.receiving ? UNIT_NAMES[t.receiving] + (t.val !== null && t.val !== undefined ? ' · ' + (t.words || t.val) : '') : 'nothing - missing data') +
+  (t.receiving && t.expected && t.receiving !== t.expected ? '\n(a ' + UNIT_NAMES[t.receiving] + ' arrives where a ' + UNIT_NAMES[t.expected] + ' is expected - converted: ' + t.val + ')' : '');
 /** Does this port carry ONE value (a field), or a whole file? */
 const carriesValue = (p, nodeById) => {
   const src = nodeById && nodeById.get(p.key);
   const f = (src && src.field) || p.field;
   return Boolean(f && f.value);
 };
-/** An inlet dot: its data type's colour; a red dashed ring only when a value is due and none arrives. */
+/** An inlet dot: its wire type's colour; a red dashed ring only when a value is due and none arrives. */
 function InDot({ label, t }) {
   return (
     <span title={typeTitle(label, t, 'in')} style={{ position: 'absolute', left: -4.5, top: '50%', marginTop: -4,
@@ -261,11 +292,14 @@ const nodeColor = (n) => {
 const boxValue = (n, v) => {
   // A boundary port shows the value of the data it carries in or out.
   if ((n.kind !== 'field' && n.kind !== 'port') || !n.field || !n.field.value) return null;
+  // A wire carries a raw value, no units: show that where the flow has one.
+  const w = wireOf(n);
+  if (w.has) return showValue(w.x);
   let val;
   try { val = n.field.value(v); } catch (e) { return null; }
   if (val === null || val === undefined || val === '') return null;
-  if (typeof val !== 'string' && typeof val !== 'number') return null;
-  const s = String(val);
+  const s = typeof val === 'string' ? val : showValue(val);
+  if (s === null) return null;
   return s.length > 18 ? s.slice(0, 17) + '…' : s;
 };
 
@@ -1181,7 +1215,7 @@ function AggregateBody({ agg, v, col }) {
           <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: 0.8, color: C.grey }}>WINDOW (min)</span>
           <NumberInput id={agg.window.id} def={agg.window.def} step={agg.window.step} min={agg.window.min} max={agg.window.max} col={col} compact />
           <span style={{ fontSize: 8, color: C.faint }}>
-            {win !== agg.window.def ? 'preview - the score uses ' + agg.window.def + ' min' : agg.window.note}
+            {win !== agg.window.def ? (agg.window.live ? 'the score uses this window' : 'preview - the score uses ' + agg.window.def + ' min') : agg.window.note}
           </span>
         </div>
       )}
@@ -1238,7 +1272,12 @@ function CalcBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClic
   const tokens = f.calc || f.fetch || [];
   const rows = Math.max(n.inPorts.length, n.outPorts.length, 1);
   const valueOf = (p) => {
-    const src = nodeById && nodeById.get(p.key);
+    if (p.cut) return null; // its wire is cut: nothing arrives
+    // Re-fed: what arrives, converted to the type this dot expects.
+    if (p.via && Object.prototype.hasOwnProperty.call(WIRE_VALUES, p.via)) {
+      return showValue(coerce(WIRE_VALUES[p.via], declaredType(p.key, (nodeById && nodeById.get(p.key)) || p)));
+    }
+    const src = nodeById && nodeById.get(p.via || p.key);
     if (src && src.kind === 'field') return boxValue(src, v);
     return p.field ? boxValue({ kind: 'field', field: p.field }, v) : null;
   };
@@ -1294,9 +1333,10 @@ function CalcBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClic
               position: 'absolute', left: 0, right: 0, top: i * ENGINE.ROW, height: ENGINE.ROW,
               display: 'flex', alignItems: 'center', fontSize: 8, fontFamily: MONO_STACK,
             }}>
-              <div style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
+              <div data-inport={pin ? pin.key : undefined} style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
                 {pin && (() => {
-                  const t = portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById));
+                  const t = pin.cut ? { expected: declaredType(pin.key, (nodeById && nodeById.get(pin.key)) || pin), receiving: null, val: null }
+                    : portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById), pin.via);
                   return (
                     <>
                       <InDot label={pin.label} t={t} />
@@ -1530,7 +1570,12 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
   onHover, onStartWire, v, nodeById, alert, onContextMenu }) {
   const rows = Math.max(n.inPorts.length, n.outPorts.length, 1);
   const valueOf = (p) => {
-    const src = nodeById && nodeById.get(p.key);
+    if (p.cut) return null; // its wire is cut: nothing arrives
+    // Re-fed: what arrives, converted to the type this dot expects.
+    if (p.via && Object.prototype.hasOwnProperty.call(WIRE_VALUES, p.via)) {
+      return showValue(coerce(WIRE_VALUES[p.via], declaredType(p.key, (nodeById && nodeById.get(p.key)) || p)));
+    }
+    const src = nodeById && nodeById.get(p.via || p.key);
     if (src && src.kind === 'field') return boxValue(src, v);
     // A field folded into a closed panel: its value comes with the port.
     return p.field ? boxValue({ kind: 'field', field: p.field }, v) : null;
@@ -1589,7 +1634,8 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
           }}>
             <div data-inport={pin ? pin.key : undefined} style={{ position: 'relative', flex: 1, minWidth: 0, paddingLeft: 9, paddingRight: 3 }}>
               {pin && (() => {
-                const t = portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById));
+                const t = pin.cut ? { expected: declaredType(pin.key, (nodeById && nodeById.get(pin.key)) || pin), receiving: null, val: null }
+                  : portType(pin.key, valueOf(pin), (nodeById && nodeById.get(pin.key)) || pin, carriesValue(pin, nodeById), pin.via);
                 return (
                   <>
                     <InDot label={pin.label} t={t} />
@@ -1632,6 +1678,7 @@ function EngineBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onCl
 }
 
 export default function FlowChart({ v }) {
+  WIRE_VALUES = { ...boardValues(), ...((v && v.pipe && v.pipe.s && v.pipe.s.flowValues) || {}) };
   const wrapRef = React.useRef(null);
   const liveV = React.useRef(v);
   liveV.current = v;
@@ -1679,6 +1726,29 @@ export default function FlowChart({ v }) {
   // Switching flow (the user picker in the header) swaps the whole layer:
   // groups, moves and positions, and starts again from the MAP.
   const [flowId, setFlowId] = React.useState(activeFlowId);
+  // Ctrl+Z / Ctrl+Y put back an earlier version of the flow: reload it.
+  const historySeen = React.useRef(flowHistoryVersion());
+  React.useEffect(() => subscribeFlows(() => {
+    if (flowHistoryVersion() !== historySeen.current) {
+      historySeen.current = flowHistoryVersion();
+      const fresh = loadConfig();
+      cfgRef.current = fresh;
+      setCfgState(fresh);
+      setMoved(new Map(Object.entries(activeFlow().positions || {})));
+    }
+  }), []);
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const k = String(e.key).toLowerCase();
+      if (k === 'z' && !e.shiftKey) { if (undoFlow()) e.preventDefault(); }
+      else if (k === 'y' || (k === 'z' && e.shiftKey)) { if (redoFlow()) e.preventDefault(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   React.useEffect(() => subscribeFlows(() => {
     const id = activeFlowId();
     setFlowId((cur) => {
@@ -1836,11 +1906,25 @@ export default function FlowChart({ v }) {
       nodes = nodes.concat((cfg.added || []).map(makeAdded));
     }
     const deleted = cfg.deleted || {};
-    const cut = new Set(cfg.cutWires || []);
+    // Wires the user drew into an input dot: reconnect a cut, or feed the
+    // dot from another box (flow/wires.js - the app and the engine use it too).
+    const H0 = hierarchy(cfg, nodes);
+    const inside = (id, target) => id === target || H0.ancestors(id).indexOf(target) !== -1;
+    const uw = applyUserWires({ edges, sketch: cfg.sketch, cut: new Set(cfg.cutWires || []), inside });
+    REROUTE = uw.reroute;
+    const cut = uw.cut;
+    const replaced = uw.replaced;
+    if (uw.extra.length) edges = edges.concat(uw.extra);
     const labelOf = new Map(nodes.map((n) => [n.id, n.label]));
     const name = (id) => labelOf.get(id) || id;
     const out = new Map();
-    edges.forEach((e) => { if (!out.has(e.from)) out.set(e.from, []); out.get(e.from).push(e); });
+    edges.forEach((e) => {
+      if (e.soft) return;
+      // A wire a drawn wire took over carries nothing now.
+      if ((e.parts || [{ from: e.from, to: e.to }]).every((p) => replaced.has(p.from + '>' + p.to))) return;
+      if (!out.has(e.from)) out.set(e.from, []);
+      out.get(e.from).push(e);
+    });
     const missing = new Map();
     const queue = [];
     const mark = (id, why) => {
@@ -1857,17 +1941,23 @@ export default function FlowChart({ v }) {
       (out.get(id) || []).forEach((e) => mark(e.to, name(id) + ' has missing data'));
     }
     const keptEdges = [];
+    // A CUT wire is kept, flagged: the dots it ran between belong to the
+    // boxes and groups (what they take and give), not to the wire, so they
+    // stay - unconnected - and the wire itself is not drawn.
+    // Kept in its place in the list, so its dots keep their place too.
     edges.forEach((e) => {
       if (deleted[e.from] || deleted[e.to]) return;
       const parts = e.parts || [{ from: e.from, to: e.to }];
-      const keep = parts.filter((p) => !cut.has(p.from + '>' + p.to));
-      if (!keep.length) return;
-      keptEdges.push(keep.length === parts.length ? e : { ...e, parts: keep });
+      const off = (p) => cut.has(p.from + '>' + p.to) || replaced.has(p.from + '>' + p.to);
+      const keep = parts.filter((p) => !off(p));
+      const gone = parts.filter(off);
+      if (keep.length) keptEdges.push(keep.length === parts.length ? e : { ...e, parts: keep });
+      if (gone.length) keptEdges.push({ ...e, id: e.id + '#cut', parts: gone, cut: true });
     });
     const baseOut = { nodes: nodes.filter((n) => !deleted[n.id]), edges: keptEdges.concat(sketchEdges(cfg)) };
     // What is wired INTO each added box, for its live value.
     const into = new Map();
-    baseOut.edges.forEach((x) => { if (!into.has(x.to)) into.set(x.to, []); into.get(x.to).push(x.from); });
+    baseOut.edges.forEach((x) => { if (x.cut) return; if (!into.has(x.to)) into.set(x.to, []); into.get(x.to).push(x.from); });
     userWires.current = { into, nodes: new Map(baseOut.nodes.map((n) => [n.id, n])) };
     return { base: baseOut, missing };
   }, [full, expanded, cfg]);
@@ -1900,7 +1990,7 @@ export default function FlowChart({ v }) {
       savedAt: Date.now(),
       groups: Array.from(H.engines.values()).map((e) => ({ id: e.id, label: e.label, parent: H.parentOf(e.id) })),
       boxes: base.nodes.map((n) => ({ id: n.id, label: n.label, type: typeOf(n), group: H.parentOf(n.id) })),
-      wires: base.edges.filter((e) => e.kind !== 'sketch').map((e) => ({ from: e.from, to: e.to, kind: e.kind })),
+      wires: base.edges.filter((e) => e.kind !== 'sketch' && !e.cut).map((e) => ({ from: e.from, to: e.to, kind: e.kind })),
     };
     const nextCfg = { ...cfgRef.current, assign: { ...assign, ...cfgRef.current.assign } };
     cfgRef.current = nextCfg;
@@ -2118,6 +2208,25 @@ export default function FlowChart({ v }) {
     return null;
   };
 
+  /**
+   * The input dot under the pointer: a box's or a group's inlet row, or a
+   * group's IN connector seen from inside it. Returns { owner, key }.
+   */
+  const inportAt = (cx, cy) => {
+    const els = document.elementsFromPoint ? document.elementsFromPoint(cx, cy) : [];
+    for (let i = 0; i < els.length; i += 1) {
+      const r = els[i].closest && els[i].closest('[data-inport]');
+      if (r) {
+        const key = r.getAttribute('data-inport');
+        const owner = r.closest('[data-node-id]');
+        if (key && key.indexOf('add:') !== 0 && owner) return { owner: owner.getAttribute('data-node-id'), key };
+      }
+      const c = els[i].closest && els[i].closest('[data-node-id^="port:in:"]');
+      if (c) return { owner: path[path.length - 1], key: c.getAttribute('data-node-id').slice(8) };
+    }
+    return null;
+  };
+
   /** Move a box or an engine into another engine (or up to a level). */
   const moveInto = (id, target) => {
     if (!H || String(id).indexOf('port:') === 0) return;
@@ -2171,12 +2280,19 @@ export default function FlowChart({ v }) {
     const at = e && Number.isFinite(e.clientX) && e.type === 'mouseup' ? e : null;
     // A sketch wire ends on whatever box it is let go over.
     if (wireDrag) {
-      const to = at ? nodeAt(at.clientX, at.clientY) : null;
-      // A boundary inlet stands for the box its data comes from.
-      const resolved = to && to.indexOf('port:in:') === 0 ? to.slice(8) : to;
-      if (resolved && resolved !== wireDrag.from && resolved.indexOf('port:') !== 0) {
-        const s = { id: Date.now().toString(36), from: wireDrag.from, to: resolved };
+      const dot = at ? inportAt(at.clientX, at.clientY) : null;
+      if (dot && dot.owner !== wireDrag.from) {
+        // Onto an input dot: that dot is now fed by this box (flow/wires.js).
+        const s = { id: Date.now().toString(36), from: wireDrag.from, to: dot.owner, toPort: dot.key };
         setCfg((cur) => ({ ...cur, sketch: (cur.sketch || []).concat([s]) }));
+      } else {
+        const to = at ? nodeAt(at.clientX, at.clientY) : null;
+        // A boundary inlet stands for the box its data comes from.
+        const resolved = to && to.indexOf('port:in:') === 0 ? to.slice(8) : to;
+        if (resolved && resolved !== wireDrag.from && resolved.indexOf('port:') !== 0) {
+          const s = { id: Date.now().toString(36), from: wireDrag.from, to: resolved };
+          setCfg((cur) => ({ ...cur, sketch: (cur.sketch || []).concat([s]) }));
+        }
       }
       setWireDrag(null);
     }
@@ -2532,7 +2648,8 @@ export default function FlowChart({ v }) {
 
   // One line per wire. (Wires used to split per value while a box was open;
   // no box opens now - every box shows its ports - so a wire is drawn whole.)
-  const drawEdges = laid.edges;
+  // Cut wires keep their dots but are not drawn.
+  const drawEdges = laid.edges.filter((e) => !e.cut);
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>

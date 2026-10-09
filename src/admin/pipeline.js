@@ -25,11 +25,13 @@
 
 import { PAGES, op, num, ref, ext, api } from './provenance';
 import { SHOWN_PAGES } from './pipeline-shown';
+import { REGIMES, REGIME_SETTING, REGIME_DEFAULT } from '../data/regimes';
+import { boardValues } from '../flow/board-flow';
 import { showsForPanel } from './shows';
 import { multipleScore, logScore, to100, Z_MIN_SAMPLES, normalizeRow, isMajorToken } from '../calculations/core.js';
 import { TOTAL_WEIGHT, SCORE_MODEL, STAGES, scoreSeriesFor } from '../calculations/asset-detail.js';
 import { GATES, GATE_RULES } from '../calculations/gates.js';
-import { getSetting, applyFilter, filterSetting } from './box-settings';
+import { getSetting, setSetting, applyFilter, filterSetting } from './box-settings';
 
 /* ------------------------------------------------------------ readers -- */
 
@@ -40,11 +42,20 @@ const Z = (v) => ((S(v) || {}).zScores || {}).metrics || {};
 const TS = (v) => (S(v) || {}).tradeStats || null;
 const fin = Number.isFinite;
 
-const rnd = (n, dp = 2) => (fin(n) ? String(Math.round(n * 10 ** dp) / 10 ** dp) : null);
-const pct = (n, dp = 2) => (fin(n) ? rnd(n, dp) + '%' : null);
-const signed = (n, dp = 1) => (fin(n) ? (n > 0 ? '+' : '') + rnd(n, dp) : null);
+/*
+ * RAW MODE. A box SENDS a raw value of a standard type (flow/types.js) - the
+ * number, not "$44.9K" or "157 wallets". The formatters below write text for
+ * a box's arithmetic line, and inside a box's value (rawCall) they return the
+ * number itself, so every box's value is raw without rewriting each one.
+ */
+let RAW_MODE = 0;
+const rawCall = (fn, v) => { RAW_MODE += 1; try { return fn(v); } finally { RAW_MODE -= 1; } };
+const rnd = (n, dp = 2) => (fin(n) ? (RAW_MODE ? Math.round(n * 10 ** dp) / 10 ** dp : String(Math.round(n * 10 ** dp) / 10 ** dp)) : null);
+const pct = (n, dp = 2) => (fin(n) ? (RAW_MODE ? rnd(n, dp) : rnd(n, dp) + '%') : null);
+const signed = (n, dp = 1) => (fin(n) ? (RAW_MODE ? rnd(n, dp) : (n > 0 ? '+' : '') + rnd(n, dp)) : null);
 const usd = (n) => {
   if (!fin(n)) return null;
+  if (RAW_MODE) return n;
   const a = Math.abs(n);
   const s = n < 0 ? '-$' : '$';
   if (a >= 1e9) return s + (a / 1e9).toFixed(2) + 'B';
@@ -53,7 +64,18 @@ const usd = (n) => {
   if (a >= 1) return s + a.toFixed(2);
   return s + a.toPrecision(4);
 };
-const count = (n) => (fin(n) ? Math.round(n).toLocaleString() : null);
+const count = (n) => (fin(n) ? (RAW_MODE ? Math.round(n) : Math.round(n).toLocaleString()) : null);
+/** A value as it goes on the wire: a leftover "157 wallets" is its number. */
+const toRaw = (x) => {
+  if (typeof x !== 'string') return x === undefined ? null : x;
+  const s = x.trim();
+  if (!s || s === '—') return null;
+  if (/^[+-]?[\d.,]+(\s*[a-z%×]+)?$/i.test(s)) {
+    const n = parseFloat(s.replace(/,/g, ''));
+    if (Number.isFinite(n)) return n;
+  }
+  return s;
+};
 
 const comp = (v, key) => ((S(v) || {}).scoreModel || []).find((c) => c.key === key) || null;
 const modOf = (v, key) => ((S(v) || {}).scoreModifiers || []).find((c) => c.key === key) || null;
@@ -290,7 +312,7 @@ PAGES.pipe = {
           value: (v) => { const s = S(v); return s ? (s.symbol || '?') + ' · ' + s.chain : null; },
           calc: [op('the row picked from'), ref('pipe', 'TOKEN LIST'),
             op('- every box to the right is this token. Each option is tagged with'),
-            ref('pipe', 'VETO LOG', 'VETO when a gate failed'), op('else its'), ref('pipe', 'FINAL', 'score')],
+            { ...ref('pipe', 'VETO LOG', 'VETO when a gate failed'), soft: true }, op('else its'), { ...ref('pipe', 'FINAL', 'score'), soft: true }],
           // A SELECTOR: every token on the list is an option, and picking one
           // here picks it for the whole admin - the same as the header picker.
           selector: {
@@ -826,9 +848,8 @@ PAGES.pipe = {
         {
           label: 'NOT A MAJOR', status: 'live',
           value: (v) => verdict(gateOf(v, 'NOT A MAJOR')),
-          calc: [ext('dexscreener', 'marketCapUsd'), op('else'), ext('geckoterminal', 'marketCapUsd'),
+          calc: [api('/raw/<chain>/market.json', 'MARKET CAP'),
             op('under'), ref('pipe', PARAMS.majorCap.label), op('- the cap band, applied as a gate rather than a weight')],
-          via: api('/raw/<chain>/market.json'),
           equation: (v) => {
             const mc = (S(v) || {}).marketCapUsd;
             return fin(mc) ? usd(mc) + ' against the $1B ceiling' : null;
@@ -988,7 +1009,7 @@ PAGES.pipe = {
             fn: 'MEAN', fmt: (n) => String(Math.round(n)),
             what: 'every RIGHT NOW reading',
             every: 'poll (~5s)',
-            window: { id: SCORE_MEAN_ID, ...SCORE_MEAN_WINDOW, note: 'the app keeps 15 min of readings' },
+            window: { id: SCORE_MEAN_ID, ...SCORE_MEAN_WINDOW, live: true, note: 'the app keeps 15 min of readings' },
             points: (v) => recentScorePoints(v),
             result: (v) => meanOf(recentScores(v)),
           },
@@ -1289,11 +1310,25 @@ export const RAW = {
     picks: [{ path: 'rows[].kind', to: 'PAID FOR' }, { path: 'rows[].totalAmount', to: 'PAID FOR' }],
     outs: [{ label: 'PAID FOR', value: (v) => { const pr = (P(v).raw || {}).promotion; return pr ? (pr.rows.map((r) => r.kind).join(' + ') || 'nothing') : null; } }],
   },
+  'MARKET CAP': {
+    from: 'market',
+    picks: [{ path: DS + 'marketCapUsd', to: 'MARKET CAP' }, { path: GT + 'marketCapUsd', to: 'MARKET CAP', alt: true }],
+    outs: [{ label: 'MARKET CAP', value: (v) => { const x = (S(v) || {}).marketCapUsd; return fin(x) ? usd(x) : null; } }],
+  },
+  FDV: {
+    from: 'market',
+    picks: [{ path: DS + 'fdvUsd', to: 'FDV' }, { path: GT + 'fdvUsd', to: 'FDV', alt: true }],
+    outs: [{ label: 'FDV', value: (v) => {
+      const s = (((P(v).raw || {}).market || {}).sources) || {};
+      const x = (s.dexscreener || {}).fdvUsd ?? (s.geckoterminal || {}).fdvUsd;
+      return fin(x) ? usd(x) : null;
+    } }],
+  },
   'PRICE CHANGE 5M': {
     from: 'market',
     picks: [{ path: DS + 'priceChangePct.m5', to: 'DELTA 5M' }, { path: GT + 'priceChangePct.m5', to: 'DELTA 5M', alt: true }],
     outs: [{ label: 'DELTA 5M', value: (v) => {
-      const s = ((S(v) || {}).sources) || {};
+      const s = (((P(v).raw || {}).market || {}).sources) || {};
       const x = ((s.dexscreener || {}).priceChangePct || {}).m5 ?? ((s.geckoterminal || {}).priceChangePct || {}).m5;
       return fin(x) ? signed(x, 2) + '%' : null;
     } }],
@@ -1384,7 +1419,20 @@ tag('BOOSTED', { join: {
 //   inputs: ref()/api() tokens from outside, '@id' for another operator here.
 const n0 = (x) => (fin(x) ? x : null);
 const show = (x, dp = 2) => (fin(x) ? String(rnd(x, dp)) : '—');
-const node = (id, sym, label, inp, expr, value, extra) => ({ id, sym, label, in: inp, expr, value, ...(extra || {}) });
+/** What a FILTER box sends: the rows (or values) it kept, as a list. */
+const filterRows = (f, v) => {
+  if (f.rules) return f.rules.reduce((rows, r) => r.apply(rows, v), (f.rows(v) || []).slice());
+  if (f.values) return applyFilter(f.values(v) || [], filterSetting(f.id, f.defaults));
+  return null;
+};
+const node = (id, sym, label, inp, expr, value, extra) => {
+  const x = extra || {};
+  let raw = null;
+  if (x.raw) raw = x.raw;
+  else if (x.filter) raw = (v) => filterRows(x.filter, v);
+  else if (value) raw = (v) => toRaw(rawCall(value, v));
+  return { id, sym, label, in: inp, expr, ...x, value: raw };
+};
 const ifNode = (id, label, inp, when, test, thenV, elseV, extra) => node(id, 'IF', label, inp,
   null, (v) => { const t = test(v); return t === null ? null : (t ? thenV(v) : elseV(v)); },
   { cond: { kind: 'IF', when, test, then: thenV, else: elseV }, ...(extra || {}) });
@@ -1437,7 +1485,8 @@ const tradesOf = (v) => { const p = (P(v).raw || {}).trades; return (p && p.trad
       { filter: { rows: normalized, of: 'rows', rules: screenRules } }),
     node('count', 'COUNT BY', 'TOKEN LIST', ['@screen'],
       (v) => { const m = byChain(screened(v)); const ks = Object.keys(m); return ks.length ? ks.map((k) => k + ' ' + m[k]).join(' · ') : null; },
-      null, { note: 'The board: every token that passed, counted per chain.' }),
+      null, { note: 'The board: every token that passed, counted per chain.',
+        raw: (v) => { const m = byChain(screened(v)); return Object.keys(m).length ? m : null; } }),
   ]);
 }
 
@@ -1474,7 +1523,7 @@ opsOf('STAGE', [
   } }),
 ]);
 opsOf('COVERAGE', [
-  node('sum', 'SUM', 'WEIGHT RESOLVED', SCORE_MODEL.map((c) => ref('pipe', weightLabel(c))),
+  node('sum', 'SUM', 'WEIGHT RESOLVED', SCORE_MODEL.map((c) => ref('pipe', c.label)).concat(SCORE_MODEL.map((c) => ref('pipe', weightLabel(c)))),
     (v) => { const m = ((S(v) || {}).scoreModel || []).filter((c) => !c.pending); return m.map((c) => c.weight).join(' + ') || null; },
     (v) => { const s = S(v); return s ? s.weightCovered : null; }),
   node('div', '÷', 'COVERAGE', ['@sum'],
@@ -1703,7 +1752,7 @@ opsOf('Whitespace', [
   opsOf('TOP-5 WALLET SHARE', [
     node('wallets', 'SUM BY', 'USD PER WALLET', [api('/raw/<chain>/trades.json', 'TRADE SAMPLE')],
       (v) => { const pool = (P(v).raw || {}).trades; const n = ((pool && pool.trades) || []).length; return n ? n + ' trades, summed per wallet' : null; },
-      (v) => { const xs = perWallet(v); return xs.length ? xs.length + ' wallets' : null; }),
+      null, { raw: (v) => { const xs = perWallet(v); return xs.length ? xs : null; } }),
     node('filter', 'FILTER', 'BIGGEST WALLETS', ['@wallets'], null,
       (v) => { const xs = kept(v); return xs.length ? modeName(setting()) + ' · ' + usd(sum(xs)) : null; },
       { filter: { id: FILTER_ID, defaults: FILTER_DEFAULT, values: perWallet, fmt: usd, of: 'wallets by USD traded' } }),
@@ -1892,7 +1941,8 @@ const weightedOps = (label, defs, partsOf, opts) => {
     { label: 'Volume spread', weight: 20, from: ref('pipe', 'WALLET SAMPLE') },
     { label: 'Position intent', weight: 15, from: ref('pipe', 'WALLET SAMPLE') },
   ], (v) => q(v).parts || [], {
-    after: [node('adj', '×', 'Wallet quality', ['@div', api('/raw/<chain>/intel.json', 'LP / CREATOR / INSIDERS')],
+    after: [node('adj', '×', 'Wallet quality', ['@div', api('/raw/<chain>/intel.json', 'LP / CREATOR / INSIDERS'),
+      api('/raw/<chain>/market.json', 'JUPITER STATS')],
       (v) => {
         const mods = q(v).modifiers || [];
         if (!mods.length) return 'no adjustment (× 1)';
@@ -1979,7 +2029,7 @@ const marketRows = (all) => Object.keys(all || {}).reduce((out, ch) => out.conca
   (all[ch].rows || []).map((r, i) => ({ ...r, chain: r.chain || ch, _rank: i, _fetchedAt: all[ch].fetchedAt }))), []);
 RAW['MARKET ROWS'] = {
   from: 'marketAll', picks: MARKET_FIELDS.map((f) => ({ path: 'rows[].' + f, to: 'MARKET ROWS' })),
-  outs: [{ label: 'MARKET ROWS', value: (v) => { const n = marketRows((P(v).raw || {}).marketAll).length; return n ? n + ' rows' : null; } }],
+  outs: [{ label: 'MARKET ROWS', value: (v) => { const rows = marketRows((P(v).raw || {}).marketAll); return rows.length ? rows : null; } }],
   list: { rows: (rec) => marketRows(rec), fields: MARKET_FIELDS, of: 'rows, every chain' },
 };
 
@@ -2029,6 +2079,10 @@ export const SLOT_PATH = {
 {
   // The value a frontend card shows today (pipeline-shown.js), so the box
   // reads the same number the dashboard does.
+  const tileOf = (list, label) => {
+    const t = (list || []).find((x) => x && (x.label === label || String(x.label).indexOf(label + ' ') === 0));
+    return t ? t.value : null;
+  };
   const shownVal = (page, label) => (v) => {
     for (const g of ((SHOWN_PAGES[page] || {}).groups || [])) {
       const f = (g.fields || []).find((x) => x.label === label);
@@ -2037,9 +2091,17 @@ export const SLOT_PATH = {
     return null;
   };
   const assets = (v) => P(v).assets || [];
+  const alertCount = (v) => (Array.isArray(v.alertColumns)
+    ? v.alertColumns.reduce((a, c) => a + ((c.cards || c.items || []).length), 0) : null);
   const organicRows = (v) => assets(v).map((a) => (a.rawServerRow || {}).organicFlow).filter((o) => o && o.score !== null);
   const ours = (v) => organicRows(v).filter((o) => o.basis === 'sample');
   const w = (o) => Math.max(o.coverage, 25);
+  const STAGE_NAMES = ['', 'EMERGING', 'CONFIRMED', 'EXCEPTIONAL', 'VETOED'];
+  const stageCounts = (v) => {
+    const m = {};
+    assets(v).forEach((a) => { const k = STAGE_NAMES[a.stage] || String(a.stage); m[k] = (m[k] || 0) + 1; });
+    return m;
+  };
   const pickRows = (v) => assets(v).filter((a) => (a.wash ?? 0) < 0.15 && a.stage >= 2 && a.score != null);
   const model = (v) => ((S(v) || {}).scoreModel || []).filter((c) => !c.pending);
   const used = (v) => model(v).reduce((s, c) => s + c.weight, 0);
@@ -2056,11 +2118,37 @@ export const SLOT_PATH = {
       { label: 'DAILY PICK', status: 'live',
         value: (v) => (v.chepePickSym && v.chepePickSym !== '—' ? v.chepePickSym + ' · ' + v.chepePickScore : null),
         calc: [ref('pipe', 'TOKEN LIST')], where: 'App.jsx chepePickVals()' },
+      { label: 'STAGE COUNTS', status: 'live',
+        value: (v) => { const m = stageCounts(v); const ks = Object.keys(m); return ks.length ? ks.map((k) => k + ' ' + m[k]).join(' · ') : null; },
+        calc: [ref('pipe', 'STAGE')], where: 'App.jsx renderVals(), stageCounts' },
+      { label: 'MARKET REGIME', status: 'live',
+        value: () => getSetting(REGIME_SETTING, { id: REGIME_DEFAULT }).id,
+        calc: [],
+        note: 'Your pick: nothing measures the regime yet. The header shows this box.',
+        selector: {
+          of: 'regimes',
+          options: () => REGIMES.map((r) => ({ id: r.id, label: r.id, sub: r.note })),
+          selected: () => getSetting(REGIME_SETTING, { id: REGIME_DEFAULT }).id,
+          pick: (v, id) => setSetting(REGIME_SETTING, { id }),
+        },
+        where: 'components/RegimeSelector.jsx' },
+      { label: 'ALERTS NOW', status: 'live', value: (v) => alertCount(v),
+        calc: [ref('pipe', 'ALERT ENGINE')],
+        note: 'The alert cards on the board right now. The app keeps no 24h log, so there is no honest 24h count.',
+        where: 'ALERT-CARDS.jsx alertsVals()' },
       { label: 'WHAT MOVES THIS SCORE', status: 'live',
         value: (v) => { const m = model(v); return m.length ? m.length + ' components' : null; },
         calc: [ref('pipe', 'RAW')], where: 'asset-detail.js drivers' },
     ],
   });
+  opsOf('STAGE COUNTS', [
+    node('by', 'COUNT BY', 'STAGE COUNTS', [ref('pipe', 'STAGE')],
+      (v) => (assets(v).length ? 'tokens on the board, counted per stage' : null), null),
+  ]);
+  opsOf('ALERTS NOW', [
+    node('count', 'COUNT', 'ALERTS NOW', [ref('pipe', 'ALERT ENGINE')],
+      (v) => { const n = alertCount(v); return n === null ? null : 'alert cards on the board: ' + n; }, null),
+  ]);
   opsOf('TOKENS TRACKED', [
     node('count', 'COUNT', 'TOKENS TRACKED', [ref('pipe', 'TOKEN LIST')],
       (v) => (assets(v).length ? 'tokens on the board after screening' : null), null),
@@ -2096,6 +2184,27 @@ export const SLOT_PATH = {
     .concat([node('sum', 'SUM', 'WHAT MOVES THIS SCORE', SCORE_MODEL.map((c, i) => '@c' + i),
       (v) => { const m = model(v); return m.length ? 'Σ points = RAW − 50 = ' + rnd(m.reduce((s, c) => s + ((c.value - 50) * c.weight) / used(v), 0), 1) : null; }, null)]));
 
+  PAGES.pipe.groups.push({
+    group: 'SOCIAL STATS', stage: 5, parent: 'eng:decomp',
+    note: 'This token\u2019s social numbers, from the social service.',
+    fields: [
+      { label: 'MENTIONS', status: 'live', value: (v) => tileOf(v.socialStats, 'MENTIONS'),
+        calc: [ref('pipe', 'SOCIAL BASELINE')],
+        extract: { path: 'SOCIAL BASELINE', picks: ['mentions'] }, where: 'services/social-intel.js' },
+      { label: 'UNIQUE AUTHORS', status: 'live', value: (v) => tileOf(v.socialStats, 'UNIQUE AUTHORS'),
+        calc: [ref('pipe', 'SOCIAL BASELINE')],
+        extract: { path: 'SOCIAL BASELINE', picks: ['uniqueAuthors'] }, where: 'services/social-intel.js' },
+      { label: 'MENTIONS PER AUTHOR', status: 'live', value: (v) => tileOf(v.socialStats, 'PER AUTHOR'),
+        calc: [ref('pipe', 'MENTIONS'), ref('pipe', 'UNIQUE AUTHORS')], where: 'SOCIAL-SCANNER.jsx' },
+      { label: 'VS SOCIAL BASELINE', status: 'live', value: (v) => tileOf(v.socialStats, 'VS BASELINE'),
+        calc: [ref('pipe', 'MENTIONS'), ref('pipe', 'SOCIAL BASELINE')], where: 'services/social-intel.js' },
+    ],
+  });
+  tag('MENTIONS PER AUTHOR', { opSpec: node('div', '÷', 'MENTIONS PER AUTHOR', [ref('pipe', 'MENTIONS'), ref('pipe', 'UNIQUE AUTHORS')],
+    (v) => { const m = tileOf(v.socialStats, 'MENTIONS'); const u = tileOf(v.socialStats, 'UNIQUE AUTHORS'); return m != null && u != null ? m + ' ÷ ' + u : null; }, null) });
+  tag('VS SOCIAL BASELINE', { opSpec: node('div', '÷', 'VS SOCIAL BASELINE', [ref('pipe', 'MENTIONS'), ref('pipe', 'SOCIAL BASELINE')],
+    () => 'mentions now ÷ this token\u2019s own mean', null) });
+
   // The background jobs, as SERVICE boxes. They sit in SERVICES on the map.
   PAGES.pipe.groups.push({
     group: 'SERVICES', stage: 4, into: 'eng:services',
@@ -2120,11 +2229,19 @@ export const SLOT_PATH = {
         calc: [api('/raw/<chain>/observations.json'), api('/raw/<chain>/observations-48h.json')],
         service: { every: 'on opening a token', keeps: 'nothing - it re-reads the score journal' },
         where: 'services/api.js fetchTokenOutcomes()' },
-      { label: 'SCORE EVALUATION', status: 'live', value: () => null,
+      { label: 'SCORE EVALUATION', status: 'live',
+        value: (v) => (v.outcome ? (v.outcome.ready ? (v.outcome.verdict || 'ready') : v.outcome.note) : null),
         calc: [api('/raw/<chain>/observations-48h.json')],
         service: { every: 'on opening EVALUATION', keeps: 'nothing - it re-reads the score journal' },
         where: 'services/api.js evaluation' },
-      { label: 'ALERT ENGINE', status: 'live', value: () => null,
+      { label: 'SYSTEM HEALTH', status: 'live',
+        value: (v) => (v.health ? v.health.title + (v.health.summary ? ' · ' + v.health.summary : '') : null),
+        calc: [api('/raw/system.json')],
+        service: { every: '15s (the server rewrites system.json)', keeps: 'nothing - each provider judged on its last 15 minutes' },
+        where: 'calculations/core.js providerHealth(), calculations/system-health.js' },
+      { label: 'ALERT ENGINE', status: 'live',
+        value: (v) => (Array.isArray(v.alertColumns)
+          ? v.alertColumns.map((c) => (c.title || c.label || c.name) + ' ' + ((c.cards || c.items || []).length)).join(' · ') : null),
         calc: [ref('pipe', 'FINAL'), ref('pipe', 'STAGE'), ref('pipe', 'RISK FLAGS')],
         service: { every: 'each poll', keeps: 'which alerts already fired' },
         where: 'calculations/alert-schema.js' },
@@ -2137,6 +2254,24 @@ export const SLOT_PATH = {
  * their tab keys (see pipeline-shown.js). Registered here so that loading the
  * pipeline loads the whole of it.
  */
+// Every box of the flow sends a RAW value (see RAW MODE above): the top-level
+// boxes too, not only the operators inside groups.
+// Where the flow computed the box (score flow per token, board flow per
+// poll), the box's value IS that wire value - one value, one place.
+PAGES.pipe.groups.forEach((g) => (g.fields || []).forEach((f) => {
+  if (!f.value || f.__raw) return;
+  const id = 'f:pipe:' + f.label;
+  const shown = f.value;
+  f.value = (v) => {
+    const flow = (S(v) || {}).flowValues || {};
+    if (id in flow) return flow[id];
+    const board = boardValues();
+    if (id in board) return board[id];
+    return f.selector ? shown(v) : toRaw(rawCall(shown, v));
+  };
+  f.__raw = true;
+}));
+
 Object.assign(PAGES, SHOWN_PAGES);
 
 

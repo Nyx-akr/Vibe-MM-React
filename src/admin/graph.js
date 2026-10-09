@@ -21,6 +21,7 @@
 import { PAGES, SOURCE_BY_ID } from './provenance';
 import { dashboardItems } from './dashboard-items';
 import { SHOWN_PAGES } from './pipeline-shown';
+import { boardValues } from '../flow/board-flow';
 // Registers PAGES.pipe - the score pipeline - before anything walks PAGES.
 import { RAW } from './pipeline';
 
@@ -254,11 +255,13 @@ export function buildGraph(v) {
   // crossing passes, and their tie-break, so the layout is stable poll to poll.
   let seq = 0;
   const add = (node) => { if (!nodes.has(node.id)) nodes.set(node.id, { ...node, seq: seq++ }); return nodes.get(node.id); };
-  const link = (from, to, kind, label) => {
+  const link = (from, to, kind, label, soft) => {
     if (!from || !to || from === to) return;
     // Two readings out of one file into one box are two values, so the
-    // reading is part of the arrow's identity.
-    edges.push({ id: from + '>' + to + ':' + kind + (label ? '#' + label : ''), from, to, kind, label });
+    // reading is part of the arrow's identity. A SOFT wire only labels its
+    // target (THIS TOKEN's options tagged with FINAL / VETO): a cut does not
+    // travel along it.
+    edges.push({ id: from + '>' + to + ':' + kind + (label ? '#' + label : ''), from, to, kind, label, ...(soft ? { soft: true } : {}) });
   };
 
   Object.keys(PAGES).forEach((page) => {
@@ -349,7 +352,7 @@ export function buildGraph(v) {
         toks.forEach(({ t, dir }) => {
           if (t.t === 'ref') {
             const other = fieldId(t.page, t.field);
-            if (dir === 'in') link(other, fid, 'field');
+            if (dir === 'in') link(other, fid, 'field', null, t.soft);
             else link(fid, other, 'field');
             return;
           }
@@ -451,6 +454,35 @@ export function buildGraph(v) {
     add({ id: l.store, kind: 'store', label: spec.label, backend: spec.backend, detail: spec.detail });
     if (l.dir === 'w') link(target, l.store, 'store-write');
     else link(l.store, target, 'store-read');
+  });
+
+  // A DASHBOARD ITEM shows what its wire delivers: the value of the box (or
+  // the file / store) wired into it - never a value of its own.
+  nodes.forEach((n) => {
+    if (n.page !== 'dash' || !n.field || !n.field.from) return;
+    const srcIds = n.field.from.map((t) => (t.t === 'ref' ? fieldId(t.page, t.field)
+      : t.t === 'store' ? t.id : t.t === 'api' && t.field && RAW[t.field] ? fieldId('pipe', t.field)
+        : t.t === 'api' ? fileId(t.path) : null)).filter(Boolean);
+    // The raw value on its wire - the first source that has one - exactly
+    // as it arrives: a number, a list, a dict, a text. No joining, no units.
+    n.field.value = (v) => {
+      const flow = (v && v.pipe && v.pipe.s && v.pipe.s.flowValues) || {};
+      const board = boardValues();
+      for (const id of srcIds) {
+        if (id in flow && flow[id] !== null) return flow[id];
+        if (id in board && board[id] !== null) return board[id];
+        const src = nodes.get(id);
+        if (!src) continue;
+        if (src.field && src.field.value) {
+          let x = null;
+          try { x = src.field.value(v); } catch (e) { x = null; }
+          if (x !== null && x !== undefined && x !== '') return x;
+        } else if (src.kind === 'file' || src.kind === 'store') {
+          return src.label;
+        }
+      }
+      return null;
+    };
   });
 
   // Dedupe: two cards naming the same pair produce the same arrow.
