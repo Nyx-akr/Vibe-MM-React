@@ -539,13 +539,13 @@ export function rotatingWallets({ limit = 50, chain = null } = {}) {
   return topWallets({ limit, chain, minPools: 2 });
 }
 
-/** Co-entry clusters across every token, newest first. */
-export function recentClusters({ limit = 40, minConfidence = null, chain = null } = {}) {
-  const rank = { low: 0, medium: 1, high: 2 };
-  return clusterLog
-    .filter((c) => (!chain || c.chain === chain) &&
-      (!minConfidence || rank[c.confidence] >= rank[minConfidence]))
-    .slice(0, limit);
+/**
+ * Every co-entry cluster logged, across every token, newest first - raw. Which
+ * of them a panel shows (this token's or the others', by confidence) is the
+ * DATA FLOW's CLUSTERS ELSEWHERE box (flow/board-flow.js).
+ */
+export function walletClusters() {
+  return clusterLog.slice();
 }
 
 /** Is this address one we have seen misbehaving anywhere? */

@@ -289,9 +289,9 @@ export const PIPELINE = [
     cadence: "pools every 30s, observations every 60s, plus a flush and fsync on shutdown" },
   { stage: "6. Normalize (app)", detail: "calculations/core.js collapses the side-by-side provider values into one row, and derives every ratio, age, delta and baseline from them.",
     cadence: "per poll, in the browser" },
-  { stage: "7. Calculate (app)", detail: "calculations/asset-detail.js turns that row plus the baselines into twelve components, two modifiers, risk flags, a score and a stage. This is the only place a score exists. Wallet quality and organic flow are not derived here - they are asked of core.js and recorded, so the tabs and the score read one verdict.",
+  { stage: "7. Calculate (app)", detail: "The DATA FLOW (flow/score-flow.js) is the whole model: it turns that row plus the sample history into EARLY (a 0-100 entry score from seven inputs), the PHASE of the token's attention cycle, the SIGNAL (BUY / SELL / SHORT / AVOID / WATCH), the safety gates, the warnings and the trade plan. This is the only place any of them exist; every tab renders its result.",
     cadence: "per poll, in the browser" },
-  { stage: "8. Journal (app)", detail: "Each score is written to the score journal, so the Evaluation tab can join it to the server's raw price series and measure whether the score meant anything.",
+  { stage: "8. Journal (app)", detail: "Each call (signal, EARLY and price) is written to the journal, so the Evaluation tab can join it to the server's raw price series and measure whether the call meant anything.",
     cadence: "one mark per token per 60s" },
 ];
 

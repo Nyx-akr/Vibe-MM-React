@@ -27,6 +27,10 @@ const PREFIX = 'vs_';
 const INPUTS = {
   watchlist:     { key: 'vs_watchlist',       fallback: () => ({}), valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
   walletRegistry:{ key: 'vs_wallet_registry', fallback: () => null, valid: (v) => Array.isArray(v) },
+  // The WALLET TRACKER library's curated list, as imported by the user.
+  curatedWallets:{ key: 'vs_curated_wallets', fallback: () => [], valid: (v) => Array.isArray(v) },
+  // WALLET TRACKER alarm delivery: { desktop: bool }.
+  trackerPrefs:  { key: 'vs_tracker_prefs',   fallback: () => ({ desktop: false }), valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
   // RETIRED 2026-10-08 with the AUTO / LOCAL / DEPLOYED switch. Kept only so
   // services/api.js can clear a value an old browser still holds.
   apiTarget:     { key: 'vs_api_target',      fallback: () => null, valid: (v) => v === 'local' || v === 'remote' },
@@ -34,6 +38,8 @@ const INPUTS = {
   chainSelection:{ key: 'vs_chain_selection', fallback: () => null, valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
   // The STAGES bar: { '1': true, ... } for WATCH..EXCEPTIONAL. Absent means all.
   stageSelection:{ key: 'vs_stage_selection', fallback: () => null, valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
+  // The SIGNALS filter: { BUY: true, ... }. Absent means all.
+  signalSelection:{ key: 'vs_signal_selection', fallback: () => null, valid: (v) => v && typeof v === 'object' && !Array.isArray(v) },
 };
 
 let lastError = null;

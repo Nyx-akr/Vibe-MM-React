@@ -2,6 +2,7 @@ import React from 'react';
 import { stageInfo } from '../utils/formatters';
 import { OUTCOME_HORIZONS } from '../services/api';
 import Help from '../components/Help';
+import { modelEval, loadModelEval } from '../services/model-eval';
 
 /**
  * EVALUATION - does a higher score lead to a better outcome?
@@ -491,12 +492,118 @@ function Flags({ o, css, v }) {
   );
 }
 
+/**
+ * TRADE OUTCOMES - the report card from scripts/backtest-early.mjs.
+ *
+ * The panels below grade the board score by forward RETURN. This one grades
+ * both scores - the board's and EARLY - by the TRADE a buy alert would have
+ * been: take profit or stop out (FAST +10% / -7% in 6h, SWING +20% / -15% in
+ * 24h). A spike is not a win if the stop came first. Read from
+ * /raw/model-eval.json; with no report it says how to make one.
+ */
+const fmtIc = (x) => (x && Number.isFinite(x.ic) ? (x.ic >= 0 ? '+' : '') + x.ic.toFixed(3) : '—');
+const icTone = (x) => (!x || !Number.isFinite(x.ic) || !Number.isFinite(x.t) || Math.abs(x.t) < 2 ? MUTED : (x.ic > 0 ? POS : NEG));
+const fmtPct = (n) => (Number.isFinite(n) ? (n > 0 ? '+' : '') + n.toFixed(2) + '%' : '—');
+const TRADE_ROW = 'display:grid;grid-template-columns:minmax(150px,1.4fr) repeat(6,minmax(64px,1fr));gap:0 10px;align-items:center';
+const SIGNAL_ROW = 'display:grid;grid-template-columns:minmax(70px,0.8fr) minmax(60px,0.7fr) minmax(80px,0.9fr) repeat(2,minmax(90px,1fr)) minmax(150px,1.6fr);gap:0 10px;align-items:center';
+
+function TradeOutcomes({ css, v }) {
+  const [r, setR] = React.useState(() => modelEval());
+  React.useEffect(() => { let on = true; loadModelEval().then((x) => { if (on) setR(x); }); return () => { on = false; }; }, []);
+  if (!r) {
+    return (
+      <div style={css(CARD, { v })}>
+        <div style={css(TITLE, { v })}>TRADE OUTCOMES · THE MODEL</div>
+        <div style={css('font-size:11.5px;color:#6b7699;margin-top:8px;line-height:1.5', { v })}>
+          No report yet. It is made from the server's archive by <code>npm run backtest</code> (scripts/backtest-early.mjs),
+          which writes /raw/model-eval.json - run it whenever you want the grades brought up to date.
+        </div>
+      </div>
+    );
+  }
+  const scores = Object.entries(r.scores || {});
+  const top = (s, h) => (s && s.top10 ? s.top10[h] : (s && s.top10Test ? s.top10Test[h] : null));
+  const inputs = Object.entries(r.inputs || {}).sort((a, b) => (a[1].score === b[1].score ? 0 : a[1].score === 'EARLY' ? -1 : 1));
+  const day = (t) => new Date(t).toISOString().slice(0, 16).replace('T', ' ');
+  return (
+    <div style={css(CARD + ';display:flex;flex-direction:column;gap:12px', { v })}>
+      <div style={css('display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap', { v })}>
+        <div style={css(TITLE, { v })}>TRADE OUTCOMES · THE MODEL</div>
+        <div style={css('font-size:9.5px;color:#6b7699', { v })}>
+          {r.moments.toLocaleString()} moments · {r.tokens} tokens · {day(r.window.from)} → {day(r.window.to)} UTC
+        </div>
+      </div>
+      <div style={css('font-size:11px;color:#a3aed0;line-height:1.5', { v })}>
+        The model (flow/score-flow.js) replayed on the archive: every 15 minutes each token's call is judged as the trade it asks for. FAST: {r.trades.fast.label}.
+        SWING: {r.trades.swing.label}. IC above 0 means a higher score meant a better trade; grey is within noise (|t| under 2).
+        TOP-10 is the ten highest scores each hour against every scored token.
+      </div>
+      <div style={css('font-size:10.5px', { v })}>
+        <div style={css(SIGNAL_ROW + ';' + ROWLINE + ';padding:5px 0;font-size:8.5px;letter-spacing:1px;color:#6b7699;font-weight:700', { v })}>
+          <div>SIGNAL</div><div>CALLS</div><div>GRADED AS</div><div>FAST 6H</div><div>SWING 24H</div><div>EVERY TOKEN, SAME TRADE</div>
+        </div>
+        {Object.entries(r.signals || {}).map(([name, g]) => {
+          const side = (r.signalSide || {})[name] || 'long';
+          const t = g[side] || {}; const base = (r.everyone || {})[side] || {};
+          const cell = (x) => (x ? fmtPct(x.avgPct) + ' · ' + Math.round(x.winPct) + '%' : '—');
+          const tone = (x, b) => (x && b && Number.isFinite(x.avgPct) && Number.isFinite(b.avgPct) ? (x.avgPct > b.avgPct + 0.5 ? POS : x.avgPct < b.avgPct - 0.5 ? NEG : MUTED) : MUTED);
+          return (
+            <div key={name} style={css(SIGNAL_ROW + ';' + ROWLINE + ';padding:7px 0', { v })}>
+              <div style={css('color:#dfe6f6;font-weight:800', { v })}>{name}</div>
+              <div style={css('color:#6b7699', { v })}>{(g.moments || 0).toLocaleString()}</div>
+              <div style={css('color:#6b7699', { v })}>{side === 'short' ? 'short / exit' : 'long'}</div>
+              <div style={css('color:{{ c }};font-weight:700', { v, c: tone(t.fast, base.fast) })}>{cell(t.fast)}</div>
+              <div style={css('color:{{ c }};font-weight:700', { v, c: tone(t.swing, base.swing) })}>{cell(t.swing)}</div>
+              <div style={css('color:#6b7699', { v })}>{cell(base.fast)} / {cell(base.swing)}</div>
+            </div>
+          );
+        })}
+        <div style={css('font-size:9.5px;color:#6b7699;margin:5px 0 12px', { v })}>
+          Each cell: average trade · win rate. Coloured when it beats (or trails) every token taken the same way by more than half a point.
+        </div>
+        <div style={css(TRADE_ROW + ';' + ROWLINE + ';padding:5px 0;font-size:8.5px;letter-spacing:1px;color:#6b7699;font-weight:700', { v })}>
+          <div>SCORE</div><div>IC FAST</div><div>IC SWING</div><div>TOP-10 FAST</div><div>BOARD FAST</div><div>TOP-10 SWING</div><div>BOARD SWING</div>
+        </div>
+        {scores.map(([name, s]) => {
+          const ic = s.all || s.test || {};
+          const tf = top(s, 'fast'); const ts = top(s, 'swing');
+          return (
+            <div key={name} style={css(TRADE_ROW + ';' + ROWLINE + ';padding:7px 0', { v })}>
+              <div style={css('color:#dfe6f6;font-weight:700', { v })}>{name}{!s.all && <span style={css('color:#6b7699;font-weight:400', { v })}> · test hours only</span>}</div>
+              <div style={css('color:{{ c }};font-weight:700', { v, c: icTone(ic.fast) })}>{fmtIc(ic.fast)}</div>
+              <div style={css('color:{{ c }};font-weight:700', { v, c: icTone(ic.swing) })}>{fmtIc(ic.swing)}</div>
+              <div title={tf ? tf.picks + ' picks' : ''}>{tf ? fmtPct(tf.avgTradePct) + ' · ' + Math.round(tf.winPct) + '%' : '—'}</div>
+              <div style={css('color:#6b7699', { v })}>{tf ? fmtPct(tf.boardAvgTradePct) + ' · ' + Math.round(tf.boardWinPct) + '%' : '—'}</div>
+              <div title={ts ? ts.picks + ' picks' : ''}>{ts ? fmtPct(ts.avgTradePct) + ' · ' + Math.round(ts.winPct) + '%' : '—'}</div>
+              <div style={css('color:#6b7699', { v })}>{ts ? fmtPct(ts.boardAvgTradePct) + ' · ' + Math.round(ts.boardWinPct) + '%' : '—'}</div>
+            </div>
+          );
+        })}
+        <div style={css('font-size:9.5px;color:#6b7699;margin-top:5px', { v })}>Trade cells: average trade · win rate.</div>
+      </div>
+      <div style={css('display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:4px 16px;font-size:10.5px', { v })}>
+        {inputs.map(([label, x]) => (
+          <div key={label} style={css('display:flex;gap:8px;align-items:baseline;' + ROWLINE + ';padding:4px 0', { v })}>
+            <span style={css('flex:1;color:#dfe6f6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', { v })} title={label}>
+              <span style={css('color:{{ c }};font-size:8px;font-weight:800;margin-right:5px', { v, c: x.score === 'EARLY' ? WARN : '#6b7699' })}>{x.score}</span>
+              {label.replace(/^board\./, '')}
+            </span>
+            <span style={css('color:{{ c }};font-weight:700', { v, c: icTone(x.fast) })}>{fmtIc(x.fast)}</span>
+            <span style={css('color:{{ c }};font-weight:700', { v, c: icTone(x.swing) })}>{fmtIc(x.swing)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function Evaluation({ v, css }) {
   if (!v.isEval) return null;
   const o = v.outcome || {};
   return (
     <div data-screen-label="Evaluation" style={css('flex:1;overflow:auto;padding:14px 16px;min-height:0', { v })}>
       <Header o={o} css={css} v={v} />
+      <div style={css('margin-bottom:12px', { v })}><TradeOutcomes css={css} v={v} /></div>
       {!o.ready ? (
         <div style={css(CARD + ';font-size:12px;color:#6b7699;padding:28px 16px;text-align:center', { v })}>{o.note}</div>
       ) : (

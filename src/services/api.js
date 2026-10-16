@@ -17,7 +17,7 @@
 
 import { chainKeys, chainKeyToName } from '../data/chains';
 import { setInput } from './storage/input-store';
-import { readRaw, readRawQuiet, setRawOrigin, probeRawStore, ageOf } from './storage/raw-store';
+import { readRaw, readRawQuiet, setRawOrigin, probeRawStore, ageOf, storeOrigin } from './storage/raw-store';
 import { payload as catalogPayload } from '../data/catalog';
 import {
   normalizeRow, screenRows, zScoresFrom, bucketBaselines,
@@ -25,20 +25,15 @@ import {
   scoreOutcomes, median,
   providerHealth, summarize,
 } from '../calculations/core';
-import {
-  evaluateAsset, deriveIntel, usdReferenceMedian, scoreAsset,
-  SCORE_MODEL, hydrateStages, stageSnapshot,
-  hydrateScoreHistory, scoreHistorySnapshot,
-} from '../calculations/asset-detail';
-import {
-  recordScore, journalFor, flushJournal, pruneJournal,
-  loadStageMemory, saveStageMemory, loadScoreWindow, saveScoreWindow,
-} from './score-journal';
+import { evaluateAsset, deriveIntel, usdReferenceMedian } from '../calculations/asset-detail';
+import { recordScore, journalFor, flushJournal, pruneJournal } from './score-journal';
 import { walletIntelForPool } from './wallet-intel';
-import { flowScore } from '../flow/score-flow';
+import { flowScore, EARLY_MODEL } from '../flow/score-flow';
 import { ethosFor } from './ethos-intel';
 import { sharedOrigin } from './shared-origin';
 import { recordTrail, flushTrail, readTrail } from './score-trail';
+import { smartWalletSet } from './smart-money';
+import { signalInfo } from '../utils/formatters';
 
 // Where the raw store is served. Vercel serves this app as static files, so a
 // deployed build needs an absolute origin. Override with VITE_API_BASE.
@@ -104,21 +99,14 @@ export async function initApiBase() {
 /** Which store the app settled on, for anything that wants to say so. */
 export const usingLocalApi = () => BASE_URL === LOCAL_BASE;
 
-/* ---------------------------------------------------------- stage memory - */
+/* ------------------------------------------------------------- the stores - */
 
 /**
- * Puts the stage machine's memory and the rolling score window back.
- *
- * Both live in the history store, which hydrates ASYNCHRONOUSLY. This used to
- * run at module load - before hydration - so it always read nothing, and the
- * first save then overwrote the stored window with an empty one: every reload
- * threw away the settled averages and the board re-settled from scratch for
- * 15 minutes. It must run after historyStore.hydrate() and before the first
- * score is computed; App does exactly that.
+ * Marks the history store as hydrated, so the journal and the trail may be
+ * flushed. The store hydrates ASYNCHRONOUSLY, and saving before it has would
+ * write empty records over real ones; App calls this right after hydrate().
  */
 export function restoreDerived() {
-  hydrateStages(loadStageMemory());
-  hydrateScoreHistory(loadScoreWindow());
   restored = true;
 }
 let restored = false;
@@ -133,8 +121,6 @@ function persistDerived() {
   pruneJournal();
   flushJournal();
   flushTrail();
-  saveStageMemory(stageSnapshot());
-  saveScoreWindow(scoreHistorySnapshot());
 }
 
 /* ------------------------------------------------------------ raw inputs -- */
@@ -270,9 +256,6 @@ const MEME_LAUNCHPADS = ['pump.fun', 'pumpfun', 'moonshot', 'bags', 'believe', '
 
 /** A scored row mapped into the shape the UI components expect. */
 export function mapServerRowToAsset(row) {
-  const stageMap = { WATCH: 1, EMERGING: 2, CONFIRMED: 3, EXCEPTIONAL: 4 };
-  const stage = typeof row.stage === 'number' ? row.stage : (stageMap[row.stage] || 1);
-
   const chainRaw = String(row.chain || 'solana').toLowerCase();
   const chain = chainKeyToName[chainRaw] || chainRaw.toUpperCase().slice(0, 4);
 
@@ -309,11 +292,12 @@ export function mapServerRowToAsset(row) {
     name: row.name || row.pairName || row.symbol || 'Asset',
     chain,
     cls,
-    stage,
-    // ?? not ||, so a legitimate 0 survives and null renders as a dash.
+    // EARLY, the model's entry score (flow/score-flow.js). ?? not ||, so a
+    // legitimate 0 (a failed safety gate) survives and null renders as a dash.
     score: row.score ?? null,
     scoreBasis: row.scoreBasis || 'market',
-    conf: row.dataQuality ?? null,
+    // How much of EARLY resolved: inputs present of the seven.
+    conf: Number.isFinite(row.inputsPresent) ? Math.round((row.inputsPresent / 7) * 100) / 100 : null,
     age: row.poolAgeHours != null ? Math.round(row.poolAgeHours * 3600) : null,
     price: row.priceUsd ?? null,
     chg: row.priceChangePct?.m5 != null ? row.priceChangePct.m5 / 100
@@ -340,6 +324,22 @@ export function mapServerRowToAsset(row) {
     // board tile, the detail tiles and the risk flag are all reading one
     // object rather than three re-derivations of it.
     organicFlow: row.organicFlow || null,
+    // PHASE & SIGNAL - what the main page shows instead of the score.
+    // The call (flow/score-flow.js PHASE and SIGNAL).
+    signal: row.signal || null,
+    signalWhy: row.signalWhy || null,
+    phase: row.phase || null,
+    phaseWhy: row.phaseWhy || null,
+    early: Number.isFinite(row.score) ? row.score : null,
+    plan: row.plan || null,
+    // The engine the active profile runs, and its own score for this token.
+    engine: row.engine || null,
+    engineScore: row.engines && row.engine && row.engines[row.engine] && Number.isFinite(row.engines[row.engine].score)
+      ? row.engines[row.engine].score : null,
+    // Sort key: the signal's rank, the active engine's score breaking ties inside it.
+    signalRank: row.signal ? signalInfo(row.signal).rank * 1000
+      + (row.engines && row.engine && row.engines[row.engine] && Number.isFinite(row.engines[row.engine].score)
+        ? row.engines[row.engine].score : (Number.isFinite(row.score) ? row.score : 0)) : null,
     rawServerRow: row,
   };
 }
@@ -420,20 +420,17 @@ export async function fetchLiveMarketData(chains = chainKeys) {
           ethos: ethosFor(chainKey, row.tokenAddress),
           // Perp venues and paid promotion, for the listing components.
           listing: listingFor(perps, promotion, row),
+          // Learned smart wallets, for PHASE & SIGNAL's smart-money boxes.
+          smartWallets: smartWalletSet(),
         };
-        // THE DATA FLOW computes the score: every box of the default flow,
-        // run for this token, with the map's edits obeyed (flow/score-flow.js).
+        // THE DATA FLOW is the model: every box of the active flow, run for
+        // this token, with the map's edits obeyed (flow/score-flow.js).
         const full = evaluateAsset(row, inputs, flowScore);
-        // Golden check (admin): the old scorer beside it, without touching its
-        // memory, so any difference between the flow and the old code shows.
-        if (typeof window !== 'undefined' && window.__flowCheck) {
-          const old = evaluateAsset(row, inputs, (r, ex) => scoreAsset(r, { ...ex, trackStage: false }));
-          (window.__flowDiffs = window.__flowDiffs || []).push({ sym: row.symbol, chain: chainKey, flow: full, old });
-        }
-        // Remember what we scored it at, so Evaluation can grade it later.
+        // Remember the call, so Evaluation can grade it later. The journal's
+        // `stage` field carries the SIGNAL - its outcomes are grouped by it.
         // This lives in the app store only - it never goes to the server.
         recordScore(chainKey, row.tokenAddress, {
-          score: full.score, stage: full.stage,
+          score: full.score, stage: full.signal, price: full.priceUsd,
           flags: (full.riskFlags || []).map((f) => f.code),
         });
         // And every component beside it, for the price chart's score overlay
@@ -586,6 +583,34 @@ export const CHART_RANGES = {
   '7D': { ms: 7 * 24 * 3600000, source: 'bars15' },
 };
 
+/**
+ * A pool's 15m candles: the stored file, or - when it is missing or older
+ * than 2h - the collector fetches them now (GET /bars15/<chain>/<pool>). Asked
+ * at most once a minute per pool from this tab.
+ */
+const bars15Asked = new Map();
+async function bars15OnDemand(chain, poolAddress) {
+  const file = await readRawQuiet(chain + '/bars15/' + poolAddress + '.json', null);
+  if (file && Date.now() - (file.fetchedAt || 0) < 2 * 3600000) return file;
+  const key = chain + ':' + poolAddress;
+  if (Date.now() - (bars15Asked.get(key) || 0) < 60000) return file;
+  bars15Asked.set(key, Date.now());
+  try {
+    const res = await fetch(storeOrigin() + '/bars15/' + chain + '/' + encodeURIComponent(poolAddress));
+    const got = res.ok ? await res.json() : null;
+    return got && Array.isArray(got.bars) && got.bars.length ? got : file;
+  } catch (e) { return file; }
+}
+
+/** One token's own recorded price, [t, priceUsd] a minute apart (GET /pricehistory). */
+async function priceHistory(chain, tokenAddress, days) {
+  try {
+    const res = await fetch(storeOrigin() + '/pricehistory/' + chain + '/' + encodeURIComponent(tokenAddress) + '?days=' + days);
+    const got = res.ok ? await res.json() : null;
+    return got && Array.isArray(got.points) ? got.points : [];
+  } catch (e) { return []; }
+}
+
 /** Minute bars rolled up to 15 minutes, for the stretch after the last stored 15m bar. */
 function rollup15(bars) {
   const out = new Map();
@@ -629,18 +654,29 @@ export async function fetchChartHistory(chain, poolAddress, tokenAddress, rangeK
     reason = stored.length > 1 ? null : (bars.length > 1 ? 'local_history' : 'not_collected');
   } else {
     interval = '15-MIN';
-    const [file, raw] = await Promise.all([
-      readRawQuiet(chain + '/bars15/' + poolAddress + '.json', null),
+    // Three layers, real candles winning wherever they exist:
+    //   1. GeckoTerminal's 15m candles - fetched on demand when the pool's file
+    //      is missing or stale (GET /bars15), since the background rotation
+    //      reaches only part of the board;
+    //   2. our own recorded price, a minute apart, from the per-source stores
+    //      and the archive backfill (GET /pricehistory) - every token since it
+    //      first reached the board;
+    //   3. our live 15s samples (24h kept) up to now.
+    const days = Math.max(1, Math.ceil(range.ms / 86400000));
+    const [stored0, raw, points] = await Promise.all([
+      bars15OnDemand(chain, poolAddress),
       rawInputsFor(chain),
+      tokenAddress ? priceHistory(chain, tokenAddress, days) : Promise.resolve([]),
     ]);
+    const file = stored0;
     const stored = (file && Array.isArray(file.bars)) ? file.bars : [];
     firstBarAt = file ? file.firstBarAt : null;
-    const lastT = stored.length ? stored[stored.length - 1].t : 0;
-    // The collector refreshes a pool every 2h; the gap since is our own samples.
-    const tail = rollup15(barsFromSamples((raw.samples && raw.samples[poolAddress]) || [],
-      lastT ? lastT + 900000 : 0));
-    bars = stored.concat(tail).filter((b) => b.t >= since);
-    reason = stored.length ? null : (bars.length > 1 ? 'local_history' : 'not_collected');
+    const byT = new Map();
+    rollup15(barsFromSamples(points.map(([t, p]) => ({ t, priceUsd: p })), since)).forEach((b) => byT.set(b.t, b));
+    rollup15(barsFromSamples((raw.samples && raw.samples[poolAddress]) || [], since)).forEach((b) => byT.set(b.t, b));
+    stored.forEach((b) => { if (Number.isFinite(b.t)) byT.set(b.t, b); });
+    bars = [...byT.values()].filter((b) => b.t >= since).sort((a, b) => a.t - b.t);
+    reason = stored.length && stored[0].t <= since + 900000 ? null : (bars.length > 1 ? 'local_history' : 'not_collected');
   }
   const trail = await trailP;
 
@@ -958,11 +994,11 @@ export async function fetchAdminStore({ collection } = {}) {
 }
 
 /**
- * The field catalogue. The equations live in the app, so it is built here
- * from the live SCORE_MODEL.
+ * The field catalogue. The equations live in the DATA FLOW, so it is built
+ * here from the model's live EARLY_MODEL weights.
  */
 export async function fetchCatalog() {
-  return catalogPayload(SCORE_MODEL);
+  return catalogPayload(EARLY_MODEL);
 }
 
 // API_ORIGIN is declared and kept current next to BASE_URL, above.

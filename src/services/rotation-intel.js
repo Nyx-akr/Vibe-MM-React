@@ -191,115 +191,19 @@ export function rotationGraphFor(chainKey) {
   return entry ? { ...entry.graph, chain: entry.chain, builtAt: entry.at, stale: entry.stale } : null;
 }
 
-/** Every chain currently held, busiest first. */
-export function rotationChains() {
-  return [...byChain.values()]
-    .map((e) => ({
-      chain: e.chain,
-      builtAt: e.at,
-      poolsSampled: e.graph.poolsSampled,
-      pairsConnected: e.graph.pairsConnected,
-      rotatedUsd: e.graph.rotatedUsd,
-      sharedWalletCount: e.graph.sharedWalletCount,
-    }))
-    .sort((a, b) => b.rotatedUsd - a.rotatedUsd);
-}
-
 /**
- * The chain with the most rotation right now.
- *
- * Nothing consumes this today: the ROTATION tab is scoped to the selected
- * token, so it reads that token's own chain rather than choosing one. Kept as
- * part of this service's read API for anything chain-level that comes later -
- * a market-regime strip, say - because the ranking is already computed by
- * rotationChains() and throwing it away would only mean writing it again.
+ * Every chain's graph as held, raw: { chain, graph, at, stale }. What the
+ * graphs SAY - one pool's peers, the chains ranked, the net gainers - is
+ * worked out by the DATA FLOW (flow/board-flow.js TOKEN ROTATION, CHAIN
+ * ROTATION, MARKET ROTATION), not here.
  */
-export function busiestRotationChain() {
-  const ranked = rotationChains();
-  return ranked.length ? ranked[0].chain : null;
+export function rotationHeld() {
+  return [...byChain.values()];
 }
 
-/**
- * What rotation says about ONE pool, for any panel that is already showing
- * that token - ASSET DETAIL, WALLETS, LIVE OPPORTUNITIES.
- *
- * Returns null when the pool is not in a graph yet, which is the honest answer
- * before the sampling rotation has reached it.
- */
-export function rotationForPool(poolAddress, { peerLimit = 12 } = {}) {
-  if (!poolAddress) return null;
-
-  let found = null;
-  let chain = null;
-  let builtAt = null;
-  byChain.forEach((entry) => {
-    if (found) return;
-    const hit = (entry.graph.nodes || []).find((n) => n.poolAddress === poolAddress);
-    if (hit) { found = hit; chain = entry.chain; builtAt = entry.at; }
-  });
-  if (!found) return null;
-
-  const entry = byChain.get(chain);
-  // Read from the node, not from graph.edges: that list is truncated for
-  // display, so filtering it would quietly drop the counterparties of any pool
-  // outside the biggest 40 pairs. rotationGraph() carries every pool's own
-  // peers on its node for exactly this caller.
-  const peers = found.peers || [];
-  const inAll = peers.filter((p) => p.direction === 'in' && p.rotatedUsd > 0);
-  const outAll = peers.filter((p) => p.direction === 'out' && p.rotatedUsd > 0);
-
-  const memory = byPool.get(poolAddress) || null;
-
-  return {
-    chain,
-    builtAt,
-    symbol: found.symbol,
-    poolAddress,
-    connections: found.connections,
-    wallets: found.wallets,
-    rotatedUsd: found.rotatedUsd,
-    inUsd: found.inUsd,
-    outUsd: found.outUsd,
-    netRotationUsd: found.netRotationUsd,
-    sampledAt: found.sampledAt,
-    poolsCompared: Math.max(0, entry.graph.poolsSampled - 1),
-    trades: found.trades,
-    peers: peers.slice(0, peerLimit),
-    peerCount: peers.length,
-    // Sliced PER DIRECTION, and counted before slicing.
-    //
-    // One combined top-N ranked by size hid whole directions: a pool with 20
-    // inbound peers and 1 outbound put the outbound one at rank 21, so a tab
-    // drawing the slice showed "0 destinations" beside a LEFT tile of $930 -
-    // money leaving for nowhere. The counts here describe every edge; the
-    // lists are what is small enough to draw.
-    inPeers: inAll.slice(0, peerLimit),
-    outPeers: outAll.slice(0, peerLimit),
-    inCount: inAll.length,
-    outCount: outAll.length,
-    // Counts that match inUsd / outUsd, as opposed to the two above which match
-    // the drawn lists. Both are needed, and they answer different questions: a
-    // tile captions the money, a diagram caption describes the paths it had
-    // room to draw.
-    receivedFrom: found.receivedFrom,
-    sentTo: found.sentTo,
-    // The window this pool's figures describe, carried alongside them so a
-    // caller never has to reach back into the graph to caption its own numbers.
-    firstTradeAt: entry.graph.firstTradeAt,
-    lastTradeAt: entry.graph.lastTradeAt,
-    // Cross-tick context: null until the service has watched it for a while.
-    firstRotatingAt: memory && memory.firstRotatingAt,
-    peakRotatedUsd: memory && memory.peakRotatedUsd,
-    ticksObserved: memory && memory.ticks,
-  };
-}
-
-/** Pools ranked by how much capital they have pulled in, across every chain. */
-export function rotationLeaders({ limit = 20, chain = null } = {}) {
-  return [...byPool.values()]
-    .filter((r) => (chain ? r.chain === chain : true))
-    .sort((a, b) => (b.lastNetUsd || 0) - (a.lastNetUsd || 0))
-    .slice(0, limit);
+/** The thin cross-tick memory for one pool, or null before it has rotated. */
+export function rotationMemoryFor(poolAddress) {
+  return poolAddress ? byPool.get(poolAddress) || null : null;
 }
 
 /** For SYSTEM HEALTH and the admin panel. */
@@ -307,11 +211,8 @@ export function rotationIntelStatus() {
   return {
     ...status,
     running,
-    // Summed across every chain held, at read time. Kept out of the tick
-    // counters deliberately: those are per-chain, and a per-chain figure under
-    // an app-wide name is how a status panel starts reporting one eighth of
-    // the truth.
-    rotatedUsdHeld: [...byChain.values()].reduce((s, e) => s + (e.graph.rotatedUsd || 0), 0),
+    // rotatedUsdHeld, summed across every chain held, is added by the DATA
+    // FLOW's ROTATION SERVICE box (flow/board-flow.js).
     // Named so nobody reads the tick rate as a sampling rate.
     note: 'processes every held pool each tick; sampling is the server’s job',
   };

@@ -32,10 +32,23 @@ export function normalizeRegistry(saved) {
       if (!w || typeof w !== 'object') return null;
       const address = String(w.address || '').trim();
       if (!address || address.includes('…') || address.includes('...')) return null;
+      const a = w.alert && typeof w.alert === 'object' ? w.alert : {};
       return {
         address,
         label: String(w.label || '').trim() || 'Tracked wallet',
         addedAt: Number(w.addedAt) || Date.now(),
+        // Where it came from: 'custom' (typed in), 'curated' (the KOL /
+        // smart-money library) or 'active' (found by our own sampler).
+        source: ['custom', 'curated', 'active'].includes(w.source) ? w.source : 'custom',
+        category: String(w.category || '').trim(),
+        // The alarm on this wallet (WALLET TRACKER). Older entries had none,
+        // so they come in with it off rather than suddenly ringing.
+        alert: {
+          on: a.on === true,
+          buy: a.buy !== false,
+          sell: a.sell !== false,
+          minUsd: Number.isFinite(Number(a.minUsd)) && Number(a.minUsd) >= 0 ? Number(a.minUsd) : 0,
+        },
       };
     })
     .filter(Boolean);

@@ -3,8 +3,9 @@ import React from 'react';
 import { UNAVAILABLE } from '../utils/formatters';
 import { chainNameToKey } from '../data/chains';
 import {
-  socialIntelFor, socialSources, socialPromoFor, socialAbsent, socialIntelStatus,
+  socialRecordFor, socialSources, socialPromoFor, socialAbsent, socialIntelStatus,
 } from '../services/social-intel';
+import { boardValue, boardNote } from '../flow/board-flow';
 
 /** Per-source badge colour, so a post's origin is readable at a glance. */
 const SOURCE_STYLE = {
@@ -80,7 +81,7 @@ export function socialVals(app, sel) {
 
   if (!sel) return { socialReady: false, socialOffline: false };
 
-  const intel = ticker ? socialIntelFor(ticker) : null;
+  const intel = ticker ? socialRecordFor(ticker) : null;
   const m = (intel && intel.mention) || null;
 
   // The service holds the corpus between sweeps, so "nothing yet" only means
@@ -97,7 +98,12 @@ export function socialVals(app, sel) {
     };
   }
 
-  const baseline = (intel && intel.baseline) || {};
+  // The numbers are the DATA FLOW's SOCIAL STATS boxes (flow/board-flow.js).
+  const baseline = boardNote('VS SOCIAL BASELINE') || {};
+  const mentions = boardValue('MENTIONS');
+  const authors = boardValue('UNIQUE AUTHORS');
+  const perAuthor = boardValue('MENTIONS PER AUTHOR');
+  const vsBase = boardValue('VS SOCIAL BASELINE');
   const sources = socialSources();
   const live = sources.filter((x) => x.ok).length;
 
@@ -106,23 +112,23 @@ export function socialVals(app, sel) {
   const socialStats = [
     {
       label: 'MENTIONS OF $' + ticker,
-      value: m && m.countable ? String(m.mentions) : '—',
-      color: m && m.countable && m.mentions > 0 ? '#ffffff' : UNAVAILABLE,
+      value: mentions != null ? String(mentions) : '—',
+      color: mentions > 0 ? '#ffffff' : UNAVAILABLE,
     },
     {
       label: 'UNIQUE AUTHORS',
-      value: m && m.countable ? String(m.authors) : '—',
-      color: m && m.countable && m.authors > 0 ? '#dfe6f6' : UNAVAILABLE,
+      value: authors != null ? String(authors) : '—',
+      color: authors > 0 ? '#dfe6f6' : UNAVAILABLE,
     },
     {
       label: 'PER AUTHOR',
-      value: m && m.concentration != null ? String(m.concentration) : '—',
-      color: m && m.concentration != null && m.concentration >= 3 ? '#ff4fae' : dim(m && m.concentration),
+      value: perAuthor != null ? String(perAuthor) : '—',
+      color: perAuthor != null && perAuthor >= 3 ? '#ff4fae' : dim(perAuthor),
     },
     {
       label: 'VS BASELINE',
-      value: baseline.vsBase != null ? baseline.vsBase + '×' : '—',
-      color: baseline.vsBase != null && baseline.vsBase >= 2 ? '#4d8dff' : dim(baseline.vsBase),
+      value: vsBase != null ? vsBase + '×' : '—',
+      color: vsBase != null && vsBase >= 2 ? '#4d8dff' : dim(vsBase),
     },
     {
       label: 'POSTS SCANNED',
@@ -180,6 +186,10 @@ export function socialVals(app, sel) {
     socialSources: socialSourceRows,
     socialLive: live + ' of ' + sources.length + ' sources answering',
     socialCountable: Boolean(m && m.countable),
+    // Raw figures for the dashboard window's buzz meter.
+    socialVsBase: vsBase,
+    socialMentions: mentions,
+    socialAuthors: authors,
     // Project identity, from Ethos. Rendered beside the mention counts.
     ethos: rep,
     ethosNote: ethosNote(rep),

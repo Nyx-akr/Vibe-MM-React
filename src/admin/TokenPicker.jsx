@@ -10,15 +10,12 @@
 import React from 'react';
 import { C } from './Explain';
 import { chains as CHAINS, chainColors } from '../data/chains';
-import { STAGES } from '../calculations/asset-detail.js';
+import { signalInfo } from '../utils/formatters';
 
 const ORDER = CHAINS.map((c) => c.name);
 const LABEL = Object.fromEntries(CHAINS.map((c) => [c.name, c.label]));
 const MONO = 'ui-monospace, Menlo, Consolas, monospace';
 
-/** The stage a score sits in, for the score's colour - the board's own bands. */
-const STAGE_COLOR = { EXCEPTIONAL: '#ffd60a', CONFIRMED: C.pink, EMERGING: C.blue, WATCH: C.dim };
-const stageOf = (score) => (STAGES.find((s) => score >= s.min) || STAGES[STAGES.length - 1]).name;
 
 const isVetoed = (a) => Boolean(a && a.rawServerRow && a.rawServerRow.vetoed);
 
@@ -30,9 +27,10 @@ function Score({ a }) {
           border: `1px solid ${C.hot}55`, borderRadius: 4, padding: '1px 5px' }}>VETO</span>
     );
   }
-  if (a.score == null) return <span style={{ color: C.grey, fontFamily: MONO, fontSize: 11 }}>–</span>;
-  const s = Math.round(a.score);
-  return <span style={{ color: STAGE_COLOR[stageOf(s)] || C.dim, fontFamily: MONO, fontSize: 11, fontWeight: 700 }}>{s}</span>;
+  // The token's call, coloured as the board colours it (flow/score-flow.js SIGNAL).
+  if (!a.signal) return <span style={{ color: C.grey, fontFamily: MONO, fontSize: 11 }}>–</span>;
+  return <span title={a.score == null ? '' : 'EARLY ' + Math.round(a.score)}
+    style={{ color: signalInfo(a.signal).fg, fontFamily: MONO, fontSize: 9.5, fontWeight: 800, letterSpacing: 0.5 }}>{a.signal}</span>;
 }
 
 function ChainDot({ chain, size = 7 }) {

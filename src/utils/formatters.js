@@ -15,6 +15,21 @@ export function fmtPrice(p) { return p >= 100 ? '$' + p.toFixed(2) : p >= 1 ? '$
 export function stageInfo(st) { return [null, { n: 'WATCH', bg: '#1a2440', fg: '#a3aed0' }, { n: 'EMERGING', bg: '#0e2a5c', fg: '#4d8dff' }, { n: 'CONFIRMED', bg: '#3a1140', fg: '#f06ee2' }, { n: 'EXCEPTIONAL', bg: '#3a2c0f', fg: '#ffc65e' }][st]; }
 export function chainColor(c) { return chainColors[c] || '#a3aed0'; }
 export function clsColor(c) { return { MEME: '#e35ff2', TOKEN: '#a3aed0', STOCK: '#4fc3f7', ETF: '#8fd3ff' }[c]; }
+/**
+ * The main page's call (calculations/phase.js SIGNALS): colour, background,
+ * and the sort rank - BUY first, then the exits, then the rest.
+ */
+export const SIGNAL_INFO = {
+  BUY: { fg: '#3ddc97', bg: 'rgba(61,220,151,0.14)', rank: 5, text: 'Waking up and not run yet - the entry zone' },
+  SHORT: { fg: '#b06bff', bg: 'rgba(176,107,255,0.16)', rank: 4, text: 'Peaking, and a perp venue lists it. Not yet proven by the grading - see Evaluation' },
+  SELL: { fg: '#ff4d5e', bg: 'rgba(255,77,94,0.14)', rank: 3, text: 'Peaking - take profit, do not chase' },
+  WATCH: { fg: '#8b96b8', bg: 'rgba(139,150,184,0.10)', rank: 2, text: 'No call yet' },
+  AVOID: { fg: '#6b7699', bg: 'rgba(107,118,153,0.10)', rank: 1, text: 'The burst is over' },
+};
+export function signalInfo(sig) { return SIGNAL_INFO[sig] || { fg: '#3a4568', bg: 'transparent', rank: 0, text: 'Not enough history for a call yet' }; }
+/** The attention cycle, in order, each with the colour of what it usually calls for. */
+export const PHASE_ORDER = ['QUIET', 'WAKING', 'RUNNING', 'PEAKING', 'FADING'];
+export function phaseColor(p) { return { QUIET: '#6b7699', WAKING: '#3ddc97', RUNNING: '#ffc65e', PEAKING: '#ff4d5e', FADING: '#8b5a6b' }[p] || '#3a4568'; }
 export function scoreColor(s) { return s >= 90 ? '#f06ee2' : s >= 80 ? '#4d8dff' : s >= 68 ? '#6ea0ff' : '#a3aed0'; }
 export function washColor(wp) { return wp >= 0.3 ? '#ff4fae' : wp >= 0.15 ? '#e35ff2' : '#6b7699'; }
 

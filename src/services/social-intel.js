@@ -40,7 +40,7 @@
  * against ~24ms for the scan it replaced.
  */
 
-import { mentionsFor, mentionBaseline } from '../calculations/core';
+import { mentionsFor } from '../calculations/core';
 import * as historyStore from './storage/history-store';
 import { readRaw } from './storage/raw-store';
 
@@ -375,43 +375,29 @@ function normalize(symbol) {
 
 /**
  * Everything known about one token's social footprint: the current
- * measurement, the standing record, and the baseline built from it.
+ * measurement and the standing record (its mention series). The baseline the
+ * series makes - and every number the tabs show - is worked out by the DATA
+ * FLOW (flow/board-flow.js MENTIONS ... VS SOCIAL BASELINE).
  *
  * Synchronous, and safe to call from render - it reads memory, never the
  * network.
  */
-export function socialIntelFor(symbol) {
+export function socialRecordFor(symbol) {
   const key = normalize(symbol);
   if (!key) return null;
   const mention = live.get(key) || null;
   const rec = memory.get(key) || null;
-  const series = (rec && rec.series) || [];
   return {
     symbol: key,
     mention,
     memory: rec,
-    baseline: mentionBaseline(series, mention ? mention.mentions : 0),
+    series: (rec && rec.series) || [],
     matched: mention ? mention.matched.slice(0, MAX_MATCHED) : [],
     firstSeen: rec ? rec.firstSeen : null,
     peakMentions: rec ? rec.peakMentions || 0 : 0,
     peakAt: rec ? rec.peakAt : null,
     everMentioned: Boolean(rec && rec.everMentioned),
   };
-}
-
-/** The board's social leaders right now, loudest first. */
-export function topSocialTokens({ limit = 20, minMentions = 1 } = {}) {
-  return [...live.entries()]
-    .filter(([, m]) => m && m.mentions >= minMentions)
-    .sort((a, b) => b[1].mentions - a[1].mentions || b[1].authors - a[1].authors)
-    .slice(0, limit)
-    .map(([symbol, m]) => ({
-      symbol,
-      mentions: m.mentions,
-      authors: m.authors,
-      concentration: m.concentration,
-      bySource: m.bySource,
-    }));
 }
 
 /** Which feeds answered on the last sweep, with their own links and errors. */

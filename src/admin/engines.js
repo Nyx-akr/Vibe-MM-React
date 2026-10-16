@@ -25,7 +25,6 @@
  * mistaken for the code.
  */
 
-import { STAGES } from './graph';
 import { activeFlow, updateFlow } from './flow-store';
 import { RAW } from './pipeline';
 
@@ -43,12 +42,6 @@ const isReading = (label) => Boolean(label && RAW[label]);
 
 export const ROOT = 'root';
 
-/**
- * A pipeline step's own name, from graph.js STAGES ('4 · GATES' -> 'GATES'),
- * so an engine named after a step follows the step when it is renamed - the
- * step-3 engine said MEASURES for a while after step 3 had become GATES.
- */
-const stepName = (k) => String((STAGES[k] || {}).title || '').replace(/^\s*\d+\s*·\s*/, '');
 
 /**
  * One engine per pipeline step. `of` decides, by rule, which boxes it holds;
@@ -56,36 +49,38 @@ const stepName = (k) => String((STAGES[k] || {}).title || '').replace(/^\s*\d+\s
  * are stable (saved configs point at them); labels may follow the steps.
  */
 /** The RAW box - the weighted sum of the components. */
-const isRaw = (n) => n.id === 'f:pipe:RAW';
+
+/** The collector's per-source history files (/history/<source>/<chain>/<token>). */
+const isHistoryFile = (n) => n.kind === 'file' && String(n.path || '').indexOf('/history/') === 0;
 
 export const DEFAULT_ENGINES = [
-  { id: 'eng:ingest', label: 'INGEST', sub: 'providers → raw files', color: '#2ec4b6',
-    of: (n) => n.kind === 'provider' || n.kind === 'file' },
-  // The board and the token picked from it: what every per-token box reads.
-  // Inside SCORE DECOMPOSITION: its options carry each token's FINAL score
-  // or VETO, so it reads the score it starts.
+  // 1 · where every number comes from: the providers, the server's raw files.
+  { id: 'eng:ingest', label: 'SOURCES', sub: 'providers → raw files', color: '#2ec4b6',
+    of: (n) => n.kind === 'provider' || (n.kind === 'file' && !isHistoryFile(n)) },
+  // The core record, inside SOURCES: every source's answers in a store of its
+  // own (the collector's lib/token-history.js), each fed by its provider.
+  { id: 'eng:history', label: 'SOURCE STORAGE', sub: 'every source in a store of its own · what the engines are graded on', color: '#22d3ee',
+    parent: 'eng:ingest', of: isHistoryFile },
+  // 2 · the readings and measures every engine reads, and the token they are for.
+  { id: 'eng:decomp', label: 'MEASURES', sub: 'readings → measures → context', color: '#e2e8f0',
+    of: (n) => n.page === 'pipe' && n.stage >= 2 && n.stage <= 3 },
   { id: 'eng:token', label: 'TOKEN SELECTOR', sub: 'the board → the picked token', color: '#e2e8f0', parent: 'eng:decomp',
-    of: (n) => n.page === 'pipe' && n.stage === 1 },
-  // The whole score in one engine: the readings and the engines that turn
-  // them into components sit in it, and each component group, the gates and
-  // the combine step sit in it as groups of their own - so the score reads
-  // MAP › SCORE DECOMPOSITION › DEMAND ENGINE, one level deeper per step.
-  { id: 'eng:decomp', label: 'SCORE DECOMPOSITION', sub: 'readings → components → gates → score', color: '#f43f5e',
-    // RAW too: it is the weighted sum of the components, so it sits beside
-    // them and hands its one number into the SCORE group.
-    of: (n) => n.page === 'pipe' && ((n.stage >= 2 && n.stage <= 3) || isRaw(n)) },
-  // After the engines: the wash gate reads one of their outputs.
-  { id: 'eng:measures', label: stepName(4), sub: 'checks a token must pass', color: '#94a3b8', parent: 'eng:decomp',
+    of: (n) => n.page === 'pipe' && n.stage === 1 && n.home !== 'eng:history' },
+  // 3 · six ways to call an entry; the active profile's is marked ★ ACTIVE.
+  { id: 'eng:engines', label: 'ENGINES', sub: 'six ways to call an entry · the profile picks one', color: '#f43f5e',
+    of: () => false },
+  // 4 · hard pass / fail and warnings.
+  { id: 'eng:measures', label: 'SAFETY', sub: 'gates a token must pass · warnings', color: '#94a3b8',
     of: (n) => n.page === 'pipe' && n.stage === 4 },
-  { id: 'eng:score', label: 'SCORE', sub: 'penalty → right now → final → stage', color: '#ffd60a', parent: 'eng:decomp',
-    of: (n) => n.page === 'pipe' && n.stage === 5 && !isRaw(n) },
+  // 5 · the phase, the active engine's call as SIGNAL, the trade plan.
+  { id: 'eng:score', label: 'THE CALL', sub: 'phase → signal → trade plan', color: '#ffd60a',
+    of: (n) => n.page === 'pipe' && n.stage === 5 },
   // The background jobs (wallet intel, rotation, social, evaluation, alerts).
   { id: 'eng:services', label: 'SERVICES', sub: 'always-on jobs that keep memory', color: '#fbbf24',
-    of: () => false },
+    of: () => false, block: 6 },
   { id: 'eng:dashboard', label: 'DASHBOARD', sub: 'the panels that show it', color: '#3b82f6',
-    of: (n) => n.kind === 'panel' || (n.kind === 'field' && n.page !== 'pipe') },
-  // What the dashboard keeps for the next visit: part of the dashboard.
-  // Beside the dashboard, not in it: the dashboard holds only its panels.
+    of: (n) => n.kind === 'panel' || (n.kind === 'field' && n.page !== 'pipe'), block: 7 },
+  // What the dashboard keeps for the next visit.
   { id: 'eng:storage', label: 'BROWSER STORAGE', sub: 'kept for the next visit', color: '#b06bff',
     of: (n) => n.kind === 'store' },
 ];
@@ -112,7 +107,8 @@ function groupEngines(nodes) {
     if (!n.calcGroup || seen.has(n.calcGroup)) return;
     seen.set(n.calcGroup, {
       id: groupId(n.calcGroup), label: n.calcGroupLabel || n.calcGroup, parent: n.calcParent || 'eng:decomp',
-      sub: n.dashTab ? 'a panel' : 'a group of calculations', color: n.dashTab ? '#3b82f6' : '#f43f5e',
+      sub: n.dashTab ? 'a panel' : (n.calcParent === 'eng:engines' ? 'an engine: its score and its call' : 'a group of calculations'),
+      color: n.dashTab ? '#3b82f6' : (n.calcParent === 'eng:history' ? '#22d3ee' : '#f43f5e'),
     });
   });
   return Array.from(seen.values());
@@ -249,6 +245,8 @@ const blockOfBase = (n) => {
   if (n.flat || (n.page === 'pipe' && n.stage)) return 1 + (n.stage || 1);
   return 7;
 };
+
+const pinnedBlock = (id) => { const d = DEFAULT_ENGINES.find((x) => x.id === id); return d && Number.isFinite(d.block) ? d.block : null; };
 
 export const ENGINE = { W: 236, HEAD: 30, ROW: 16, PAD: 6 };
 /** The room under an API box's rows for its health and its sample. */
@@ -423,7 +421,9 @@ export function viewGraph(base, H, level) {
     const rows = Math.max(ins.length, outs.length, 1);
     nodes.push({
       id, kind: 'engine', label: eng.label, sub: eng.sub, color: eng.color, user: eng.user,
-      count, block: engineBlock.has(id) ? engineBlock.get(id) : 7, inPorts: ins, outPorts: outs,
+      // A container with a fixed place on the map (DEFAULT_ENGINES `block`)
+      // keeps it; any other sits in the column of the earliest box it holds.
+      count, block: pinnedBlock(id) ?? (engineBlock.has(id) ? engineBlock.get(id) : 7), inPorts: ins, outPorts: outs,
       w: ENGINE.W, h: ENGINE.HEAD + rows * ENGINE.ROW + ENGINE.PAD,
     });
   });

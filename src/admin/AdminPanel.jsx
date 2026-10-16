@@ -10,6 +10,7 @@ import { showsForPanel, showsForField } from './shows';
 import FlowChart from './FlowChart';
 import TokenPicker from './TokenPicker';
 import FlowUsers from './FlowUsers';
+import SmartWallets from './SmartWallets';
 // Registers PAGES.pipe and step 6 - the catalogue DATA FLOW draws.
 import './pipeline';
 import { API_ORIGIN } from '../services/api';
@@ -79,21 +80,8 @@ const OPS_PAGES = { ops: 'SERVER', opsStore: 'STORAGE', opsSources: 'SOURCES' };
  */
 const FLOW_PAGE = 'flow';
 
-/**
- * The dashboard's rail labels, back to the page keys behind them.
- *
- * The dashboard disables the four token-scoped tabs until a token is picked,
- * and sends a click to the board instead. On the admin page that is the wrong
- * behaviour: there is no board to send anyone to, and an operator opening
- * WALLETS wants to see a worked example, not a prompt. So the rail is rebuilt
- * here from the same labels, with nothing disabled, and a token is picked by
- * default - see defaultToken().
- */
-const PAGE_FOR_LABEL = {
-  'LIVE OPPORTUNITIES': 'live', DETAIL: 'detail', SOCIAL: 'social',
-  WALLETS: 'wallets', ROTATION: 'rotation', 'MARKET ROTATION': 'market', ALERTS: 'alerts',
-  EVALUATION: 'eval', HEALTH: 'health',
-};
+/** Rail labels for the mirrored dashboard pages - the same words the dashboard's navbar uses. */
+const MIRROR_LABELS = { market: 'MARKET ROTATION', alerts: 'ALERTS', eval: 'EVALUATION', health: 'HEALTH' };
 
 /**
  * The page to actually show. A map-only tab (set by inherited App code) means
@@ -410,44 +398,28 @@ export default class AdminPanel extends App {
     const page = shownPage(this.state.page);
     const isOps = Object.prototype.hasOwnProperty.call(OPS_PAGES, page);
     const isFlow = page === FLOW_PAGE;
+    const isSmart = page === 'smart';
 
-    // The dashboard's own rail, plus the three server pages under it. Built
-    // from v.navItems so the mirror's nav cannot drift from the dashboard's.
+    // DATA FLOW, the mirrored dashboard pages, then the three server pages.
+    // Built here rather than from v.navItems: the dashboard's nav is now a top
+    // bar (with an ADMIN link of its own), not a rail this page can reuse.
+    const railItem = (key, label, child) => {
+      const active = page === key;
+      return {
+        label, child, disabled: false, hint: '',
+        go: () => this.setState({ page: key }),
+        indent: child ? 30 : 16,
+        fg: active ? '#e35ff2' : '#8b96b8',
+        tickC: active ? '#e35ff2' : '#39445f',
+        line: active ? '#e35ff2' : 'transparent',
+        bg: active ? 'rgba(227,95,242,0.07)' : 'transparent',
+      };
+    };
     const navItems = [
-      {
-        label: 'DATA FLOW', child: false, disabled: false,
-        go: () => this.setState({ page: FLOW_PAGE }),
-        hint: 'every panel, file and provider on one canvas', indent: 16,
-        fg: isFlow ? '#e35ff2' : '#8b96b8',
-        tickC: isFlow ? '#e35ff2' : '#39445f',
-        line: isFlow ? '#e35ff2' : 'transparent',
-        bg: isFlow ? 'rgba(227,95,242,0.07)' : 'transparent',
-      },
-      // The dashboard's rail minus the tabs that now live only on the map.
-      ...v.navItems.filter((item) => !MAP_ONLY_PAGES.has(PAGE_FOR_LABEL[item.label])).map((item) => {
-        const key = PAGE_FOR_LABEL[item.label];
-        if (!key) return item;
-        const active = page === key;
-        return {
-          ...item,
-          disabled: false, hint: '',
-          go: () => this.setState({ page: key }),
-          fg: active ? '#e35ff2' : '#8b96b8',
-          tickC: active ? '#e35ff2' : '#39445f',
-          line: active ? '#e35ff2' : 'transparent',
-          bg: active ? 'rgba(227,95,242,0.07)' : 'transparent',
-        };
-      }),
-      ...Object.entries(OPS_PAGES).map(([k, label], i) => ({
-        label: i === 0 ? 'SERVER' : label,
-        child: i > 0, disabled: false,
-        go: () => this.setState({ page: k }),
-        hint: '', indent: i > 0 ? 30 : 16,
-        fg: page === k ? '#e35ff2' : '#8b96b8',
-        tickC: page === k ? '#e35ff2' : '#39445f',
-        line: page === k ? '#e35ff2' : 'transparent',
-        bg: page === k ? 'rgba(227,95,242,0.07)' : 'transparent',
-      })),
+      { ...railItem(FLOW_PAGE, 'DATA FLOW', false), hint: 'every panel, file and provider on one canvas' },
+      { ...railItem('smart', 'SMART WALLETS', false), hint: 'the wallets the backtest learned to follow' },
+      ...MIRROR_PAGES.map((k) => railItem(k, MIRROR_LABELS[k] || k.toUpperCase(), false)),
+      ...Object.entries(OPS_PAGES).map(([k, label], i) => railItem(k, label, i > 0)),
     ];
 
     const selected = this.selectedAsset();
@@ -486,7 +458,7 @@ export default class AdminPanel extends App {
             position: isFlow ? 'relative' : 'static',
             padding: isFlow ? 0 : '14px 16px 40px',
           }}>
-            {v.serverError && !isOps && !isFlow && (
+            {v.serverError && !isOps && !isFlow && !isSmart && (
               <div style={{
                 background: C.panel, border: `1px solid ${C.hot}`, borderRadius: 10,
                 padding: '12px 14px', marginBottom: 14, fontSize: 11, color: C.hot, lineHeight: 1.6,
@@ -497,7 +469,9 @@ export default class AdminPanel extends App {
               </div>
             )}
 
-            {isFlow ? (
+            {isSmart ? (
+              <SmartWallets />
+            ) : isFlow ? (
               <MapBoundary>
                 <FlowChart v={v} />
               </MapBoundary>
@@ -513,7 +487,7 @@ export default class AdminPanel extends App {
               />
             )}
 
-            {!isOps && !isFlow && (
+            {!isOps && !isFlow && !isSmart && (
               <div style={{ fontSize: 9, color: C.grey, marginTop: 18, lineHeight: 1.7, maxWidth: 900 }}>
                 Read-only. Every value above is read out of the same renderVals() object the
                 dashboard renders, so this page cannot show a different number than the tab it

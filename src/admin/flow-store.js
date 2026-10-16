@@ -17,15 +17,35 @@
  */
 
 import { storeOrigin } from '../services/storage/raw-store';
+import { ENGINES } from '../flow/score-flow.js';
 
 export const DEFAULT_FLOW = 'default';
+
+/**
+ * ENGINE PROFILES - one built-in flow per engine (flow/score-flow.js ENGINES).
+ * A profile is a flow like a user's - its changes are saved the same way -
+ * that starts with its `engine` set: that engine's call becomes SIGNAL, the
+ * map draws SIGNAL fed by that engine alone, and the app's board, alerts and
+ * trail follow it. Switching profiles is switching the strategy the app runs.
+ */
+// Read lazily: the model imports this file (through flow/params.js), so at
+// load time ENGINES may not exist yet.
+let profiles = null;
+export const engineProfiles = () => {
+  if (!profiles) {
+    try { profiles = ENGINES.map((e) => ({ id: 'engine-' + e.key, name: e.label, engine: e.key, blurb: e.blurb, chain: e.chain || null })); } catch (e) { return []; }
+  }
+  return profiles.slice();
+};
+const profileOf = (id) => engineProfiles().find((p) => p.id === id) || null;
+export const isEngineProfile = (id) => Boolean(profileOf(id));
 const LS_ACTIVE = 'vs.admin.flow.active';
 const LS_USERS = 'vs.admin.flow.users';
 const LS_DOC = (id) => 'vs.admin.flow.doc.' + id;
 
 const emptyCfg = () => ({ engines: {}, assign: {}, renamed: {}, removed: {}, sketch: [] });
 const blank = (id, name) => ({
-  id, name, version: 1, createdAt: Date.now(), updatedAt: Date.now(),
+  id, name, version: 1, engine: profileOf(id) ? profileOf(id).engine : null, createdAt: Date.now(), updatedAt: Date.now(),
   arrangement: null, cfg: emptyCfg(), settings: {}, positions: {},
 });
 
@@ -47,13 +67,15 @@ const emit = () => listeners.forEach((fn) => fn());
 
 export const subscribeFlows = (fn) => { listeners.add(fn); return () => listeners.delete(fn); };
 export const flowUsers = () => state.users.slice();
-export const activeFlowId = () => (state.active === DEFAULT_FLOW || state.users.some((u) => u.id === state.active) ? state.active : DEFAULT_FLOW);
+export const activeFlowId = () => (state.active === DEFAULT_FLOW || profileOf(state.active) || state.users.some((u) => u.id === state.active) ? state.active : DEFAULT_FLOW);
 export const serverState = () => state.server;
 
 function docOf(id) {
   if (!state.docs[id]) {
-    const u = state.users.find((x) => x.id === id);
+    const u = state.users.find((x) => x.id === id) || profileOf(id);
     state.docs[id] = { ...blank(id, u ? u.name : id), ...(read(LS_DOC(id), null) || {}) };
+    // A profile's engine is what makes it that profile: never lost to an old copy.
+    if (profileOf(id)) state.docs[id].engine = profileOf(id).engine;
   }
   return state.docs[id];
 }
@@ -95,7 +117,7 @@ async function pullUsers() {
     state.server = 'ok';
     const known = new Map(state.users.map((u) => [u.id, u]));
     (out.flows || []).forEach((f) => { if (!known.has(f.id)) known.set(f.id, { id: f.id, name: f.name }); });
-    state.users = Array.from(known.values());
+    state.users = Array.from(known.values()).filter((u) => !profileOf(u.id));
     write(LS_USERS, state.users);
     emit();
   } catch (e) {
@@ -116,6 +138,7 @@ async function pullDoc(id) {
     // local one when this browser edited while the server was off.
     if (remote && (remote.updatedAt || 0) > (local.updatedAt || 0)) {
       state.docs[id] = { ...blank(id, remote.name || id), ...remote };
+      if (profileOf(id)) state.docs[id].engine = profileOf(id).engine;
       write(LS_DOC(id), state.docs[id]);
       emit();
     } else if ((local.updatedAt || 0) > (remote.updatedAt || 0)) {
@@ -139,10 +162,11 @@ export function addUser(name) {
   const clean = String(name || '').trim().slice(0, 40);
   if (!clean) return null;
   let id = clean.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'user';
-  while (id === DEFAULT_FLOW || state.users.some((u) => u.id === id)) id += '-2';
+  while (id === DEFAULT_FLOW || profileOf(id) || state.users.some((u) => u.id === id)) id += '-2';
   state.users = state.users.concat([{ id, name: clean }]);
   write(LS_USERS, state.users);
-  const doc = blank(id, clean);
+  // A new user starts on the engine of the flow they were looking at.
+  const doc = { ...blank(id, clean), engine: activeFlow().engine || null };
   state.docs[id] = doc;
   write(LS_DOC(id), doc);
   pushToServer(doc);

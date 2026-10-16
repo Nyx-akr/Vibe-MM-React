@@ -1,15 +1,12 @@
 import React from 'react';
 
 /**
- * Vertical tab rail. Moved out of the header so the top bar carries only
- * status, and the tab list has room to breathe.
+ * The admin panel's vertical rail: DATA FLOW, the mirrored dashboard pages
+ * and the server pages, with a way back to the dashboard at the foot. (The
+ * dashboard itself navigates from its top bar.)
  *
- * One flat list, no group headers. DETAIL, SOCIAL and WALLETS are indented
- * under LIVE OPPORTUNITIES because that is where their token gets picked; the
- * indent carries that relationship on its own.
- *
- * Those three go dim when nothing is selected - they lead to the "pick an
- * asset" prompt until one is.
+ * Child items are indented under their parent with a tick; the indent carries
+ * the relationship on its own, so there are no group headers.
  */
 export default function SideNav({ v }) {
   // The rail scrolls, so a tooltip parented inside it would be clipped at the
@@ -77,8 +74,7 @@ export default function SideNav({ v }) {
 
       <div style={{ flex: 1 }} />
 
-      <a className="h3eb549cf" href="Architecture Handoff.dc.html" style={link}>DOCS ↗</a>
-      <a className="h3eb549cf" href="/admin" style={link}>ADMIN ↗</a>
+      <a className="h3eb549cf" href="/" style={link}>← DASHBOARD</a>
     </div>
   );
 }

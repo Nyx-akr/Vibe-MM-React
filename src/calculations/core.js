@@ -479,6 +479,9 @@ export function buildWalletSets(tradePools) {
       firstTradeAt: times.length ? Math.min(...times) : null,
       lastTradeAt: times.length ? Math.max(...times) : null,
       stats: tradeStatsFrom(entry.trades || []),
+      // The tape itself, for anything that needs WHEN a wallet traded - the
+      // smart-money count (phase.js smartFlow) reads the last hour of it.
+      trades: entry.trades || [],
     });
   });
   return sets;

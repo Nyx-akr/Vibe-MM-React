@@ -28,12 +28,12 @@ export const DASHBOARD = [
     tab: 'HEADER',
     panels: [
       { panel: 'TOP BAR', items: [
-        { label: 'MARKET REGIME', display: 'text', from: [pipe('MARKET REGIME')] },
+        { label: 'ENGINE PICKER', display: 'list', from: [pipe('SIGNAL'), pipe('ENGINE GRADING')] },
         { label: 'ALERTS NOW', display: 'number', from: [pipe('ALERTS NOW')] },
-        { label: 'TOKEN PICKER', display: 'list', from: [pipe('TOKEN LIST'), pipe('FINAL')] },
+        { label: 'TOKEN PICKER', display: 'list', from: [pipe('TOKEN LIST'), pipe('SIGNAL')] },
       ] },
       { panel: 'FILTERS', items: [
-        { label: 'STAGES BAR', display: 'chart', from: [pipe('STAGE COUNTS')] },
+        { label: 'SIGNALS FILTER', display: 'list', from: [pipe('BOARD COUNTS')] },
       ] },
       { panel: 'ALERT FEED', items: [
         { label: 'LIVE TAPE', display: 'list', from: [pipe('ALERT ENGINE')] },
@@ -45,15 +45,16 @@ export const DASHBOARD = [
     tab: 'LIVE OPPORTUNITIES',
     panels: [
       { panel: 'HEADER STATS', items: [
-        { label: 'TOKENS TRACKED', display: 'number', from: [pipe('TOKENS TRACKED')], show: ['live', 'TOKENS TRACKED'] },
-        { label: 'AVG ORGANIC SCORE', display: 'number', from: [pipe('AVG ORGANIC SCORE')], show: ['live', 'AVG ORGANIC SCORE'] },
+        { label: 'TOKENS TRACKED', display: 'number', from: [pipe('TOKENS TRACKED'), pipe('BOARD COUNTS')], show: ['live', 'TOKENS TRACKED'] },
+        { label: 'AVG ORGANIC SCORE', display: 'number', from: [pipe('AVG ORGANIC SCORE'), pipe('ORGANIC GRADES')], show: ['live', 'AVG ORGANIC SCORE'] },
         { label: 'TOP 20 HIT RATE', display: 'number', from: [pipe('TOP 20 HIT RATE')], show: ['live', 'TOP 20 HIT RATE'] },
       ] },
       { panel: 'BOARD', items: [
         { label: 'ASSET', display: 'text', from: [pipe('TOKEN LIST')] },
-        { label: 'STAGE', display: 'text', from: [pipe('STAGE')], show: ['live', 'STAGE'] },
-        { label: 'SCORE', display: 'number', from: [pipe('FINAL')], show: ['live', 'SCORE'] },
-        { label: 'CONF', display: 'number', from: [pipe('COVERAGE')], show: ['live', 'CONF'] },
+        // The call, where the stage and score used to be (calculations/phase.js).
+        { label: 'PHASE', display: 'text', from: [pipe('PHASE')] },
+        { label: 'SIGNAL', display: 'text', from: [pipe('SIGNAL')] },
+        { label: 'CONF', display: 'number', from: [pipe('EARLY RAW')], show: ['live', 'CONF'] },
         { label: 'PRICE', display: 'number', from: [market('PRICE, 2 SOURCES')], show: ['live', 'PRICE'] },
         { label: 'DELTA 5M', display: 'number', from: [market('PRICE CHANGE 5M')], show: ['live', 'DELTA 5M'] },
         { label: 'LIQUIDITY', display: 'number', from: [market('LIQUIDITY')], show: ['live', 'LIQUIDITY'] },
@@ -63,6 +64,33 @@ export const DASHBOARD = [
         { label: 'BUYERS', display: 'number', from: [market('BUYERS 24H')], show: ['live', 'BUYERS'] },
         { label: 'AGE', display: 'number', from: [pipe('SURVIVAL')], show: ['live', 'AGE'] },
         { label: 'TREND', display: 'chart', from: [api('/raw/<chain>/history.json', 'VOLUME 5M HISTORY')], show: ['live', 'TREND (sparkline)'] },
+      ] },
+      // The landing page under the chart: the three things a call rests on.
+      { panel: 'DETAIL', items: [
+        { label: 'SIGNAL', display: 'text', from: [pipe('SIGNAL')] },
+        { label: 'PHASE TRACK', display: 'chart', from: [pipe('PHASE')] },
+        { label: 'WARNINGS', display: 'list', from: [pipe('RISK FLAGS')] },
+      ] },
+      { panel: 'CYCLE', items: [
+        { label: 'ABOVE 6H LOW', display: 'number', from: [pipe('ABOVE 6H LOW')] },
+        { label: 'FROM 6H HIGH', display: 'number', from: [pipe('BELOW 6H HIGH')] },
+        { label: 'LAST HOUR RANGE', display: 'number', from: [pipe('RANGE 1H')] },
+        { label: 'VOLUME 15M vs 1H', display: 'number', from: [pipe('VOLUME 15M vs 1H')] },
+        { label: 'BUYERS 1H vs 6H', display: 'number', from: [pipe('BUYERS 1H vs 6H')] },
+      ] },
+      { panel: 'TRADE PLAN', items: [
+        { label: 'ENTRY · TARGET · STOP', display: 'text', from: [pipe('TRADE PLAN')] },
+        { label: 'SIGNAL GRADE', display: 'text', from: [pipe('SIGNAL'), pipe('SCORE EVALUATION')] },
+        { label: 'WHAT MOVES THE ENTRY', display: 'chart', from: [pipe('EARLY RAW')] },
+      ] },
+      { panel: 'SAFETY & FLOW', items: [
+        { label: 'SAFETY GATES', display: 'list', from: [pipe('VETO LOG')] },
+        { label: 'SMART BUYERS 1H', display: 'number', from: [pipe('SMART BUYERS 1H')] },
+        { label: 'SMART SELLERS 1H', display: 'number', from: [pipe('SMART SELLERS 1H')] },
+        { label: 'NET FLOW', display: 'number', from: [pipe('NET FLOW RATIO')] },
+        { label: '$10K IMPACT', display: 'number', from: [pipe('PRICE IMPACT $10K')] },
+        { label: 'ORGANIC FLOW', display: 'number', from: [pipe('Organic flow')] },
+        { label: 'WALLET QUALITY', display: 'number', from: [pipe('Wallet quality')] },
       ] },
       { panel: 'DAILY PICK', items: [
         { label: 'DAILY PICK', display: 'text', from: [pipe('DAILY PICK')] },
@@ -76,13 +104,13 @@ export const DASHBOARD = [
     tab: 'TOKEN DETAIL',
     panels: [
       { panel: 'SCORE', items: [
-        { label: 'SCORE GAUGE', display: 'chart', from: [pipe('FINAL')], show: ['detail', 'FINAL'] },
-        { label: 'STAGE', display: 'text', from: [pipe('STAGE')] },
-        { label: 'SCORE SPARKLINE', display: 'chart', from: [pipe('RIGHT NOW, 15 MIN MEAN')] },
+        { label: 'SIGNAL', display: 'text', from: [pipe('SIGNAL')], show: ['detail', 'SIGNAL'] },
+        { label: 'CYCLE GAUGE', display: 'chart', from: [pipe('PHASE'), pipe('SIGNAL')], show: ['detail', 'PHASE'] },
+        { label: 'EARLY', display: 'number', from: [pipe('EARLY SCORE')], show: ['detail', 'EARLY'] },
       ] },
-      { panel: 'PRICE & SCORE', items: [
+      { panel: 'PRICE & EARLY', items: [
         { label: 'CANDLES', display: 'chart', from: [api('/raw/<chain>/bars15/<pool>.json')], show: ['detail', 'CANDLES'] },
-        { label: 'SCORE LINES', display: 'chart', from: [store('idb:trails')], show: ['detail', 'SCORE LINES'] },
+        { label: 'EARLY LINES', display: 'chart', from: [store('idb:trails')], show: ['detail', 'EARLY LINES'] },
       ] },
       { panel: 'MARKET', items: [
         { label: 'PRICE', display: 'number', from: [market('PRICE, 2 SOURCES')] },
@@ -96,21 +124,21 @@ export const DASHBOARD = [
         { label: 'DELTA 5M', display: 'number', from: [market('PRICE CHANGE 5M')] },
         { label: 'POOL AGE', display: 'number', from: [pipe('SURVIVAL')] },
       ] },
-      { panel: 'WHAT MOVES THIS SCORE', items: [
-        { label: 'POINTS PER COMPONENT', display: 'chart', from: [pipe('WHAT MOVES THIS SCORE')] },
+      { panel: 'WHAT MOVES EARLY', items: [
+        { label: 'POINTS PER INPUT', display: 'chart', from: [pipe('WHAT MOVES EARLY')] },
       ] },
-      { panel: 'SCORE DECOMPOSITION', items: [
-        { label: 'COMPONENT BARS', display: 'chart', from: [pipe('RAW')] },
-        { label: 'RAW', display: 'number', from: [pipe('RAW')], show: ['detail', 'RAW'] },
-        { label: 'RISK PENALTY', display: 'number', from: [pipe('RISK PENALTY')], show: ['detail', 'RISK PENALTY'] },
-        { label: 'FINAL', display: 'number', from: [pipe('FINAL')], show: ['detail', 'FINAL'] },
-        { label: 'CONFIDENCE', display: 'number', from: [pipe('Data quality')], show: ['detail', 'CONFIDENCE'] },
+      { panel: 'EARLY INPUTS', items: [
+        { label: 'INPUT BARS', display: 'chart', from: [pipe('EARLY RAW')] },
+        { label: 'EARLY RAW', display: 'number', from: [pipe('EARLY RAW')], show: ['detail', 'EARLY RAW'] },
+        { label: 'SAFETY', display: 'text', from: [pipe('VETO LOG')], show: ['detail', 'SAFETY'] },
+        { label: 'EARLY', display: 'number', from: [pipe('EARLY SCORE')], show: ['detail', 'EARLY'] },
       ] },
       { panel: 'RISK FLAGS', items: [
         { label: 'RISK FLAGS', display: 'list', from: [pipe('RISK FLAGS')] },
       ] },
-      { panel: 'PERP LISTING', items: [
-        { label: 'LISTING VERDICT', display: 'list', from: [pipe('VETO LOG'), pipe('Whitespace'), pipe('Durability'), pipe('Reachability')] },
+      { panel: 'TRADE PLAN · SAFETY', items: [
+        { label: 'TRADE PLAN', display: 'text', from: [pipe('TRADE PLAN')], show: ['detail', 'TRADE PLAN'] },
+        { label: 'SAFETY GATES', display: 'list', from: [pipe('VETO LOG')] },
       ] },
       { panel: 'OUTCOME TRACKING', items: [
         { label: 'FORWARD RETURNS', display: 'list', from: [pipe('FORWARD RETURNS')], show: ['detail', 'FORWARD RETURNS'] },
@@ -121,27 +149,27 @@ export const DASHBOARD = [
     tab: 'WALLETS',
     panels: [
       { panel: 'WALLET STATS', items: [
-        { label: 'ACTIVE WALLETS', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'ACTIVE WALLETS'] },
-        { label: 'NET FLOW', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'NET FLOW'] },
-        { label: 'BUYERS / SELLERS', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'BUYERS / SELLERS'] },
-        { label: 'TOP WALLET SHARE', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'TOP WALLET SHARE'] },
-        { label: 'CO-ENTRY WALLETS', display: 'number', from: [pipe('WALLET INTEL')], show: ['wallets', 'CO-ENTRY WALLETS'] },
+        { label: 'ACTIVE WALLETS', display: 'number', from: [pipe('ACTIVE WALLETS')], show: ['wallets', 'ACTIVE WALLETS'] },
+        { label: 'NET FLOW', display: 'number', from: [pipe('WALLET NET FLOW')], show: ['wallets', 'NET FLOW'] },
+        { label: 'BUYERS / SELLERS', display: 'number', from: [pipe('BUYER WALLETS'), pipe('SELLER WALLETS')], show: ['wallets', 'BUYERS / SELLERS'] },
+        { label: 'TOP WALLET SHARE', display: 'number', from: [pipe('TOP WALLET SHARE')], show: ['wallets', 'TOP WALLET SHARE'] },
+        { label: 'CO-ENTRY WALLETS', display: 'number', from: [pipe('CO-ENTRY WALLETS')], show: ['wallets', 'CO-ENTRY WALLETS'] },
       ] },
       { panel: 'WALLET GROUPS', items: [
-        { label: 'ACCUMULATING / EXITING / CHURN / ROTATING / CO-ENTRY', display: 'list', from: [pipe('WALLET INTEL')] },
-        { label: 'CO-ORDINATED ENTRY', display: 'list', from: [pipe('WALLET INTEL')] },
+        { label: 'ACCUMULATING / EXITING / CHURN / ROTATING / CO-ENTRY', display: 'list', from: [pipe('WALLET GROUPS'), pipe('WALLET HISTORY')] },
+        { label: 'CO-ORDINATED ENTRY', display: 'list', from: [pipe('TOKEN WALLETS'), pipe('CLUSTERS ELSEWHERE')] },
       ] },
       { panel: 'YOUR TRACKED WALLETS', items: [
-        { label: 'TRACKED WALLETS', display: 'list', from: [pipe('WALLET INTEL')] },
+        { label: 'TRACKED WALLETS', display: 'list', from: [pipe('TRACKED HERE')] },
       ] },
       { panel: 'WALLET MAP', items: [
-        { label: 'BUBBLE MAP', display: 'chart', from: [pipe('WALLET INTEL')] },
+        { label: 'BUBBLE MAP', display: 'chart', from: [pipe('WALLET RANKS'), pipe('TOKEN WALLETS')] },
       ] },
       { panel: 'WALLET QUALITY', items: [
         { label: 'WALLET QUALITY', display: 'number', from: [pipe('Wallet quality')] },
       ] },
       { panel: 'TURNOVER WITH OTHER TOKENS', items: [
-        { label: 'ALSO TRADING', display: 'list', from: [pipe('ROTATION SERVICE')] },
+        { label: 'ALSO TRADING', display: 'list', from: [pipe('TOKEN ROTATION')] },
       ] },
     ],
   },
@@ -172,11 +200,11 @@ export const DASHBOARD = [
     tab: 'ROTATION',
     panels: [
       { panel: 'NET ROTATION', items: [
-        { label: 'NET ROTATION', display: 'number', from: [pipe('ROTATION SERVICE')] },
-        { label: 'CONNECTED POOLS', display: 'list', from: [pipe('ROTATION SERVICE')] },
+        { label: 'NET ROTATION', display: 'number', from: [pipe('TOKEN ROTATION')] },
+        { label: 'CONNECTED POOLS', display: 'list', from: [pipe('TOKEN ROTATION')] },
       ] },
       { panel: 'ROTATION PATHS', items: [
-        { label: 'ROTATION PATHS', display: 'chart', from: [pipe('ROTATION SERVICE')] },
+        { label: 'ROTATION PATHS', display: 'chart', from: [pipe('TOKEN ROTATION'), pipe('CHAIN ROTATION')] },
       ] },
     ],
   },
@@ -184,12 +212,12 @@ export const DASHBOARD = [
     tab: 'MARKET ROTATION',
     panels: [
       { panel: 'MEASURED ROTATION', items: [
-        { label: 'RIBBONS', display: 'chart', from: [pipe('ROTATION SERVICE')] },
-        { label: 'POOLS SAMPLED', display: 'number', from: [pipe('ROTATION SERVICE')] },
+        { label: 'RIBBONS', display: 'chart', from: [pipe('MARKET ROTATION')] },
+        { label: 'POOLS SAMPLED', display: 'number', from: [pipe('MARKET ROTATION')] },
       ] },
       { panel: 'NET GAINERS / LOSERS', items: [
-        { label: 'NET GAINERS', display: 'list', from: [pipe('ROTATION SERVICE')] },
-        { label: 'NET LOSERS', display: 'list', from: [pipe('ROTATION SERVICE')] },
+        { label: 'NET GAINERS', display: 'list', from: [pipe('MARKET ROTATION')] },
+        { label: 'NET LOSERS', display: 'list', from: [pipe('MARKET ROTATION')] },
       ] },
     ],
   },

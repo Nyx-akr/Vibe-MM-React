@@ -1,5 +1,5 @@
 /**
- * Step 6 of the score pipeline: SHOWN ON THE DASHBOARD.
+ * Step 6 of the model: SHOWN ON THE DASHBOARD.
  *
  * Every panel of the token-facing tabs - LIVE OPPORTUNITIES, ASSET DETAIL,
  * WALLETS, SOCIAL SCANNER, ROTATION - and what each number on it is read
@@ -15,7 +15,6 @@
  */
 
 import { op, num, ref, ext, api, tile, sampleRow, fromCatalog } from './provenance';
-import { TOTAL_WEIGHT } from '../calculations/asset-detail.js';
 
 export const SHOWN_PAGES = {
 
@@ -40,24 +39,6 @@ export const SHOWN_PAGES = {
             where: 'App.jsx renderVals() <- syncLiveData()',
           },
           {
-            label: 'CONFIRMED+', status: 'live',
-            value: (v) => tile(v.stats, 'CONFIRMED+'),
-            calc: [op('count('), ref('live', 'STAGE'), op('=== CONFIRMED )'), op('+'),
-              op('count('), ref('live', 'STAGE'), op('=== EXCEPTIONAL )')],
-            feeds: [ref('live', 'EXCEPTIONAL', 'EXCEPTIONAL (a subset)'),
-              ref('eval', 'OUTCOMES BY STAGE')],
-            where: 'App.jsx renderVals(), counts[]',
-          },
-          {
-            label: 'EXCEPTIONAL', status: 'live',
-            value: (v) => tile(v.stats, 'EXCEPTIONAL'),
-            calc: [op('count('), ref('live', 'STAGE'), op('=== EXCEPTIONAL ), i.e.'),
-              ref('pipe', 'FINAL'), op('>='), num(85)],
-            feeds: [ref('live', 'CONFIRMED+', 'CONFIRMED+ (includes it)'),
-              ref('alerts', 'OPPORTUNITY')],
-            where: 'App.jsx renderVals(), counts[]',
-          },
-          {
             label: 'AVG ORGANIC SCORE', status: 'live',
             value: (v) => tile(v.stats, 'AVG ORGANIC SCORE'),
             calc: [op('sum('), ref('pipe', 'Organic flow'), op('x max( coverage,'), num(25),
@@ -67,7 +48,7 @@ export const SHOWN_PAGES = {
               'separately in the subline: its number is a different quantity over a ' +
               'different window, and it only covers Solana.',
             feeds: [],
-            where: 'App.jsx renderVals(), organicReads',
+            where: 'flow/board-flow.js AVG ORGANIC SCORE, ORGANIC GRADES',
           },
           {
             // Measured since 2026-09-25. It was a hard-coded em dash captioned
@@ -88,7 +69,7 @@ export const SHOWN_PAGES = {
               'actually used: it walks 24h down to shorter ones and upgrades itself once a ' +
               'continuous day of uptime exists.',
             feeds: [ref('eval', 'VERDICT', 'the same question, measured differently')],
-            where: 'App.jsx precisionTile() <- calculations/core.js precisionAtK()',
+            where: 'App.jsx precisionTile() <- flow/board-flow.js TOP 20 HIT RATE (precisionAtK)',
           },
         ],
       },
@@ -98,27 +79,29 @@ export const SHOWN_PAGES = {
         perRow: true,
         fields: [
           {
-            label: 'SCORE', status: 'live',
+            label: 'SIGNAL', status: 'live',
+            value: (v) => (sampleRow(v) || {}).signal,
+            calc: [ref('pipe', 'SIGNAL'), op('- the call, shown as computed')],
+            note: 'BUY · SELL · SHORT · AVOID · WATCH. The board sorts by it (BUY first), with EARLY ' +
+              'breaking ties inside each signal. Every call goes to the journal and is graded in Evaluation.',
+            feeds: [ref('live', 'PHASE'), ref('alerts', 'OPPORTUNITY'), ref('eval', 'OUTCOMES BY STAGE', 'the journal of calls')],
+            where: 'flow/score-flow.js SIGNAL → services/api.js mapServerRowToAsset()',
+          },
+          {
+            label: 'EARLY', status: 'live',
             value: (v) => (sampleRow(v) || {}).score,
-            calc: [ref('pipe', 'FINAL'), op('- the settled score, shown as computed')],
-            note: 'The SETTLED score, not the momentary one. Its biggest inputs are 5-minute ' +
-              'windows that shift every poll, so ranking the board on the instantaneous value ' +
-              'made it reshuffle constantly. The momentary number is on the detail page as ' +
-              'RIGHT NOW. A ring beside this means it was scored before contract, holder and ' +
-              'routed-impact data landed - scoreBasis "market" rather than "intel".',
-            feeds: [ref('live', 'STAGE'), ref('live', 'CONFIRMED+'), ref('alerts', 'OPPORTUNITY'),
-              ref('eval', 'OUTCOMES BY STAGE', 'the score journal')],
-            where: 'calculations/asset-detail.js evaluateAsset()',
+            calc: [ref('pipe', 'EARLY SCORE')],
+            note: 'The entry score, 0-100: has it started to move without having run yet. 0 when a safety gate failed.',
+            feeds: [ref('live', 'SIGNAL', 'the BUY bar')],
+            where: 'flow/score-flow.js EARLY SCORE',
           },
           {
             label: 'CONF', status: 'live',
             value: (v) => (sampleRow(v) || {}).conf,
-            calc: [ref('pipe', 'COVERAGE'), op('as a fraction')],
-            note: 'Measured against the ACTUAL total weight in SCORE_MODEL (' + TOTAL_WEIGHT + '), not ' +
-              'a hard-coded 100 - dividing by 100 is what once reported a confidence of 1.04 on a ' +
-              'fully resolved token.',
+            calc: [op('EARLY inputs that resolved ÷'), num(7)],
+            note: 'How much of EARLY could be measured. Under four inputs there is no EARLY at all.',
             feeds: [],
-            where: 'calculations/asset-detail.js, dataQuality',
+            where: 'services/api.js mapServerRowToAsset(), inputsPresent',
           },
           {
             label: 'PRICE', status: 'live',
@@ -184,14 +167,12 @@ export const SHOWN_PAGES = {
             where: 'services/api.js mapServerRowToAsset()',
           },
           {
-            label: 'STAGE', status: 'live',
-            value: (v) => (sampleRow(v) || {}).stage,
-            calc: [ref('pipe', 'STAGE'), op('as computed')],
-            note: 'Hysteresis comes from the stage machine, rehydrated from the browser history ' +
-              'store on load, so a score hovering on a band edge does not flicker.',
-            feeds: [ref('live', 'CONFIRMED+'), ref('live', 'EXCEPTIONAL'),
-              ref('eval', 'OUTCOMES BY STAGE')],
-            where: 'calculations/asset-detail.js, hydrateStages()',
+            label: 'PHASE', status: 'live',
+            value: (v) => (sampleRow(v) || {}).phase,
+            calc: [ref('pipe', 'PHASE'), op('as computed')],
+            note: 'Where the token is in its attention cycle: QUIET · WAKING · RUNNING · PEAKING · FADING.',
+            feeds: [ref('live', 'SIGNAL')],
+            where: 'flow/score-flow.js PHASE',
           },
           {
             label: 'AGE', status: 'live',
@@ -218,56 +199,57 @@ export const SHOWN_PAGES = {
   /* ------------------------------------------------------ ASSET DETAIL -- */
   detail: {
     title: 'ASSET DETAIL',
-    blurb: 'One token, fully decomposed. This page does not score - it renders the ' +
-      'one score the board already computed, so the two can never disagree.',
+    blurb: 'One token, fully decomposed. This page does not compute anything - it renders ' +
+      'the call the model already made, so the two can never disagree.',
     groups: [
       {
-        group: 'THE SCORE',
+        group: 'THE CALL',
         fields: [
           {
-            label: 'FINAL', status: 'live',
+            label: 'SIGNAL', status: 'live',
+            value: (v) => v.d && v.d.signal,
+            calc: [ref('pipe', 'SIGNAL'), op('- rendered from the board’s own evaluation, never recomputed')],
+            note: 'The headline: what to do. Its reason is printed beside it.',
+            feeds: [ref('live', 'SIGNAL'), ref('eval', 'OUTCOMES BY STAGE', 'the journal of calls')],
+            where: 'flow/score-flow.js SIGNAL',
+          },
+          {
+            label: 'PHASE', status: 'live',
+            value: (v) => v.d && v.d.phase,
+            calc: [ref('pipe', 'PHASE')],
+            note: 'The cycle gauge across the top of the page lights this step.',
+            feeds: [ref('detail', 'SIGNAL')],
+            where: 'flow/score-flow.js PHASE',
+          },
+          {
+            label: 'EARLY', status: 'live',
             value: (v) => v.d && v.d.score,
-            calc: [ref('pipe', 'FINAL'), op('- rendered from the board’s own evaluation, never rescored')],
-            note: 'The headline everywhere, and what the STAGE follows - so the badge can ' +
-              'never disagree with the number beside it.',
-            feeds: [ref('live', 'STAGE'), ref('live', 'SCORE'),
-              ref('eval', 'OUTCOMES BY STAGE', 'the score journal')],
-            where: 'calculations/asset-detail.js settledScore()',
+            calc: [ref('pipe', 'EARLY SCORE')],
+            feeds: [ref('detail', 'SIGNAL', 'the BUY bar')],
+            where: 'flow/score-flow.js EARLY SCORE',
           },
           {
-            label: 'RIGHT NOW', status: 'live',
-            value: (v) => v.d && v.d.scoreNow,
-            calc: [ref('pipe', 'RIGHT NOW')],
-            note: 'This poll on its own. Kept visible because the gap between it and FINAL is ' +
-              'how volatile the token is right now: wide means it is still moving, "settled" means ' +
-              'the window agrees with the instant.',
-            feeds: [ref('detail', 'FINAL', 'one reading of the average')],
-            where: 'calculations/asset-detail.js scoreAsset()',
-          },
-          {
-            label: 'RAW', status: 'live',
+            label: 'EARLY RAW', status: 'live',
             value: (v) => v.d && v.d.raw,
-            calc: [ref('pipe', 'RAW')],
-            note: 'Dividing by the weights that RESOLVED, not by 100, is what stops a missing ' +
-              'provider from dragging the score down.',
-            feeds: [ref('detail', 'FINAL')],
-            where: 'evaluateAsset()',
+            calc: [ref('pipe', 'EARLY RAW')],
+            note: 'Dividing by the weights that RESOLVED is what stops a missing input dragging EARLY down.',
+            feeds: [ref('detail', 'EARLY')],
+            where: 'flow/score-flow.js EARLY RAW',
           },
           {
-            label: 'RISK PENALTY', status: 'live',
-            value: (v) => v.d && v.d.penalty,
-            calc: [ref('pipe', 'RISK PENALTY')],
-            feeds: [ref('detail', 'FINAL')],
-            where: 'evaluateAsset()',
+            label: 'SAFETY', status: 'live',
+            value: (v) => v.d && v.d.safetyVerdict,
+            calc: [ref('pipe', 'VETO LOG')],
+            feeds: [ref('detail', 'EARLY'), ref('detail', 'SIGNAL')],
+            where: 'flow/score-flow.js GATES',
           },
           {
-            label: 'CONFIDENCE', status: 'live',
-            value: (v) => v.d && v.d.conf,
-            calc: [ref('pipe', 'Data quality', 'components measured'), op('/'), num(11)],
-            note: 'The model has twelve components plus two modifiers, so a fully resolved ' +
-              'token reads above 1.00. The divisor and the model have drifted apart.',
-            feeds: [ref('live', 'CONF')],
-            where: 'evaluateAsset(), dataQuality',
+            label: 'TRADE PLAN', status: 'live',
+            value: (v) => { const p = v.d && v.d.plan; return p ? p.side + ' · target ' + p.targetPct + '% · stop ' + p.stopPct + '% · ' + p.horizonHours + 'h' : null; },
+            calc: [ref('pipe', 'TRADE PLAN')],
+            note: 'The trade the signal is graded on.',
+            feeds: [ref('eval', 'VERDICT')],
+            where: 'flow/score-flow.js TRADE PLAN',
           },
           {
             label: 'SCORE BASIS', status: 'live',
@@ -275,7 +257,7 @@ export const SHOWN_PAGES = {
             calc: [op('"intel" once'), api('/raw/<chain>/intel.json'), op('has answered for this token, "feed" until then')],
             note: 'The enrichment loop fills two tokens per poll and caches for 45 minutes, so ' +
               'a fresh board climbs from "feed" to "intel" over a few minutes.',
-            feeds: [ref('live', 'SCORE', 'the ring beside the board SCORE')],
+            feeds: [],
             where: 'services/api.js, intelFor() / enrichInBackground()',
           },
         ],
@@ -302,8 +284,8 @@ export const SHOWN_PAGES = {
         }),
       },
       {
-        group: 'PRICE & SCORE',
-        note: 'Candles from the raw store; score lines from the browser-only score trail ' +
+        group: 'PRICE & EARLY',
+        note: 'Candles from the raw store; EARLY lines from the score trail ' +
           '(services/score-trail.js, its own IndexedDB database). The two share one time axis.',
         fields: [
           {
@@ -318,8 +300,8 @@ export const SHOWN_PAGES = {
             where: 'services/api.js fetchChartHistory()',
           },
           {
-            label: 'SCORE LINES', status: 'live',
-            value: () => 'avg score, this-poll score and each component, 0-100 left axis',
+            label: 'EARLY LINES', status: 'live',
+            value: () => 'EARLY, EARLY before safety, and each of its inputs, 0-100 left axis',
             calc: [op('one mark per token per minute from evaluateAsset(); hours older than a day ' +
               'thinned to one per 5 minutes; kept 14 days')],
             note: 'Only hours the app was open have marks, so a line can start later than the candles.',
@@ -329,9 +311,9 @@ export const SHOWN_PAGES = {
         ],
       },
       {
-        group: 'WHAT MOVES THIS SCORE',
-        note: 'Each resolved component as the POINTS it moved the score against a ' +
-          'neutral 50: (value - 50) x weight / weightUsed. These sum to (raw - 50), ' +
+        group: 'WHAT MOVES EARLY',
+        note: 'Each resolved EARLY input as the POINTS it moved EARLY against a ' +
+          'neutral 50: (value - 50) x weight / weightUsed. These sum to (EARLY RAW - 50), ' +
           'which is what lets the panel print its own arithmetic.',
         from: (v) => ((v.d && v.d.drivers) || []).map((r) => ({
           label: r.label,
@@ -351,15 +333,15 @@ export const SHOWN_PAGES = {
             status: 'live',
             value: () => f.text,
             calc: [ref('pipe', 'RISK FLAGS'), op('- one raised flag')],
-            feeds: [ref('detail', 'RISK PENALTY'), ref('alerts', 'RISK')],
-            where: 'calculations/alert-schema.js',
+            feeds: [ref('alerts', 'RISK')],
+            where: 'flow/board-flow.js ALERT ENGINE',
           }));
           return flags.length ? flags : [{
             label: 'RISK FLAGS', status: 'live',
             value: () => 'none triggered',
             calc: [ref('pipe', 'RISK FLAGS')],
-            feeds: [ref('detail', 'RISK PENALTY'), ref('alerts', 'RISK')],
-            where: 'calculations/alert-schema.js',
+            feeds: [ref('alerts', 'RISK')],
+            where: 'flow/board-flow.js ALERT ENGINE',
           }];
         },
       },
@@ -371,7 +353,7 @@ export const SHOWN_PAGES = {
           value: () => (c.ok ? 'PASS' : 'FAIL'),
           calc: [api('/raw/<chain>/intel.json', 'CONTRACT CHECKS'), op('- one of the checks')],
           evidence: c.detail || '',
-          feeds: [ref('detail', 'Contract safety'), ref('detail', 'FINAL')],
+          feeds: [ref('detail', 'SAFETY')],
           where: 'calculations/asset-detail.js deriveIntel(), contractSafety',
         })),
       },
@@ -416,7 +398,7 @@ export const SHOWN_PAGES = {
               'immediately instead of waiting a poll.',
             feeds: [ref('wallets', 'ACTIVE WALLETS'), ref('wallets', 'NET FLOW'),
               ref('wallets', 'WALLET QUALITY'), ref('rotation', 'NET ROTATION')],
-            where: 'tabs-modules/WALLETS.jsx walletsVals()',
+            where: 'flow/board-flow.js WALLET READ → tabs-modules/WALLETS.jsx walletsVals()',
           },
         ],
       },
@@ -430,7 +412,7 @@ export const SHOWN_PAGES = {
               op(', pool contract excluded')],
             feeds: [ref('wallets', 'TOP WALLET SHARE', 'TOP WALLET SHARE (denominator)'),
               ref('wallets', 'WALLET QUALITY')],
-            where: 'services/wallet-intel.js, window.wallets',
+            where: 'flow/board-flow.js ACTIVE WALLETS',
           },
           {
             label: 'NET FLOW', status: 'live',
@@ -438,7 +420,7 @@ export const SHOWN_PAGES = {
             calc: [op('sum( buyUsd )'), op('-'), op('sum( sellUsd ) across'),
               ref('wallets', 'ACTIVE WALLETS')],
             feeds: [ref('live', 'NET FLOW'), ref('detail', 'Net demand')],
-            where: 'services/wallet-intel.js, flow.netUsd',
+            where: 'flow/board-flow.js WALLET NET FLOW',
           },
           {
             label: 'BUYERS / SELLERS', status: 'live',
@@ -447,14 +429,14 @@ export const SHOWN_PAGES = {
             note: 'A wallet that did both counts on both sides - which is the point: ' +
               'round-tripping is what the organic read is looking for.',
             feeds: [ref('detail', 'Organic flow')],
-            where: 'services/wallet-intel.js, flow',
+            where: 'flow/board-flow.js BUYER WALLETS / SELLER WALLETS',
           },
           {
             label: 'TOP WALLET SHARE', status: 'live',
             value: (v) => tile(v.walletStats, 'TOP WALLET SHARE'),
             calc: [ref('wallets', 'WALLET INTEL'), op('largest wallet |USD| / total window volume x'), num(100)],
             feeds: [ref('wallets', 'WALLET QUALITY')],
-            where: 'services/wallet-intel.js, flow.topWalletSharePct',
+            where: 'flow/board-flow.js TOP WALLET SHARE',
           },
           {
             label: 'CO-ENTRY WALLETS', status: 'live',
@@ -462,7 +444,7 @@ export const SHOWN_PAGES = {
             calc: [op('wallets in a burst: arrivals vs this pool own arrival rate, then checked ' +
               'for a group exit, over'), ref('wallets', 'SAMPLE WINDOW')],
             feeds: [ref('wallets', 'WALLET QUALITY')],
-            where: 'services/wallet-intel.js, clusters',
+            where: 'flow/board-flow.js CO-ENTRY WALLETS',
           },
         ],
       },
@@ -492,7 +474,7 @@ export const SHOWN_PAGES = {
             note: 'Ownership rule: the wallets module produces this number and the score ' +
               'consumes it. Recomputing it inside a tab is what used to make the same token ' +
               'read two different values.',
-            feeds: [ref('detail', 'Wallet quality'), ref('detail', 'FINAL')],
+            feeds: [ref('detail', 'Wallet quality')],
             where: 'calculations/core.js walletQualityScore()',
           }].concat(parts);
         },
@@ -596,7 +578,7 @@ export const SHOWN_PAGES = {
               calc: spec.calc ||
                 [op('counted from the matched posts in'), ref('social', 'SOURCES ANSWERING')],
               feeds: spec.feeds || [ref('social', 'VS BASELINE')],
-              where: 'services/social-intel.js, mention / baseline',
+              where: 'flow/board-flow.js MENTIONS ... VS SOCIAL BASELINE',
             };
           });
         },
@@ -611,7 +593,7 @@ export const SHOWN_PAGES = {
             calc: [op('rolling mean and z of'), ref('social', 'MENTIONS'),
               op(', one sample a minute, kept with the tab closed')],
             feeds: [ref('social', 'VS BASELINE')],
-            where: 'services/social-intel.js, baseline',
+            where: 'flow/board-flow.js VS SOCIAL BASELINE',
           },
           {
             label: 'COVERAGE', status: 'live',
@@ -672,7 +654,7 @@ export const SHOWN_PAGES = {
             note: 'Only pools the server warm loop has sampled can appear here - coverage ' +
               'there is the ceiling on coverage of this graph.',
             feeds: spec.feeds || [],
-            where: 'services/rotation-intel.js rotationForPool()',
+            where: 'flow/board-flow.js TOKEN ROTATION',
           };
         }),
       },
@@ -688,7 +670,7 @@ export const SHOWN_PAGES = {
             : [op('total USD moved between sampled pools on this chain, over'),
               ref('wallets', 'SAMPLE WINDOW')],
           feeds: [],
-          where: 'services/rotation-intel.js rotationGraphFor()',
+          where: 'flow/board-flow.js CHAIN ROTATION',
         })),
       },
       {
@@ -704,7 +686,7 @@ export const SHOWN_PAGES = {
             note: 'It polls nothing itself - it rides the wallet sample, so it costs no ' +
               'upstream calls.',
             feeds: [ref('rotation', 'NET ROTATION'), ref('health', 'ROTATION GRAPHS HELD')],
-            where: 'services/rotation-intel.js rotationIntelStatus()',
+            where: 'flow/board-flow.js ROTATION SERVICE',
           },
         ],
       },

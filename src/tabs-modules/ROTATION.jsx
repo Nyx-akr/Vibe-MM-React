@@ -1,9 +1,7 @@
 import React from 'react';
 import { fmtUsd } from '../utils/formatters';
 import { chainNameToKey } from '../data/chains';
-import {
-  rotationForPool, rotationGraphFor, rotationIntelStatus,
-} from '../services/rotation-intel';
+import { boardValue } from '../flow/board-flow';
 
 /**
  * Where THIS token's crowd is going.
@@ -158,8 +156,9 @@ function egoBars(inPeers, outPeers, totals, labelFor, openFor) {
   // order therefore goes "what is coming in" then "what is going out", and
   // the biggest number in each direction leads its group.
   const rows = [
-    ...inPeers.slice().sort((a, b) => b.rotatedUsd - a.rotatedUsd).map((p) => row(p, false)),
-    ...outPeers.slice().sort((a, b) => b.rotatedUsd - a.rotatedUsd).map((p) => row(p, true)),
+    // TOKEN ROTATION draws each direction largest first.
+    ...inPeers.map((p) => row(p, false)),
+    ...outPeers.map((p) => row(p, true)),
   ];
   // Where the list turns from arrivals to departures, for the rule between them.
   const turn = inPeers.length && outPeers.length ? inPeers.length : -1;
@@ -182,7 +181,9 @@ function egoBars(inPeers, outPeers, totals, labelFor, openFor) {
 
 export function rotationVals(app, sel) {
   const st = app.state;
-  const svc = rotationIntelStatus();
+  // The DATA FLOW's ROTATION SERVICE, TOKEN ROTATION and CHAIN ROTATION boxes
+  // (flow/board-flow.js) hold every number here; this tab lays them out.
+  const svc = boardValue('ROTATION SERVICE') || {};
 
   // The background service, made visible. It runs whether or not this tab is
   // open, which is what lets the tab render instead of fetch.
@@ -202,14 +203,14 @@ export function rotationVals(app, sel) {
   const chainKey = (sel.rawServerRow && sel.rawServerRow.chain) ||
     chainNameToKey[sel.chain] || null;
 
-  const token = rotationForPool(sel.poolAddress);
-  const chainGraph = chainKey ? rotationGraphFor(chainKey) : null;
+  const token = boardValue('TOKEN ROTATION');
+  const chainGraph = chainKey ? boardValue('CHAIN ROTATION') : null;
 
   const assets = app.assets || [];
   const openFor = (poolAddress) => {
     const hit = assets.find((a) => a.poolAddress === poolAddress);
     return hit && hit.id !== sel.id
-      ? () => app.setState({ page: 'rotation', selectedId: hit.id })
+      ? () => app.setState({ page: 'live', popup: 'rotation', selectedId: hit.id })
       : null;
   };
 
@@ -257,11 +258,8 @@ export function rotationVals(app, sel) {
       },
     ];
 
-    const involved = (chainGraph.nodes || []).filter((n) => n.rotatedUsd > 0);
-    const maxNet = Math.max(...involved.map((n) => Math.abs(n.netRotationUsd)), 1);
-    rotChainNet = involved
-      .slice()
-      .sort((a, b) => b.netRotationUsd - a.netRotationUsd)
+    const maxNet = chainGraph.maxNetUsd;
+    rotChainNet = (chainGraph.ranked || [])
       .map((n) => ({
         key: n.poolAddress,
         sym: labelFor(n.symbol, n.poolAddress),

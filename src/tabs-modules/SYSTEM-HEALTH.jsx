@@ -1,19 +1,14 @@
 import React from 'react';
 import { chainColor } from '../utils/formatters';
 import { chainKeyToName } from '../data/chains';
-import { rotationIntelStatus } from '../services/rotation-intel';
-import { walletIntelStatus } from '../services/wallet-intel';
-import { socialIntelStatus } from '../services/social-intel';
-import { storageStats } from '../services/storage/history-store';
-import { rawStoreStats } from '../services/storage/raw-store';
-import { systemHealth, ago, bytes } from '../calculations/system-health';
+import { boardValue, ago, bytes } from '../flow/board-flow';
 
 /**
  * SYSTEM HEALTH - is the app doing its job right now?
  *
  * Read top to bottom, it narrows: one verdict, then the seven parts of the
  * system that verdict is made of, then the detail behind each. Every colour
- * is a judgement made in calculations/system-health.js, and every non-green
+ * is a judgement made by the DATA FLOW's SYSTEM HEALTH box (flow/board-flow.js), and every non-green
  * one carries its reason - hover a tile for its problems.
  */
 
@@ -304,13 +299,31 @@ function StorageStrip({ title, data }) {
   }
   const cells = data.cells || [];
   const span = data.until - data.since;
+  // `recorded` leaves out the blocks before the archive began (they were never
+  // lost, there was nothing yet). Printed alone it read "100% recorded" over a
+  // week that was mostly grey, so when part of the window predates the
+  // archive, say how much of the window has data at all and when it starts.
+  const tally = data.tally || {};
+  const total = cells.length || data.buckets || 0;
+  const withData = (tally.healthy || 0) + (tally.partial || 0);
+  const beforeArchive = (tally.none || 0) > 0;
+  const recColor = data.recorded >= 0.95 ? '#3ddc97' : data.recorded >= 0.8 ? '#ffb454' : '#ff4d5e';
+  const began = data.oldestRecordAt
+    ? shortWhen(data.oldestRecordAt, 2 * 86400000 + 1) + ' ' + shortWhen(data.oldestRecordAt, 0)
+    : null;
   return (
     <div style={{ marginBottom: 10 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10, marginBottom: 4 }}>
         <span style={{ fontSize: 9.5, color: C.mid }}>{title}</span>
-        <span style={{ fontSize: 9.5, color: data.recorded >= 0.95 ? '#3ddc97' : data.recorded >= 0.8 ? '#ffb454' : '#ff4d5e', fontWeight: 600 }}>
-          {data.recorded == null ? '—' : Math.round(data.recorded * 100) + '% recorded'}
-        </span>
+        {data.recorded == null ? <span style={{ fontSize: 9.5, color: C.dim }}>—</span> : beforeArchive ? (
+          <span style={{ fontSize: 9.5, textAlign: 'right' }}>
+            <span style={{ color: '#dfe6f6', fontWeight: 600 }}>{total ? Math.round(withData / total * 100) : 0}% of this window has data</span>
+            <span style={{ color: C.dim }}>{' · archive began ' + (began || '—') + ' · '}</span>
+            <span style={{ color: recColor, fontWeight: 600 }}>{Math.round(data.recorded * 100)}% recorded since</span>
+          </span>
+        ) : (
+          <span style={{ fontSize: 9.5, color: recColor, fontWeight: 600 }}>{Math.round(data.recorded * 100) + '% recorded'}</span>
+        )}
       </div>
       <div style={{ display: 'flex', gap: 1, height: 18, borderRadius: 3, overflow: 'hidden', background: '#070c1a' }}>
         {cells.map((c, i) => (
@@ -409,19 +422,11 @@ function Resources({ r, stuck }) {
 /* ---------------------------------------------------------------- vals --- */
 
 export function healthVals(app) {
-  const health = systemHealth({
-    system: app.state.apiSystem,
-    browser: {
-      wallet: walletIntelStatus(),
-      social: socialIntelStatus(),
-      rotation: rotationIntelStatus(),
-      storage: storageStats(),
-      reads: rawStoreStats(),
-    },
-    timeline: app.state.storageTimeline,
-    // Before the first read lands, "no report" means "not asked yet", not "down".
-    waiting: !app.state.apiSystem && !app.state.serverError,
-  });
+  // The DATA FLOW's SYSTEM HEALTH box judges every part (flow/board-flow.js).
+  const health = boardValue('SYSTEM HEALTH') || {
+    level: 'unknown', checking: true, title: 'Checking…', summary: 'Reading the collector’s latest report.',
+    issues: [], parts: [], chains: [], sources: [], jobs: [], stuckFiles: [], browser: [], resources: null,
+  };
   return { health, storageTimeline: app.state.storageTimeline };
 }
 

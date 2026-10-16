@@ -1,50 +1,8 @@
 import React from 'react';
 import { ethosFor, ethosColor, ethosNote } from '../services/ethos-intel';
-import { fmtUsd, fmtPrice, stageInfo, clsColor, scoreColor, washColor, UNAVAILABLE, isMissing, fmtOr, fmtPct, fmtNum } from '../utils/formatters';
-import { scoreSeriesFor } from '../calculations/asset-detail';
+import { fmtUsd, fmtPrice, clsColor, scoreColor, washColor, UNAVAILABLE, isMissing, fmtOr, fmtPct, fmtNum, signalInfo, phaseColor, PHASE_ORDER } from '../utils/formatters';
 // Split out: the charting library is only needed once a token is opened.
 import ScoreHistoryChart from '../components/ScoreHistoryChart';
-
-/**
- * Sparkline geometry for the score window.
- *
- * One series, no axes, no legend - the numbers printed beside it are the
- * readout, and this only has to show the SHAPE: whether "55-70 seen" was a
- * drift, a spike or a step. The y-range is the window's own min/max, so the
- * line uses the full height; that exaggerates small moves on purpose, which is
- * what a sparkline is for. The average is a hairline across it, and the last
- * reading gets a dot so "right now" is locatable.
- */
-const SPARK_W = 132;
-const SPARK_H = 34;
-const SPARK_PAD = 4;
-
-function scoreSpark(series, average) {
-  if (!Array.isArray(series) || series.length < 2) return null;
-  const values = series.map((pt) => pt.v).filter(Number.isFinite);
-  if (values.length < 2) return null;
-
-  const lo = Math.min(...values);
-  const hi = Math.max(...values);
-  // A flat window would divide by zero and also deserves a centred line.
-  const span = (hi - lo) || 1;
-  const innerW = SPARK_W - SPARK_PAD * 2;
-  const innerH = SPARK_H - SPARK_PAD * 2;
-  const xAt = (i) => SPARK_PAD + (i / (values.length - 1)) * innerW;
-  const yAt = (v) => SPARK_PAD + (1 - (v - lo) / span) * innerH;
-
-  const last = values[values.length - 1];
-  return {
-    w: SPARK_W, h: SPARK_H,
-    points: values.map((v, i) => xAt(i).toFixed(1) + ',' + yAt(v).toFixed(1)).join(' '),
-    avgY: Number.isFinite(average) ? yAt(Math.min(hi, Math.max(lo, average))).toFixed(1) : null,
-    lastX: xAt(values.length - 1).toFixed(1),
-    lastY: yAt(last).toFixed(1),
-    lastColor: scoreColor(last),
-    title: values.length + ' readings · low ' + lo + ' · high ' + hi + ' · average ' +
-      (Number.isFinite(average) ? average : '—'),
-  };
-}
 
 const EMPTY_DETAIL = {
   sym: '—', name: '—', stage: '—', stageBg: '#1a2440', stageFg: '#a3aed0', cls: '—', clsColor: '#a3aed0', canonical: false,
@@ -63,56 +21,31 @@ const barColor = (v) => isMissing(v) ? UNAVAILABLE : v >= 75 ? '#4d8dff' : v >= 
 const Z_METRIC_FOR = { volumeAnomaly: 'volume5mUsd', tradeActivity: 'buys5m', buyerBreadth: 'buyers5m' };
 
 /**
- * Stage gauge.
- *
- * The stage is nothing but the score bucketed at 55 / 70 / 85, so the
- * gauge shows that relationship directly instead of the old three-timestamp
- * timeline.
- *
- * Segments are drawn equal-width, not proportional to their band: WATCH covers
- * 55 of the 100 points and the other three 15 each, which at true scale leaves
- * no room to write EXCEPTIONAL. The marker is placed piecewise instead - one
- * quarter of the bar per band, linear inside it - and the band edges are
- * printed above the joins so the scale is still readable.
- *
- * The lit segment is the current stage and the marker sits at the score, so
- * the two can never disagree - the stage is the score, bucketed.
+ * The cycle gauge: the five phases of a token's attention burst, left to
+ * right, the current one lit and the call (flow/score-flow.js SIGNAL) marked
+ * on it. Read straight off the model - this view decides nothing.
  */
-const GAUGE_BANDS = [
-  { n: 'WATCH', min: 0, max: 55 },
-  { n: 'EMERGING', min: 55, max: 70 },
-  { n: 'CONFIRMED', min: 70, max: 85 },
-  { n: 'EXCEPTIONAL', min: 85, max: 100 }
-];
-
-function buildGauge(score, stageIdx) {
-  const live = Number.isFinite(score);
-  const segs = GAUGE_BANDS.map((b, i) => {
-    const info = stageInfo(i + 1);
-    const on = stageIdx === i + 1;
+function buildGauge(phase, signal) {
+  const at = PHASE_ORDER.indexOf(phase);
+  const segs = PHASE_ORDER.map((p, i) => {
+    const on = i === at;
+    const c = phaseColor(p);
     return {
-      n: b.n,
-      // Opaque fills only. A translucent tint over this near-black card reads
+      n: p,
+      // Opaque fills only: a translucent tint over this near-black card reads
       // darker than its inactive neighbours, the opposite of lit.
-      bg: on ? info.bg : '#0c142c',
-      fg: on ? info.fg : '#3f4a68',
-      bd: on ? info.fg : 'transparent',
+      bg: on ? '#16223f' : '#0c142c',
+      fg: on ? c : '#3f4a68',
+      bd: on ? c : 'transparent',
       sep: i > 0 ? '#1c2a4d' : 'transparent',
-      edge: i < 3 ? String(b.max) : '',
-      at: ((i + 1) * 25) + '%'
+      edge: '', at: ((i + 1) * 20) + '%',
     };
   });
-  const scoreIdx = live
-    ? Math.max(0, GAUGE_BANDS.findIndex((b, i) => score >= b.min && (i === 3 || score < b.max)))
-    : 0;
-  const band = GAUGE_BANDS[scoreIdx];
-  const within = Math.min(1, Math.max(0, (score - band.min) / (band.max - band.min)));
   return {
-    segs, live,
-    // Held off the very ends so the triangle never hangs past the rounded edge.
-    left: Math.min(98.2, Math.max(1.8, (scoreIdx + within) * 25)).toFixed(2) + '%',
-    fg: stageInfo(scoreIdx + 1).fg,
-    value: live ? String(Math.round(score)) : '—'
+    segs, live: at >= 0,
+    left: at >= 0 ? (at * 20 + 10).toFixed(2) + '%' : '50%',
+    fg: signalInfo(signal).fg,
+    value: signal || '—',
   };
 }
 
@@ -128,23 +61,18 @@ export function detailVals(app, a, showAdj, extra) {
     if (!a) return EMPTY_DETAIL;
     const { intel = null, bars = null, intelState = 'idle', barsState = 'idle', staleMs = 0 , tokenOutcomes = null } = extra || {};
     const row = a.rawServerRow || {};
-    const si = stageInfo(a.stage);
+    const si = signalInfo(a.signal);
 
-    // ONE score per token. The pipeline computes it once per poll, with
-    // whatever intel is cached for this token, and this view renders that
-    // result - it never rescores. If it did, the board and this page would be
-    // two snapshots of a moving input and would disagree by a few points.
+    // ONE result per token: the DATA FLOW computes it once per poll and this
+    // view renders it - it never rescores, so the board and this page can
+    // never be two snapshots that disagree.
     const scored = row;
     const scoreSource = `${row.scoreBasis === 'intel' ? 'intel' : 'feed'} · ` +
-      `${row.componentsPresent ?? '?'} of ${(row.scoreModel || []).length} inputs`;
+      `${row.inputsPresent ?? '?'} of ${(row.scoreModel || []).length} EARLY inputs`;
 
-    const modifiers = scored.scoreModifiers || [];
-    const subs = [
-      ...(scored.scoreModel || []).map((c) => ({
-        k: c.label, w: c.weight + '%', v: c.pending ? null : c.value, evidence: c.evidence || ''
-      })),
-      ...modifiers.map((m) => ({ k: m.label, w: '—', v: m.pending ? null : m.value, evidence: m.evidence || '' }))
-    ].map((s) => ({
+    const subs = (scored.scoreModel || []).map((c) => ({
+      k: c.label, w: c.weight + '%', v: c.pending ? null : c.value, evidence: ''
+    })).map((s) => ({
       ...s,
       pending: isMissing(s.v),
       pct: isMissing(s.v) ? '0%' : s.v + '%',
@@ -454,7 +382,6 @@ export function detailVals(app, a, showAdj, extra) {
      */
     const POS = '#4d8dff';
     const NEG = '#f2478f';
-    const weightUsed = Number.isFinite(scored.weightCovered) ? scored.weightCovered : 0;
 
     const contributions = (scored.scoreModel || [])
       .filter((c) => !c.pending && Number.isFinite(c.value))
@@ -462,7 +389,8 @@ export function detailVals(app, a, showAdj, extra) {
         const z = zMetrics[Z_METRIC_FOR[c.key]] || null;
         return {
           label: c.label,
-          points: weightUsed ? ((c.value - 50) * c.weight) / weightUsed : 0,
+          // The flow's own number (score-flow.js EARLY RAW, WHAT MOVES EARLY).
+          points: Number.isFinite(c.points) ? c.points : 0,
           value: c.value,
           weight: c.weight,
           evidence: c.evidence || '',
@@ -472,16 +400,6 @@ export function detailVals(app, a, showAdj, extra) {
           z: z && Number.isFinite(z.z) ? z.z.toFixed(2) : null,
         };
       });
-
-    // The penalty is not a component, but it is part of the final number, so
-    // the chart would not add up without it.
-    if (Number.isFinite(scored.riskPenalty) && scored.riskPenalty > 0) {
-      contributions.push({
-        label: 'Risk penalty', points: -scored.riskPenalty, value: null, weight: null,
-        evidence: (row.riskFlags || []).map((f) => f.detail || f.code).join('; ') || 'risk flags raised',
-        chip: null, z: null, isPenalty: true,
-      });
-    }
 
     const maxAbs = contributions.reduce((m, d) => Math.max(m, Math.abs(d.points)), 0) || 1;
     const drivers = contributions
@@ -499,6 +417,8 @@ export function detailVals(app, a, showAdj, extra) {
             ? 'left:50%;width:' + pct.toFixed(2) + '%;border-radius:0 4px 4px 0'
             : 'right:50%;width:' + pct.toFixed(2) + '%;border-radius:4px 0 0 4px',
           chip: d.chip,
+          // Raw shape for the dashboard's diverging bars.
+          up, pct: Number(pct.toFixed(2)), points: d.points,
           title: d.evidence + (d.z ? ' · z ' + d.z : '') +
             (d.weight ? ' · weight ' + d.weight : ''),
         };
@@ -506,10 +426,8 @@ export function detailVals(app, a, showAdj, extra) {
 
     // The panel's own arithmetic, so the picture is checkable.
     const driverMath = Number.isFinite(scored.rawScore)
-      ? 'neutral 50 → raw ' + scored.rawScore +
-        (Number.isFinite(scored.riskPenalty) && scored.riskPenalty > 0
-          ? ' − ' + scored.riskPenalty + ' risk' : '') +
-        ' = ' + (Number.isFinite(scored.score) ? scored.score : '—')
+      ? 'neutral 50 → EARLY ' + scored.rawScore +
+        (scored.vetoed ? ' → 0, a safety gate failed' : '')
       : '';
 
     const flags = (row.riskFlags || []).map((f) => ({
@@ -548,87 +466,57 @@ export function detailVals(app, a, showAdj, extra) {
       { k: 'Corp action', v: '—', c: UNAVAILABLE }
     ] : [];
 
-    // PERP LISTING: would this token make a good perp - the hard gates, and
-    // the three listing components the score now carries. Read off the row
-    // (row.gates, row.facts, row.scoreModel), never re-derived here.
-    const compOf = (key) => (row.scoreModel || []).find((c) => c.key === key) || null;
-    const compChip = (key) => {
-      const c = compOf(key);
-      return c && Number.isFinite(c.value) ? { n: c.value, c: barColor(c.value) } : { n: '—', c: UNAVAILABLE };
-    };
-    const facts = row.facts || {};
-    const perp = facts.perp || null;
-    const reach = facts.reach || null;
+    // TRADE PLAN & SAFETY: the trade the signal is graded on, and the three
+    // gates that can veto it - both read off the model's result.
+    const plan = row.plan || null;
     const gates = row.gates || null;
+    const px = (n) => (Number.isFinite(n) ? fmtPrice(n) : '—');
     const listing = [
-      {
-        k: 'Perp elsewhere', chip: compChip('whitespace'),
-        v: !perp ? 'not checked yet'
-          : perp.listedOn.length ? perp.listedOn.map((id) => perp.labels[id] || id).join(', ')
-          : perp.checked ? 'none found' : 'venues unreachable',
-        c: !perp || (!perp.listedOn.length && !perp.checked) ? UNAVAILABLE : perp.listedOn.length ? '#ff4fae' : '#4d8dff',
-        why: perp ? 'Checked ' + perp.checked + ' of ' + perp.total + ' venues by ticker' +
-          (perp.unreachable && perp.unreachable.length ? ' (unreachable: ' + perp.unreachable.join(', ') + ')' : '') +
-          '. Venues list symbols, not contracts, so a shared ticker reads as listed.' : '',
-      },
-      {
-        k: 'Pool age', chip: compChip('durability'),
-        v: Number.isFinite(row.poolAgeHours) ? (row.poolAgeHours / 24).toFixed(1) + ' days' : '—',
-        c: Number.isFinite(row.poolAgeHours) ? (row.poolAgeHours >= 24 * 14 ? '#dfe6f6' : '#ff4fae') : UNAVAILABLE,
-        why: 'Durability: 14 days = 0, 180 days = 100. Under 14 days the age gate vetoes it.',
-      },
-      {
-        k: 'Contact', chip: compChip('reachability'),
-        v: reach ? ([reach.website && 'website', reach.x && 'X', reach.telegram && 'Telegram'].filter(Boolean).join(' · ') || 'none advertised') : '—',
-        c: reach && (reach.website || reach.x || reach.telegram) ? '#dfe6f6' : UNAVAILABLE,
-        why: 'Reachability: website 30 + X 30 + Telegram 20 + paid promotion 20.',
-      },
-      {
-        k: 'Paid promotion', chip: null,
-        v: reach && reach.promotion.length
-          ? reach.promotion.map((p) => p.kind.toLowerCase() + (Number.isFinite(p.totalAmount) ? ' ×' + p.totalAmount : '')).join(' + ')
-          : 'none',
-        c: reach && reach.boosted ? '#ffd60a' : UNAVAILABLE,
-        why: 'A DexScreener boost or profile bought - the team is paying to be seen right now.',
-      },
+      { k: 'Call', chip: null, v: a.signal || 'no call yet', c: si.fg, why: a.signalWhy || '' },
+      { k: 'Side', chip: null, v: plan ? plan.side : '—', c: plan ? '#dfe6f6' : UNAVAILABLE,
+        why: 'BUY is a long; SELL means get out (or do not chase); SHORT is a short where a perp venue lists the ticker.' },
+      { k: 'Entry', chip: null, v: plan ? px(plan.entry) : '—', c: plan ? '#dfe6f6' : UNAVAILABLE, why: 'The price the call was made at.' },
+      { k: 'Target', chip: null, v: plan ? px(plan.target) + ' (' + (plan.side === 'LONG' ? '+' : '−') + plan.targetPct + '%)' : '—',
+        c: plan ? '#3ddc97' : UNAVAILABLE, why: 'Take profit here - the grading counts it a win.' },
+      { k: 'Stop', chip: null, v: plan ? px(plan.stop) + ' (' + (plan.side === 'LONG' ? '−' : '+') + plan.stopPct + '%)' : '—',
+        c: plan ? '#ff4fae' : UNAVAILABLE, why: 'Cut it here - the grading counts it a loss.' },
+      { k: 'Horizon', chip: null, v: plan ? plan.horizonHours + 'h' : '—', c: plan ? '#dfe6f6' : UNAVAILABLE,
+        why: 'Neither level hit by then: close at the market.' },
+      ...((gates && gates.checks) || []).map((g) => ({
+        k: g.label.toLowerCase(), chip: null,
+        v: g.ok === true ? 'pass' : g.ok === false ? 'FAIL' : 'not checked yet',
+        c: g.ok === true ? '#4d8dff' : g.ok === false ? '#ff4fae' : UNAVAILABLE, why: g.detail || '',
+      })),
     ];
     const listingVerdict = !gates ? null : gates.vetoed
-      ? { text: 'VETOED · ' + gates.vetoes.map((g) => g.label.toLowerCase()).join(', '), c: '#ff4fae',
-          why: gates.vetoes.map((g) => g.label + ': ' + g.detail).join('\n') + '\nA vetoed token scores 0.' }
-      : { text: 'passes every gate' + (gates.unchecked.length ? ' checked so far' : ''), c: '#4d8dff',
-          why: gates.unchecked.length ? 'Not checked yet: ' + gates.unchecked.join(', ') : 'All ' + gates.checks.length + ' gates passed.' };
+      ? { text: 'UNSAFE · ' + gates.vetoes.map((g) => g.label.toLowerCase()).join(', '), c: '#ff4fae',
+          why: gates.vetoes.map((g) => g.label + ': ' + g.detail).join('\n') + '\nA failed gate blocks BUY and sets EARLY to 0.' }
+      : { text: 'safe' + (gates.unchecked.length ? ' so far' : ''), c: '#4d8dff',
+          why: gates.unchecked.length ? 'Not checked yet: ' + gates.unchecked.join(', ') : 'All ' + gates.checks.length + ' safety gates passed.' };
 
     const finalScore = Number.isFinite(scored.score) ? scored.score
       : (a.score == null ? null : Math.round(a.score));
     return {
-      sym: a.sym, name: a.name, stage: si.n, stageBg: si.bg, stageFg: si.fg, cls: a.cls, clsColor: clsColor(a.cls), canonical: a.canonical,
+      // The call and EARLY behind it - the main page's headline.
+      signal: a.signal || null, signalWhy: a.signalWhy || null,
+      phase: a.phase || null, phaseWhy: a.phaseWhy || null,
+      smartBuyers: (row.smart || {}).buyers, smartSellers: (row.smart || {}).sellers, shortable: row.shortable,
+      early: Number.isFinite(row.score) ? row.score : null,
+      earlyParts: row.scoreModel || [],
+      plan,
+      measures: row.measures || {},
+      // SAFETY & FLOW on the landing page - all the model's own outputs.
+      gateChecks: (row.gates && row.gates.checks) || [],
+      gatesVetoed: Boolean(row.gates && row.gates.vetoed),
+      organicScore: Number.isFinite(organicScore) ? organicScore : null,
+      walletQualityScore: row.walletQuality && Number.isFinite(row.walletQuality.score) ? row.walletQuality.score : null,
+      impactPct: Number.isFinite((row.measures || {}).priceImpactPct) ? row.measures.priceImpactPct : (Number.isFinite(impactPct) ? impactPct : null),
+      sym: a.sym, name: a.name, stage: a.signal || '—', stageBg: si.bg, stageFg: si.fg, cls: a.cls, clsColor: clsColor(a.cls), canonical: a.canonical,
       score: finalScore == null ? '—' : finalScore,
       scoreColor: finalScore == null ? UNAVAILABLE : scoreColor(finalScore),
-      // The settled score is the headline; this poll's own number sits beside
-      // it, and the drift between them says whether the token is still moving.
-      scoreNow: Number.isFinite(scored.scoreNow) ? scored.scoreNow : '—',
-      scoreNowColor: Number.isFinite(scored.scoreNow) ? scoreColor(scored.scoreNow) : UNAVAILABLE,
-      scoreWindowLabel: Number.isFinite(scored.scoreWindowMs)
-        ? Math.round(scored.scoreWindowMs / 60000) + 'M AVG' : 'AVG',
-      scoreWindowNote: Number.isFinite(scored.scoreSamples)
-        ? 'Mean of ' + scored.scoreSamples + ' readings over the last ' +
-          (scored.scoreObservedMs >= 60000
-            ? Math.round(scored.scoreObservedMs / 60000) + ' min'
-            : Math.round((scored.scoreObservedMs || 0) / 1000) + 's') +
-          '. The stage follows this number, not the momentary one.'
-        : '',
-      scoreSpark: scoreSpark(scoreSeriesFor(row.chain, row.tokenAddress), finalScore),
-      scoreRange: Number.isFinite(scored.scoreMin) && scored.scoreMin !== scored.scoreMax
-        ? scored.scoreMin + '–' + scored.scoreMax + ' seen' : null,
-      scoreDrift: (Number.isFinite(scored.scoreNow) && Number.isFinite(finalScore))
-        ? (scored.scoreNow === finalScore ? 'settled'
-          : (scored.scoreNow > finalScore ? '+' : '−') + Math.abs(scored.scoreNow - finalScore) + ' vs avg')
-        : null,
-      scoreDriftColor: (Number.isFinite(scored.scoreNow) && Number.isFinite(finalScore))
-        ? (scored.scoreNow >= finalScore ? '#4d8dff' : '#f2478f') : UNAVAILABLE,
-      conf: isMissing(row.dataQuality) ? '—' : row.dataQuality.toFixed(2),
+      conf: isMissing(a.conf) ? '—' : a.conf.toFixed(2),
       raw: Number.isFinite(scored.rawScore) ? scored.rawScore : '—',
-      penalty: Number.isFinite(scored.riskPenalty) ? scored.riskPenalty : '—',
+      safetyVerdict: listingVerdict ? listingVerdict.text : '—',
       scoreSource, intelState,
       price: fmtOr(row.priceUsd, fmtPrice),
       chg: isMissing(a.chg) ? '—' : (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
@@ -653,14 +541,10 @@ export function detailVals(app, a, showAdj, extra) {
       repColor: ethosColor(reputation && reputation.state),
       isStock: !!a.oracle, oracle,
       drivers, driverMath, flags,
-      gauge: buildGauge(finalScore, a.stage),
-      // WATCH 0 / EMERGING 55 / CONFIRMED 70 / EXCEPTIONAL 85. The stage
-      // follows the score immediately, both ways - the badge can never
-      // disagree with the number next to it.
-      bandNote: finalScore == null
-        ? 'Bands 55 / 70 / 85.'
-        : 'Bands 55 / 70 / 85. The stage is the final score bucketed, so it moves the moment the ' +
-          'score crosses a band in either direction. At ' + finalScore + ' this is ' + si.n + '.'
+      gauge: buildGauge(a.phase, a.signal),
+      bandNote: a.signal
+        ? a.signal + ' - ' + (a.signalWhy || '') + (a.phaseWhy ? '. ' + a.phaseWhy.charAt(0).toUpperCase() + a.phaseWhy.slice(1) + '.' : '')
+        : 'No call yet: the phase needs an hour of price history.'
     };
   }
 
@@ -673,21 +557,21 @@ export default function AssetDetail({ v, css }) {
             <div style={css("flex:1 1 0;min-width:0;text-align:center;padding:6px 2px 4px;font-size:8.5px;font-weight:800;letter-spacing:.2px;background:{{ sg.bg }};color:{{ sg.fg }};border-left:1px solid {{ sg.sep }};border-bottom:2px solid {{ sg.bd }}", { v, sg })}>{sg.n}</div>
           </React.Fragment>))}</div><div style={css("position:relative;height:20px", { v })}>{v.d.gauge && v.d.gauge.live ? (<>
             <div style={css("position:absolute;top:-4px;left:{{ d.gauge.left }};transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;transition:left 420ms cubic-bezier(.4,0,.2,1)", { v, d: v.d })}><div style={css("width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:6px solid {{ d.gauge.fg }}", { v, d: v.d })}></div><div style={css("font-size:10px;font-weight:700;line-height:1.3;color:{{ d.gauge.fg }}", { v, d: v.d })}>{v.d.gauge.value}</div></div>
-          </>) : (<div style={css("padding-top:4px;font-size:9px;color:#3a4568", { v })}>score unavailable</div>)}</div></div><div style={css("flex:1 1 240px;font-size:10px;color:#8b96b8;line-height:1.5;max-width:420px", { v })}>{v.d.bandNote}</div></div>{/* Price and score on one axis, full width - see ScoreHistoryChart. */}<div style={{ marginBottom: 10 }}>{v.d.chartPool ? <ScoreHistoryChart chain={v.d.chartChain} pool={v.d.chartPool} token={v.d.chartToken} height={380} /> : null}</div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>MARKET</div><div style={css("display:grid;grid-template-columns:repeat(4,1fr);gap:10px", { v })}>{(v.d.market || []).map((m, i) => (<React.Fragment key={i}>
+          </>) : (<div style={css("padding-top:4px;font-size:9px;color:#3a4568", { v })}>no phase yet</div>)}</div></div><div style={css("flex:1 1 240px;font-size:10px;color:#8b96b8;line-height:1.5;max-width:420px", { v })}>{v.d.bandNote}</div></div>{/* Price and score on one axis, full width - see ScoreHistoryChart. */}<div style={{ marginBottom: 10 }}>{v.d.chartPool ? <ScoreHistoryChart chain={v.d.chartChain} pool={v.d.chartPool} token={v.d.chartToken} height={380} /> : null}</div><div style={css("display:grid;grid-template-columns:1.5fr 1fr;gap:10px", { v })}><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>MARKET</div><div style={css("display:grid;grid-template-columns:repeat(4,1fr);gap:10px", { v })}>{(v.d.market || []).map((m, i) => (<React.Fragment key={i}>
             <div title={m.why || (m.src ? 'source: ' + m.src : '')}><div style={css("font-size:9px;color:#6b7699;letter-spacing:.6px", { v, m })}>{m.k}</div><div style={css("font-size:13px;font-weight:600;margin-top:2px;color:{{ m.c }}", { v, m })}>{m.v}</div>{m.src && (<div style={css("font-size:8px;color:#4a5578;margin-top:2px;line-height:1.35", { v, m })}>{m.src}</div>)}{m.why && (<div style={css("font-size:8px;color:#5b4468;margin-top:2px;line-height:1.35", { v, m })}>{m.why}</div>)}</div>
-          </React.Fragment>))}</div>{v.d.sourceLine && (<div style={css("font-size:8.5px;color:#3a4568;margin-top:9px;padding-top:7px;border-top:1px solid #16223f", { v })}>{v.d.sourceLine}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>WHAT MOVES THIS SCORE</div><div style={css("font-size:9px;color:#4a5578", { v })}>points vs a neutral 50</div></div><div style={css("display:flex;gap:8px;align-items:center;margin-bottom:7px;font-size:8.5px;color:#4a5578", { v })}><span style={css("display:inline-block;width:8px;height:8px;border-radius:2px;background:#4d8dff", { v })}></span><span>helping</span><span style={css("display:inline-block;width:8px;height:8px;border-radius:2px;background:#f2478f;margin-left:6px", { v })}></span><span>holding it back</span></div>{(v.d.drivers || []).map((dr, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}</div>{v.d.sourceLine && (<div style={css("font-size:8.5px;color:#3a4568;margin-top:9px;padding-top:7px;border-top:1px solid #16223f", { v })}>{v.d.sourceLine}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>WHAT MOVES EARLY</div><div style={css("font-size:9px;color:#4a5578", { v })}>points vs a neutral 50</div></div><div style={css("display:flex;gap:8px;align-items:center;margin-bottom:7px;font-size:8.5px;color:#4a5578", { v })}><span style={css("display:inline-block;width:8px;height:8px;border-radius:2px;background:#4d8dff", { v })}></span><span>helping</span><span style={css("display:inline-block;width:8px;height:8px;border-radius:2px;background:#f2478f;margin-left:6px", { v })}></span><span>holding it back</span></div>{(v.d.drivers || []).map((dr, i) => (<React.Fragment key={i}>
             <div title={dr.title} style={css("display:flex;align-items:center;gap:6px;padding:2px 0", { v, dr })}><span style={css("width:104px;flex-shrink:0;font-size:10px;color:#a3aed0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis", { v, dr })}>{dr.label}</span><div style={css("flex:1 1 auto;position:relative;height:10px;min-width:48px", { v, dr })}><div style={css("position:absolute;left:50%;top:-1px;bottom:-1px;width:1px;background:#1c2a4d", { v, dr })}></div><div style={css("position:absolute;top:1px;height:8px;background:{{ dr.c }};{{ dr.barStyle }}", { v, dr })}></div></div><span style={css("width:38px;flex-shrink:0;text-align:right;font-size:10px;font-weight:700;color:{{ dr.c }}", { v, dr })}>{dr.pointsLabel}</span>{dr.chip && (<span style={css("flex-shrink:0;font-size:8px;color:#6b7699;white-space:nowrap", { v, dr })}>{dr.chip}</span>)}</div>
           </React.Fragment>))}<div style={css("margin-top:8px;padding-top:7px;border-top:1px solid #16223f;font-size:9px;color:#6b7699", { v })}>{v.d.driverMath}</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>OUTCOME TRACKING <span style={css("font-weight:400;letter-spacing:0;color:#4a5578", { v })}>· excess vs the board</span></div><div style={css("display:grid;grid-template-columns:repeat(3,1fr);gap:10px", { v })}>{(v.d.outcomes || []).map((o, i) => (<React.Fragment key={i}>
             <div title={o.why || ''} style={css("background:#101c38;border:1px solid #1c2a4d;border-radius:10px;padding:8px 10px;text-align:center", { v, o })}><div style={css("font-size:9px;color:#6b7699;letter-spacing:1px", { v, o })}>{o.k}</div><div style={css("font-size:14px;font-weight:700;margin-top:3px;color:{{ o.c }}", { v, o })}>{o.v}</div>{o.why && (<div style={css("font-size:8px;color:#4a5578;margin-top:3px;line-height:1.3", { v, o })}>{o.why}</div>)}</div>
-          </React.Fragment>))}</div></div></div><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>SCORE DECOMPOSITION</div>{(v.d.subs || []).map((s, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}</div></div></div><div style={css("display:flex;flex-direction:column;gap:10px", { v })}><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>EARLY · ENTRY SCORE INPUTS</div>{(v.d.subs || []).map((s, i) => (<React.Fragment key={i}>
             <div title={s.evidence} style={css("display:flex;align-items:center;gap:6px;padding:2.5px 0", { v, s })}><span title={s.k} style={css("width:104px;flex-shrink:0;font-size:10px;color:{{ s.keyColor }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis", { v, s })}>{s.k}</span><span style={css("width:24px;flex-shrink:0;font-size:9px;color:#6b7699", { v, s })}>{s.w}</span><div style={css("flex:1 1 auto;min-width:40px;height:7px;background:#16223f;border-radius:1px;overflow:hidden", { v, s })}><div className="score-bar" style={css("height:100%;width:{{ s.pct }};background:{{ s.c }}", { v, s })}></div></div><span style={css("width:24px;flex-shrink:0;text-align:right;font-size:10px;font-weight:600;color:{{ s.labelColor }}", { v, s })}>{s.label}</span></div>
-          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>RISK PENALTY <span style={css("color:#ff4fae;font-weight:700", { v })}>−{v.d.penalty}</span></span><span style={css("color:#8b96b8", { v })}>FINAL <span style={css("color:{{ d.scoreColor }};font-weight:700", { v, d: v.d })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs that could not be computed yet</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}<div style={css("display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #1c2a4d;font-size:10px", { v })}><span style={css("color:#8b96b8", { v })}>EARLY RAW <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.raw}</span></span><span style={css("color:#8b96b8", { v })}>SAFETY <span style={css("color:#ffffff;font-weight:700", { v })}>{v.d.safetyVerdict}</span></span><span style={css("color:#8b96b8", { v })}>EARLY <span style={css("color:{{ d.scoreColor }};font-weight:700", { v, d: v.d })}>{v.d.score}</span></span></div><div style={css("font-size:9px;color:#6b7699;margin-top:6px", { v })}>source: {v.d.scoreSource} · grey rows are inputs that could not be computed yet</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>RISK FLAGS</div>{(v.d.flags || []).map((f, i) => (<React.Fragment key={i}>
             <div style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0", { v, f })}><span style={css("font-size:9px;font-weight:700;padding:2px 6px;border-radius:10px;background:{{ f.bg }};color:{{ f.fg }};flex-shrink:0", { v, f })}>{f.sev}</span><span style={css("font-size:11px;color:#c6d1ea", { v, f })}>{f.text}</span></div>
           </React.Fragment>))}{!(v.d.flags || []).length && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>No risk flags raised</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>CONTRACT SAFETY · GoPlus + RugCheck</div>{(v.d.safety || []).map((sc, i) => (<React.Fragment key={i}>
             <div title={sc.detail} style={css("display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #16223f", { v, sc })}><span style={css("font-size:11px;font-weight:700;color:{{ sc.c }};flex-shrink:0;width:12px", { v, sc })}>{sc.glyph}</span><span style={css("flex:1;font-size:10.5px;color:#c6d1ea", { v, sc })}>{sc.label}</span><span style={css("font-size:9.5px;color:#6b7699", { v, sc })}>{sc.detail}</span></div>
-          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>PERP LISTING</span>{v.d.listingVerdict && (<span title={v.d.listingVerdict.why} style={css("font-size:9px;font-weight:700;letter-spacing:.4px;color:{{ lv.c }};text-align:right", { v, lv: v.d.listingVerdict })}>{v.d.listingVerdict.text}</span>)}</div>{(v.d.listing || []).map((l, i) => (<React.Fragment key={i}>
+          </React.Fragment>))}{v.d.safetyNote && (<div style={css("font-size:10px;color:#3a4568;padding:4px 0", { v })}>{v.d.safetyNote}</div>)}</div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px", { v })}><span style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>TRADE PLAN · SAFETY</span>{v.d.listingVerdict && (<span title={v.d.listingVerdict.why} style={css("font-size:9px;font-weight:700;letter-spacing:.4px;color:{{ lv.c }};text-align:right", { v, lv: v.d.listingVerdict })}>{v.d.listingVerdict.text}</span>)}</div>{(v.d.listing || []).map((l, i) => (<React.Fragment key={i}>
             <div title={l.why} style={css("display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid #16223f", { v, l })}><span style={css("width:92px;flex-shrink:0;font-size:10px;color:#a3aed0", { v, l })}>{l.k}</span><span style={css("flex:1;min-width:0;font-size:10.5px;font-weight:600;color:{{ l.c }};overflow:hidden;text-overflow:ellipsis;white-space:nowrap", { v, l })}>{l.v}</span>{l.chip && (<span style={css("width:26px;flex-shrink:0;text-align:right;font-size:10px;font-weight:700;color:{{ ch.c }}", { v, ch: l.chip })}>{l.chip.n}</span>)}</div>
-          </React.Fragment>))}<div style={css("font-size:9px;color:#6b7699;margin-top:6px;line-height:1.45", { v })}>Would this token make a good perp: no perp elsewhere yet, a pool that has lasted, a team you can reach. The numbers are the Whitespace, Durability and Reachability scores.</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>PROJECT REPUTATION · Ethos</div>{v.d.rep && v.d.rep.linked ? (<>
+          </React.Fragment>))}<div style={css("font-size:9px;color:#6b7699;margin-top:6px;line-height:1.45", { v })}>The trade the signal is graded on in Evaluation: enter at the call, take profit at the target, cut at the stop, close at the horizon. Safety gates fail only on evidence; a failed gate blocks BUY.</div></div><div style={css("background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:12px", { v })}><div style={css("font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600;margin-bottom:8px", { v })}>PROJECT REPUTATION · Ethos</div>{v.d.rep && v.d.rep.linked ? (<>
             <div style={css("display:flex;align-items:baseline;justify-content:space-between;gap:10px", { v })}><a href={v.d.rep.url} target="_blank" rel="noreferrer" style={css("font-size:12px;font-weight:700;color:{{ d.repColor }};text-decoration:none", { v, d: v.d })}>@{v.d.rep.handle}</a><span style={css("font-size:15px;font-weight:700;color:{{ d.repColor }}", { v, d: v.d })}>{v.d.rep.score == null ? '—' : (v.d.rep.score === 0 ? 'unrated' : v.d.rep.score)}</span></div>
             <div style={css("display:flex;justify-content:space-between;margin-top:4px;font-size:9.5px", { v })}><span style={css("color:#6b7699;letter-spacing:.6px", { v })}>{v.d.rep.levelLabel || '—'}{v.d.rep.kind === 'post' ? ' · FROM A POST LINK' : ''}</span><span style={css("color:#6b7699", { v })}>{v.d.rep.delta == null ? '' : (v.d.rep.delta > 0 ? '+' : '') + v.d.rep.delta + ' vs start'}</span></div>
           </>) : null}<div style={css("font-size:10px;color:#3a4568;padding:6px 0 0;line-height:1.5", { v })}>{v.d.repNote}</div></div>{v.d.isStock && (<>

@@ -9,6 +9,8 @@ import SocialScanner from './tabs-modules/SOCIAL-SCANNER';
 import AlertCards from './tabs-modules/ALERT-CARDS';
 import Evaluation from './tabs-modules/EVALUATION';
 import SystemHealth from './tabs-modules/SYSTEM-HEALTH';
+import WalletTracker, { trackerVals } from './tabs-modules/WALLET-TRACKER';
+import { detectWalletMoves, shouldAlarm } from './services/wallet-alerts';
 import { detailVals } from './tabs-modules/ASSET-DETAIL';
 import { rotationVals } from './tabs-modules/ROTATION';
 import { walletsVals } from './tabs-modules/WALLETS';
@@ -17,7 +19,7 @@ import { alertsVals } from './tabs-modules/ALERT-CARDS';
 import { evalVals } from './tabs-modules/EVALUATION';
 import { healthVals } from './tabs-modules/SYSTEM-HEALTH';
 import { css } from './utils/css';
-import { fmtUsd, fmtAge, fmtPrice, stageInfo, chainColor, clsColor, scoreColor, washColor } from './utils/formatters';
+import { fmtUsd, chainColor, clsColor, scoreColor, signalInfo, SIGNAL_INFO, phaseColor } from './utils/formatters';
 import { chains as chainList, chainKeys, chainNameToKey } from './data/chains';
 
 /**
@@ -52,26 +54,28 @@ function saveChains(sel) {
   return sel;
 }
 
+
 /**
- * The stage bar's selection works exactly like the chain chips: a set of
- * stages (1 WATCH .. 4 EXCEPTIONAL), every one on meaning "all stages".
+ * The SIGNALS filter: a set of signals (flow/score-flow.js SIGNALS), every one
+ * on meaning "everything" - including tokens with no call yet. Same rules as
+ * the chain chips.
  */
-const STAGE_KEYS = ['1', '2', '3', '4'];
-const allStages = () => Object.fromEntries(STAGE_KEYS.map((k) => [k, true]));
-const isAllStages = (sel) => STAGE_KEYS.every((k) => sel && sel[k]);
-function restoreStages(saved) {
-  if (!saved) return allStages();
-  const kept = Object.fromEntries(STAGE_KEYS.filter((k) => saved[k]).map((k) => [k, true]));
-  return Object.keys(kept).length ? kept : allStages();
+const SIGNAL_KEYS = Object.keys(SIGNAL_INFO);
+const allSignals = () => Object.fromEntries(SIGNAL_KEYS.map((k) => [k, true]));
+const isAllSignals = (sel) => SIGNAL_KEYS.every((k) => sel && sel[k]);
+function restoreSignals(saved) {
+  if (!saved) return allSignals();
+  const kept = Object.fromEntries(SIGNAL_KEYS.filter((k) => saved[k]).map((k) => [k, true]));
+  return Object.keys(kept).length ? kept : allSignals();
 }
-function saveStages(sel) {
-  setInput('stageSelection', isAllStages(sel) ? null : sel);
+function saveSignals(sel) {
+  setInput('signalSelection', isAllSignals(sel) ? null : sel);
   return sel;
 }
-function toggleStage(sel, key) {
+function toggleSignal(sel, key) {
   const next = Object.assign({}, sel, { [key]: !sel[key] });
   if (!next[key]) delete next[key];
-  return STAGE_KEYS.some((k) => next[k]) ? next : allStages();
+  return SIGNAL_KEYS.some((k) => next[k]) ? next : allSignals();
 }
 
 function toggleChain(sel, name) {
@@ -97,7 +101,7 @@ import { fetchTokenOutcomes,
   storeFreshness
 } from './services/api';
 import {
-  startWalletIntel, stopWalletIntel, onWalletIntel, walletIntelStatus,
+  startWalletIntel, stopWalletIntel, onWalletIntel, walletIntelStatus, walletProfile,
 } from './services/wallet-intel';
 import {
   startSocialIntel, stopSocialIntel, onSocialIntel,
@@ -110,17 +114,17 @@ import * as historyStore from './services/storage/history-store';
 import { migrateLegacyStorage } from './services/storage/migrate';
 import { getInput, setInput } from './services/storage/input-store';
 import { hydrateJournal, journalFor } from './services/score-journal';
-// Precision@20 is a calculation, so it lives in calculations/ like every other
-// derived number - App only decides when to run it and how to caption it.
-import { precisionAtK } from './calculations/core';
 import AppHeader from './components/AppHeader';
-import SelectAssetPrompt from './components/SelectAssetPrompt';
-import SideNav from './components/SideNav';
+import TabPopup from './components/TabPopup';
+import EventTape from './components/EventTape';
 import AlertToasts from './components/AlertToasts';
-import AssetBar from './components/AssetBar';
 import { gateAssets, gateStats, gateDetail } from './flow/runtime';
-import { runBoardFlow, boardValues } from './flow/board-flow';
-import { subscribeFlows } from './admin/flow-store';
+import {
+  runBoardFlow, boardValue, boardNote, dailyPickAsset,
+  PRECISION_MIN_PICKS, PRECISION_HORIZONS, organicGradeOf,
+} from './flow/board-flow';
+import { subscribeFlows, activeFlow } from './admin/flow-store';
+import { loadModelEval } from './services/model-eval';
 /** The one selected-state palette shared by every filter chip. */
 // Opaque, not translucent. A semi-transparent fill composites over the page's
 // near-black gradient and lands DARKER than the unselected #0a1226, which made
@@ -136,10 +140,20 @@ const TOAST_VISIBLE = 3;
 const TOAST_BACKLOG = 12;
 /** How long the opened card keeps blinking before it settles. */
 const ALERT_PING_MS = 1800;
-/** How long the feed table keeps blinking after a disabled tab is clicked. */
-const TABLE_PING_MS = 1900;
 
-const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SOCIAL SCANNER', rotation: 'ROTATION' };
+/** The dashboard windows, and the full view each one's DETAILS button opens. */
+const POPUPS = { detail: 'ASSET DETAIL', social: 'SOCIAL SCANNER', wallets: 'WALLETS', rotation: 'ROTATION' };
+
+/** What the token list can be ordered by. */
+const SORT_OPTIONS = [
+  // The signal leads: BUY first, EARLY breaking ties (api.js signalRank).
+  { key: 'signalRank', label: 'Signal' },
+  { key: 'early', label: 'EARLY' },
+  { key: 'chg', label: '5m change' },
+  { key: 'nf', label: 'Net flow' },
+  { key: 'liq', label: 'Liquidity' },
+  { key: 'buyers', label: 'Buyers' },
+];
 
 /**
  * The PRECISION@20 · 24H tile.
@@ -156,7 +170,6 @@ const SELECTION_TABS = { detail: 'ASSET DETAIL', wallets: 'WALLETS', social: 'SO
  * of either coverage or sample size the tile withholds the number entirely
  * rather than showing one nobody should act on.
  */
-const PRECISION_MIN_PICKS = 20;
 /** Market files older than this mean the collector has stopped writing. */
 const STORE_STALE_MS = 60000;
 /**
@@ -177,20 +190,9 @@ const PRECISION_REFRESH_MS = 300000;
 /** A 24h strip bucket is 30 minutes wide; polling faster cannot move a pixel. */
 const STORAGE_TIMELINE_MS = 60000;
 
-/**
- * Horizons to try, longest first.
- *
- * 24h is the one worth having, and it is the one the record can least often
- * support: it needs a score mark and a price a full day apart, so a single
- * outage anywhere in that day breaks every pick that spans it. Measured on
- * the live archive, the 24-48h mark band was entirely empty while 3h and 12h
- * both had over a thousand resolvable picks.
- *
- * So rather than print a permanent em dash next to a day of real data, the
- * tile takes the LONGEST horizon that actually resolves and says which one it
- * used. It upgrades itself to 24h the moment a continuous day exists.
- */
-const PRECISION_HORIZONS = [86400000, 43200000, 21600000, 10800000, 3600000];
+// The horizons tried and the minimum picks are the DATA FLOW's TOP 20 HIT
+// RATE box's own (flow/board-flow.js PRECISION_HORIZONS, PRECISION_MIN_PICKS);
+// the tile only captions what it measured.
 
 const hoursLabel = (ms) => {
   const h = ms / 3600000;
@@ -280,16 +282,21 @@ function precisionHelp(p) {
 
 class App extends React.Component {
   constructor(props) {
-    super(props); this.state = { page: 'live', sortKey: 'score', sortDir: -1, selectedId: null, clock: '', tick: 0, tape: [], flashId: null, expandedId: null, viewF: 'ALL', chainSel: allChains(), classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, tablePing: false, serverError: false, apiBase: null, apiIsLocal: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
+    super(props); this.state = { page: 'live', sortKey: 'signalRank', sortDir: -1, selectedId: null, popup: null, clock: '', tick: 0, tape: [], flashId: null, viewF: 'ALL', chainSel: allChains(), classF: 'ALL', searchQ: '', watch: {}, soundOn: false, toasts: [], alertPing: null, serverError: false, apiBase: null, apiIsLocal: false, intel: null, intelState: 'idle', bars: null, barsState: 'idle' };
     // User inputs come from the input store, which validates the shape and
     // falls back to a default rather than handing render code a bad value.
     this.state.watch = getInput('watchlist');
     this.state.chainSel = restoreChains(getInput('chainSelection'));
-    this.state.stageSel = restoreStages(getInput('stageSelection'));
+    this.state.signalSel = restoreSignals(getInput('signalSelection'));
     this.assets = []; this.tapeSeq = 0;
     this.state.walletInput = ''; this.state.walletLabel = '';
     this.state.walletFilter = 'ALL';
     this.state.registry = normalizeRegistry(getInput('walletRegistry') || defaultWalletRegistry);
+    // WALLET TRACKER: the imported KOL / smart-money list, how alarms are
+    // delivered, and this session's log of tracked-wallet trades.
+    this.state.curated = getInput('curatedWallets');
+    this.state.trackerPrefs = getInput('trackerPrefs');
+    this.state.walletLog = [];
   }
 
   /** Full addresses the user is tracking, for the wallet join. */
@@ -325,7 +332,7 @@ class App extends React.Component {
         const picked = selectedChains(this.state.chainSel);
         const chain = picked.length === 1 ? (chainNameToKey[picked[0]] || 'solana') : 'solana';
 
-        if (this.state.page === 'wallets') {
+        if (this.state.page === 'live') {
           // Wallets reads ONE pool's trades, so it follows the selection, not
           // the chain filter - and it follows the selected token's own chain,
           // which is not necessarily the one the filter is pointing at.
@@ -335,13 +342,13 @@ class App extends React.Component {
           const walletData = selected
             ? await fetchLiveWalletData(walletChain, selected, this.trackedAddresses())
             : null;
-          this.setState({ apiWallets: walletData });
+          this.setState({ apiWallets: walletData }, () => this.rerunBoard());
         } else if (this.state.page === 'eval') {
           const evalData = await fetchLiveEvalData(chain);
           if (evalData) this.setState({ apiEval: evalData });
         } else if (this.state.page === 'health') {
           const systemData = await fetchLiveSystemData();
-          if (systemData) this.setState({ apiSystem: systemData });
+          if (systemData) this.setState({ apiSystem: systemData }, () => this.rerunBoard());
         }
 
         const fresh = storeFreshness();
@@ -371,10 +378,24 @@ class App extends React.Component {
   }
 
   componentDidMount() {
+    // The engines' grades (by holding window too), for the TRADE PLAN panel.
+    loadModelEval().then(() => this.setState({})).catch(() => {});
+    this.onKey = (e) => this.onArrowKey(e);
+    window.addEventListener('keydown', this.onKey);
     // A box deleted or a wire cut on the DATA FLOW (or undone) shows at once.
+    this.flowScoreKey = (() => { try { const f = activeFlow(); return f.id + '|' + (f.engine || '') + '|' + JSON.stringify(f.settings || {}); } catch (e) { return null; } })();
     this.unsubFlows = subscribeFlows(() => {
       if (this.ungatedAssets) { this.runBoard(this.ungatedAssets); this.assets = gateAssets(this.ungatedAssets); }
       this.forceUpdate();
+      // A setting or a profile changed (the TIME FRAME, a weight, the engine):
+      // re-score now rather than on the next poll, so the plan follows at once.
+      // Box positions and other map-only edits do not re-score.
+      let key = null;
+      try { const f = activeFlow(); key = f.id + '|' + (f.engine || '') + '|' + JSON.stringify(f.settings || {}); } catch (e) { key = null; }
+      if (key && key !== this.flowScoreKey) {
+        this.flowScoreKey = key;
+        clearTimeout(this.rescoreTimer); this.rescoreTimer = setTimeout(() => this.syncLiveData(), 300);
+      }
     });
     const clockFn = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); this.setState({ clock: p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) }); };
     clockFn(); this.clockTimer = setInterval(clockFn, 1000);
@@ -386,11 +407,9 @@ class App extends React.Component {
       this.setState({ apiBase: base, apiIsLocal: usingLocalApi() });
 
       // The app store is asynchronous, and everything that scores reads its
-      // memory the moment it starts: the intel services, the journal, and the
-      // stage machine and 15-minute score window. The first board read used to
-      // run BEFORE this, so it scored against an empty window and then saved
-      // that empty window over the real one - every reload re-settled the whole
-      // board from scratch. Hydrating is a few ms of IndexedDB; the board waits.
+      // memory the moment it starts: the intel services and the journal. A
+      // board read BEFORE this would save empty records over the real ones.
+      // Hydrating is a few ms of IndexedDB; the board waits.
       const opened = await historyStore.hydrate();
       await migrateLegacyStorage();
       hydrateJournal();
@@ -437,39 +456,16 @@ class App extends React.Component {
     try {
       const inputs = await fetchPrecisionInputs({ chain, windowMs: 86400000, horizonMs: 86400000, k: 20 });
       if (!inputs) {
-        this.setState({ precision: { error: 'raw store unreachable' } });
+        this.setState({ precisionRead: { error: 'raw store unreachable' } }, () => this.rerunBoard());
         return;
       }
       // The app store's journal is the only record of what we scored. It
       // holds ~50h, so a window this browser was closed for simply has no
-      // marks - reported as unresolved/thin, never filled in.
-      const journal = journalFor(chain);
-
-      // Longest horizon that actually resolves. A 24h reading is the one worth
-      // having, but it needs a mark and a price a day apart, so one outage in
-      // that day breaks every pick spanning it - see PRECISION_HORIZONS.
-      let result = null;
-      let exhausted = true;
-      for (const horizonMs of PRECISION_HORIZONS) {
-        const attempt = precisionAtK(inputs.observations, journal, {
-          k: 20, horizonMs, windowMs: Math.max(horizonMs, 43200000),
-        });
-        if (!result) result = attempt;
-        if (attempt.evaluated >= PRECISION_MIN_PICKS) { result = attempt; exhausted = false; break; }
-      }
-
-      this.setState({
-        precision: Object.assign({}, result, {
-          exhausted,
-          coverage: inputs.coverage ? inputs.coverage.coverage : null,
-          missingMs: inputs.coverage ? inputs.coverage.missingMs : null,
-          longestGapMs: inputs.coverage ? inputs.coverage.longestGapMs : null,
-          source: inputs.source,
-          at: Date.now(),
-        }),
-      });
+      // marks - reported as unresolved/thin, never filled in. The DATA FLOW's
+      // TOP 20 HIT RATE box measures it (flow/board-flow.js).
+      this.setState({ precisionRead: { inputs, journal: journalFor(chain), at: Date.now() } }, () => this.rerunBoard());
     } catch (e) {
-      this.setState({ precision: { error: 'could not measure' } });
+      this.setState({ precisionRead: { error: 'could not measure' } }, () => this.rerunBoard());
     }
   }
 
@@ -484,7 +480,7 @@ class App extends React.Component {
       fetchStorageTimeline({ windowMs: 86400000, buckets: 96 }),
       fetchStorageTimeline({ windowMs: 7 * 86400000, buckets: 56 }),
     ]);
-    this.setState({ storageTimeline: { day, week, at: Date.now() } });
+    this.setState({ storageTimeline: { day, week, at: Date.now() } }, () => this.rerunBoard());
   }
 
   startIntelServices() {
@@ -498,7 +494,9 @@ class App extends React.Component {
     });
     // Re-render on new wallet findings; the tick is throttled, not per-trade.
     this.offWalletIntel = onWalletIntel(() => {
-      if (this.state.page === 'wallets') this.setState({ walletIntelAt: Date.now() });
+      // Alarms run on every page - they are the point of tracking a wallet.
+      this.checkWalletAlarms();
+      if (this.state.page === 'live' || this.state.page === 'tracker') this.setState({ walletIntelAt: Date.now() });
     });
 
     // Social intelligence runs on the same terms: every token on the board is
@@ -512,7 +510,7 @@ class App extends React.Component {
       })),
     });
     this.offSocialIntel = onSocialIntel(() => {
-      if (this.state.page === 'social') this.setState({ socialIntelAt: Date.now() });
+      if (this.state.page === 'live') this.setState({ socialIntelAt: Date.now() });
     });
 
     // Rotation runs on the same terms, and costs nothing extra: it attaches
@@ -526,14 +524,37 @@ class App extends React.Component {
 
     startRotationIntel();
     this.offRotationIntel = onRotationIntel(() => {
-      if (this.state.page === 'rotation' || this.state.page === 'market') this.setState({ rotationIntelAt: Date.now() });
+      if (this.state.page === 'live' || this.state.page === 'market') this.setState({ rotationIntelAt: Date.now() });
     });
 
     for (let i = 0; i < 7; i++) this.pushTape(false);
   }
-  componentDidUpdate() {
-    if (this.state.page !== 'detail') { this.detailKey = null; return; }
+  componentDidUpdate(prevProps, prevState) {
+    // The board flow reads the selected token and the tracked wallets (THIS
+    // TOKEN, TRACKED HERE): a new pick shows at once, not on the next poll.
+    if (prevState && (prevState.selectedId !== this.state.selectedId || prevState.registry !== this.state.registry)) this.rerunBoard();
+    if (this.state.page !== 'live') { this.detailKey = null; return; }
+    // The dashboard always describes a token: with nothing picked yet, it
+    // takes the top of the list rather than opening on empty windows.
+    if (!this.state.selectedId && this.firstRowId) {
+      this.setState({ selectedId: this.firstRowId });
+      return;
+    }
     this.loadDetailData(this.assets.find(a => a.id === this.state.selectedId));
+  }
+
+  /** ↑ / ↓ walk the token list - with a popup open too, so it follows. */
+  onArrowKey(e) {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    if (this.state.page !== 'live' || e.altKey || e.ctrlKey || e.metaKey) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const ids = this.rowIds || [];
+    if (!ids.length) return;
+    e.preventDefault();
+    const at = ids.indexOf(this.state.selectedId);
+    const next = at < 0 ? 0 : Math.min(Math.max(at + (e.key === 'ArrowDown' ? 1 : -1), 0), ids.length - 1);
+    this.setState({ selectedId: ids[next] });
   }
 
   /**
@@ -594,22 +615,9 @@ class App extends React.Component {
     });
   }
 
-  /**
-   * Answer to clicking a tab that needs a token when none is picked. Pointing
-   * at the table is no use from another tab, so this goes to the feed first and
-   * then blinks the table there - the instruction and the thing it refers to
-   * end up on screen together.
-   */
-  promptSelectAsset() {
-    clearTimeout(this.tablePingTimer);
-    // Restart the animation even if it is already running.
-    this.setState({ page: 'live', tablePing: false }, () => {
-      this.setState({ tablePing: true });
-      this.tablePingTimer = setTimeout(() => this.setState({ tablePing: false }), TABLE_PING_MS);
-    });
-  }
-
   componentWillUnmount() {
+    clearTimeout(this.rescoreTimer);
+    window.removeEventListener('keydown', this.onKey);
     if (this.unsubFlows) this.unsubFlows();
     clearInterval(this.clockTimer);
     clearInterval(this.simTimer);
@@ -617,7 +625,6 @@ class App extends React.Component {
     clearInterval(this.precisionTimer);
     clearInterval(this.storageTimer);
     clearTimeout(this.pingTimer);
-    clearTimeout(this.tablePingTimer);
     if (this.offWalletIntel) this.offWalletIntel();
     stopWalletIntel();
     if (this.offSocialIntel) this.offSocialIntel();
@@ -682,6 +689,49 @@ class App extends React.Component {
 
     if (this.state.soundOn) this.beep();
     this.setState((st) => ({ toasts: fresh.concat(st.toasts).slice(0, TOAST_BACKLOG) }));
+  }
+
+  /**
+   * WALLET TRACKER alarms. Every trade a tracked wallet made since the last
+   * wallet-intel update goes into the log; the ones that pass that wallet's
+   * own settings (buys / sells / minimum size) also ring: a toast, the beep if
+   * sound is on, and a desktop notification if those are on and the tab is in
+   * the background. See services/wallet-alerts.js.
+   */
+  checkWalletAlarms() {
+    const registry = this.state.registry || [];
+    const memory = this.walletMoveMemory || (this.walletMoveMemory = {});
+    const events = detectWalletMoves(registry, walletProfile, memory);
+    if (!events.length) return;
+
+    const byAddress = new Map(registry.map((w) => [w.address, w]));
+    const logged = events.map((e) => ({
+      ...e, key: 'wm:' + e.address + ':' + e.pool + ':' + e.at,
+      alarmed: shouldAlarm(byAddress.get(e.address), e),
+    }));
+    const rung = logged.filter((e) => e.alarmed);
+    const sym = (e) => (e.symbol ? '$' + String(e.symbol).replace(/^\$/, '') : 'a token');
+    const toasts = rung.reverse().map((e) => ({
+      key: e.key,
+      accent: e.side === 'buy' ? '#4fd6c1' : '#ff4fae',
+      label: e.side === 'buy' ? 'WALLET BUY' : 'WALLET SELL',
+      title: e.label + ' ' + (e.side === 'buy' ? 'bought ' : 'sold ') + sym(e),
+      body: fmtUsd(e.usd) + (e.trades > 1 ? ' across ' + e.trades + ' trades' : '') + (e.chain ? ' on ' + String(e.chain).toUpperCase() : ''),
+      meta: e.address.slice(0, 4) + '…' + e.address.slice(-4),
+      openLabel: 'OPEN TRACKER →',
+      go: () => this.setState({ page: 'tracker' }),
+    }));
+
+    this.setState((st) => ({
+      walletLog: logged.slice().reverse().concat(st.walletLog || []).slice(0, 200),
+      toasts: toasts.length ? toasts.concat(st.toasts).slice(0, TOAST_BACKLOG) : st.toasts,
+    }));
+    if (!toasts.length) return;
+    if (this.state.soundOn) this.beep();
+    const prefs = this.state.trackerPrefs || {};
+    if (prefs.desktop && typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
+      toasts.slice(0, 3).forEach((t) => { try { new Notification(t.title, { body: t.body, tag: t.key }); } catch (err) { /* blocked */ } });
+    }
   }
 
   dismissToast(key) {
@@ -751,48 +801,28 @@ class App extends React.Component {
     // They live in the TOKENS TRACKED tile, each with the number of tokens the
     // board is tracking on that chain - the tile's total is their sum.
     const allOn = isAllChains(st.chainSel);
-    const stagesAll = isAllStages(st.stageSel);
-    const perChain = {};
-    this.assets.forEach((a) => { perChain[a.chain] = (perChain[a.chain] || 0) + 1; });
+    const signalsAll = isAllSignals(st.signalSel);
+    // The DATA FLOW's BOARD COUNTS box counts the board; a chip shows its count
+    // over the chains switched on.
+    const counts = boardValue('BOARD COUNTS') || { chain: {}, type: {}, signal: {}, engineBuys: {} };
+    const perChain = counts.chain || {};
+    const overChains = (byChain) => Object.keys(byChain || {})
+      .filter((c) => allOn || st.chainSel[c]).reduce((t, c) => t + byChain[c], 0);
     const chainFilters = [
       Object.assign(chainChip('ALL', allOn, () => this.setState({ chainSel: saveChains(allChains()) })),
         // The total now lives on ALL itself, so ALL carries the tile's weight.
-        { count: this.assets.length, big: true, fg: '#ffffff' }),
+        { count: boardValue('TOKENS TRACKED') || 0, big: true, fg: '#ffffff' }),
     ].concat(chainList.map((c) => Object.assign(
       chainChip(c.name, Boolean(st.chainSel[c.name]),
         () => this.setState((prev) => ({ chainSel: saveChains(toggleChain(prev.chainSel, c.name)) }))),
       { count: perChain[c.name] || 0 },
     )));
-    // Ten columns, ordered by how much they matter - the feed drops the trailing
-    // ones as the window narrows (see .vs-feed-* in App.css). Seven of the old
-    // seventeen were folded into the cells they belong with rather than dropped:
-    // chain, class and age ride under the symbol, confidence under the score,
-    // Δ5M under the price, and buyers under net flow. Only TOP REASON left the
-    // row outright - it is a sentence, it never fit, and the expanded row has
-    // always shown the same triggers in full.
-    const cols = [
-      [null, '', 'mark'],
-      ['sym', 'ASSET', 'asset'],
-      ['stage', 'STAGE', 'stage'],
-      ['score', 'SCORE', 'score', true],
-      ['price', 'PRICE', 'price', true],
-      ['liq', 'LIQUIDITY', 'liq', true],
-      [showAdj ? 'adj' : 'vol', showAdj ? 'VOL 5M' : 'VOL 24H', 'vol', true],
-      ['wash', 'WASH', 'risk', true],
-      ['nf', 'NET FLOW', 'flow', true],
-      [null, 'TREND', 'trend']
-    ];
-    const headers = cols.map(([k, label, col, num]) => ({
-      label, col, num: !!num, sortable: !!k,
-      arrow: st.sortKey === k ? (st.sortDir < 0 ? ' ▼' : ' ▲') : '', fg: st.sortKey === k ? '#e35ff2' : '#6b7699',
-      sort: k ? () => this.setState(s => ({ sortKey: k, sortDir: s.sortKey === k ? -s.sortDir : -1 })) : () => { }
-    }));
     // Typed once here rather than per row - $ is stripped from both sides so
     // "cate" matches $CATE and "$cate" matches it too.
     const q = st.searchQ.trim().toLowerCase().replace(/\$/g, '');
     const filtered = this.assets.filter(a => {
       if (!allOn && !st.chainSel[a.chain]) return false;
-      if (!stagesAll && !st.stageSel[String(a.stage)]) return false;
+      if (!signalsAll && !(a.signal && st.signalSel[a.signal])) return false;
       if (st.classF !== 'ALL' && a.cls !== st.classF) return false;
       if (q && (a.sym + ' ' + a.name).toLowerCase().replace(/\$/g, '').indexOf(q) === -1) return false;
       if (st.viewF === 'WATCHLIST' && !st.watch[a.id]) return false;
@@ -806,85 +836,32 @@ class App extends React.Component {
       if (typeof av === 'string') return String(av).localeCompare(String(bv)) * st.sortDir;
       return (av - bv) * st.sortDir;
     });
-    const sevMap = { HIGH: { bg: '#45103a', fg: '#ff4fae' }, MED: { bg: '#33124a', fg: '#e35ff2' }, LOW: { bg: '#1a2440', fg: '#a3aed0' } };
+    // The token list is one line per token: everything else the old table
+    // carried is in the dashboard windows for whichever token is selected.
     const rows = sorted.map(a => {
-      const si = stageInfo(a.stage);
-      const tr = a.spark.slice(-14); const tMax = Math.max(...tr), tMin = Math.min(...tr);
       return {
-        // Clicking a row FOCUSES the token - it does not navigate. You stay in
-        // the feed, the eye lights up, and the row opens to offer the scoped
-        // tabs. Jumping straight to Asset Detail used to cost you your place in
-        // the table every time you wanted a second look at something.
-        open: () => this.setState((s) => s.expandedId === a.id
-          ? { expandedId: null }
-          : { expandedId: a.id, selectedId: a.id }),
-        // One jump per token-scoped tab, in the same order as the sidebar.
-        goDetail: () => this.setState({ page: 'detail', selectedId: a.id }),
-        goSocial: () => this.setState({ page: 'social', selectedId: a.id }),
-        goWallets: () => this.setState({ page: 'wallets', selectedId: a.id }),
-        goRotation: () => this.setState({ page: 'rotation', selectedId: a.id }),
+        id: a.id,
+        pick: () => this.setState({ selectedId: a.id }),
         star: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleWatch(a.id); },
-        // A tint alone reads as "slightly different row" at a glance. The white
-        // ring is the thing that actually locates the selection - drawn inset so
-        // it costs no layout and the grid columns stay aligned down the table.
         selected: st.selectedId === a.id,
-        selBg: st.selectedId === a.id ? 'rgba(227,95,242,0.14)' : 'transparent',
-        selBar: st.selectedId === a.id ? '#ffffff' : 'transparent',
-        selRing: st.selectedId === a.id ? 'inset 0 0 0 1px #ffffff' : 'none',
         starGlyph: st.watch[a.id] ? '★' : '☆', starColor: st.watch[a.id] ? '#f06ee2' : '#3a4568',
-        expanded: st.expandedId === a.id,
-        trend: tr.map(v => ({ h: Math.round(15 + (v - tMin) / (tMax - tMin + 0.01) * 85) + '%', c: v >= tr[0] ? '#4d8dff' : '#ff4fae' })),
-        // What the expanded row shows: the same figures the table carries, but
-        // every one of them captioned in words. The sparkline and the trigger
-        // codes it used to show were the two things nobody could read at a
-        // glance, and the columns the feed hides on a narrow window are exactly
-        // the ones worth spelling out here.
-        peekStats: [
-          { label: 'LIQUIDITY', value: fmtUsd(a.liq), sub: 'pool depth', color: '#dfe6f6' },
-          {
-            label: showAdj ? 'VOLUME 5M' : 'VOLUME 24H',
-            value: fmtUsd(showAdj ? a.adj : a.vol), sub: 'traded', color: '#dfe6f6'
-          },
-          {
-            label: 'BUYERS 5M', value: a.buyers == null ? '—' : String(a.buyers),
-            sub: 'separate wallets', color: '#dfe6f6'
-          },
-          {
-            label: 'NET FLOW', value: fmtUsd(a.nf), sub: a.nf >= 0 ? 'more in than out' : 'more out than in',
-            color: a.nf >= 0 ? '#4d8dff' : '#ff4fae'
-          },
-          {
-            label: 'PRICE 5M', value: (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
-            sub: 'move this bar', color: a.chg >= 0 ? '#4d8dff' : '#ff4fae'
-          },
-          {
-            label: 'WASH', value: a.wash == null ? '—' : Math.round(a.wash * 100) + '%',
-            // A percentage means nothing without knowing which way is good.
-            sub: a.wash == null ? 'not measured yet'
-              : a.wash < 0.15 ? 'looks like real trading'
-                : a.wash < 0.35 ? 'some self-trading' : 'mostly self-trading',
-            color: a.wash == null ? '#3a4568' : washColor(a.wash)
-          },
-          { label: 'AGE', value: fmtAge(a.age), sub: 'since the pool opened', color: '#dfe6f6' }
-        ],
-        peekFlags: a.flags.slice(0, 2).map(f => ({ sev: f.sev, bg: sevMap[f.sev].bg, fg: sevMap[f.sev].fg, text: f.text })),
         anim: st.flashId === a.id ? 'vsFlash 1.2s ease-out' : 'none',
-        stage: si.n, stageBg: si.bg, stageFg: si.fg,
         score: a.score == null ? '—' : Math.round(a.score), scoreColor: a.score == null ? '#3a4568' : scoreColor(a.score),
         partialScore: a.score != null && a.scoreBasis !== 'intel',
-        conf: a.conf == null ? '—' : a.conf.toFixed(2),
-        sym: a.sym, name: a.name, chain: a.chain, chainColor: chainColor(a.chain), cls: a.cls, clsColor: clsColor(a.cls),
-        age: a.age == null ? '—' : fmtAge(a.age),
-        price: a.price == null ? '—' : fmtPrice(a.price),
+        // The board shows the call, not the score (calculations/phase.js).
+        signal: a.signal || '—', signalFg: signalInfo(a.signal).fg, signalBg: signalInfo(a.signal).bg,
+        signalTitle: (a.signal ? a.signal + ' - ' + (a.signalWhy || '') : signalInfo(null).text) +
+          (a.phase ? '\nphase ' + a.phase + ' - ' + (a.phaseWhy || '') : '') + (Number.isFinite(a.early) ? '\nEARLY ' + a.early : ''),
+        phase: a.phase || null, phaseFg: phaseColor(a.phase),
+        sym: a.sym, chain: a.chain, chainColor: chainColor(a.chain),
         chg: a.chg == null ? '—' : (a.chg >= 0 ? '+' : '') + (a.chg * 100).toFixed(1) + '%',
-        chgColor: a.chg == null ? '#3a4568' : a.chg >= 0 ? '#4d8dff' : '#ff4fae',
-        liq: a.liq == null ? '—' : fmtUsd(a.liq),
-        vol: (showAdj ? a.adj : a.vol) == null ? '—' : fmtUsd(showAdj ? a.adj : a.vol), volTag: '',
-        buyers: a.buyers == null ? '—' : a.buyers,
-        netflow: a.nf == null ? '—' : fmtUsd(a.nf), nfColor: a.nf == null ? '#3a4568' : a.nf >= 0 ? '#4d8dff' : '#ff4fae',
-        wash: a.wash == null ? '—' : Math.round(a.wash * 100) + '%', washColor: a.wash == null ? '#3a4568' : washColor(a.wash), reason: a.reason
+        chgColor: a.chg == null ? '#3a4568' : a.chg >= 0 ? '#4d8dff' : '#ff4fae'
       };
     });
+    // Read by componentDidUpdate (auto-select) and the arrow keys.
+    // Unique, or ↓ would stall on a token the feed lists twice.
+    this.rowIds = [...new Set(rows.map((r) => r.id))];
+    this.firstRowId = rows.length ? rows[0].id : null;
     // The feed reorders every 5s and a token can drop out of it. Keep showing
     // the token the user opened (with a staleness note) instead of silently
     // swapping the detail view to a different asset.
@@ -894,72 +871,22 @@ class App extends React.Component {
     else sel = null;
     const staleMs = sel && this.lastSelected === sel && !this.assets.includes(sel) ? Date.now() - this.lastSelectedAt : 0;
 
-    // Nav mirrors SELECTION_TABS: everything asset-scoped is indented,
-    // everything else is app-wide. Deriving `child` from the same map keeps the
-    // sidebar honest if a tab later changes scope.
-    // One flat list. The three token-scoped tabs are indented under LIVE
-    // OPPORTUNITIES because that is where you pick the token they describe -
-    // the indent carries the relationship, so no group headers are needed and
-    // the items can stay one word each.
-    const navItem = (k, label, child) => {
-      const active = st.page === k;
-      const scoped = Boolean(SELECTION_TABS[k]);
-      // A scoped tab with nothing selected has nothing to show, so it does not
-      // open at all - it sends you to where the choice is actually made and
-      // flags the table, rather than dumping you on an empty page.
-      const disabled = scoped && !sel;
-      return {
-        label, child: !!child, disabled,
-        go: disabled ? () => this.promptSelectAsset() : nav(k),
-        hint: disabled ? 'Choose an asset from Live Opportunities' : '',
-        indent: child ? 30 : 16,
-        fg: active ? '#e35ff2' : (disabled ? '#4a5473' : '#8b96b8'),
-        tickC: active ? '#e35ff2' : '#39445f',
-        line: active ? '#e35ff2' : 'transparent',
-        bg: active ? 'rgba(227,95,242,0.07)' : 'transparent'
-      };
-    };
+    // The top navbar. The token tabs are gone from it - they are the
+    // dashboard's windows now, each opening its full view as a popup.
+    const navItem = (k, label) => ({ label, active: st.page === k, go: nav(k) });
     const navItems = [
       navItem('live', 'LIVE OPPORTUNITIES'),
-      navItem('detail', 'DETAIL', true),
-      navItem('social', 'SOCIAL', true),
-      navItem('wallets', 'WALLETS', true),
-      navItem('rotation', 'ROTATION', true),
+      navItem('tracker', 'WALLET TRACKER'),
       navItem('market', 'MARKET ROTATION'),
       navItem('alerts', 'ALERTS'),
       navItem('eval', 'EVALUATION'),
-      navItem('health', 'HEALTH')
+      navItem('health', 'HEALTH'),
+      { label: 'ADMIN ↗', href: '/admin' }
     ];
     const d = detailVals(this, sel, showAdj, {
       intel: st.intel, bars: st.bars, intelState: st.intelState, barsState: st.barsState, staleMs,
       tokenOutcomes: st.tokenOutcomes
     });
-    const counts = [0, 0, 0, 0, 0]; this.assets.forEach(a => counts[a.stage]++);
-    // STAGES: the score, bucketed at 55 / 70 / 85, as one bar. Counted over the
-    // chains that are switched on, so picking SOL shows Solana's mix. Each
-    // segment's width is its share; clicking one toggles that stage on the
-    // board, with the same rules as the chain chips.
-    const chainOn = isAllChains(st.chainSel);
-    const stageCounts = [0, 0, 0, 0, 0];
-    this.assets.forEach((a) => { if (chainOn || st.chainSel[a.chain]) stageCounts[a.stage] += 1; });
-    const stageTotal = stageCounts[1] + stageCounts[2] + stageCounts[3] + stageCounts[4];
-    const stagesOn = isAllStages(st.stageSel);
-    const stageTile = {
-      label: 'STAGES', value: String(stageTotal), color: '#ffffff', hideValue: true, wide: true,
-      // Buttons only - the proportional bar above them was removed at the user's request.
-      noBar: true,
-      sub: stagesOn ? 'score bands 55 / 70 / 85 · click to filter' : null,
-      reset: stagesOn ? null : () => this.setState({ stageSel: saveStages(allStages()) }),
-      segments: [1, 2, 3, 4].map((n) => {
-        const info = stageInfo(n);
-        const on = Boolean(st.stageSel[String(n)]);
-        return {
-          name: info.n, count: stageCounts[n], bg: info.bg, fg: info.fg, on,
-          share: stageTotal ? stageCounts[n] / stageTotal : 0.25,
-          go: () => this.setState((prev) => ({ stageSel: saveStages(toggleStage(prev.stageSel, String(n))) })),
-        };
-      }),
-    };
     // AVG ORGANIC SCORE averages OUR score and only our score.
     //
     // It used to take Jupiter's number where it existed and a locally computed
@@ -972,38 +899,22 @@ class App extends React.Component {
     //
     // Each token is weighted by how much of the model resolved for it, so a
     // token read on one of four parts does not count as much as a complete one.
-    const organicReads = this.assets
-      .map(a => (a.rawServerRow || {}).organicFlow)
-      .filter(o => o && o.score !== null);
-    const ours = organicReads.filter(o => o.basis === 'sample');
-    const borrowed = organicReads.length - ours.length;
-    const weightSum = ours.reduce((sum, o) => sum + Math.max(o.coverage, 25), 0);
-    const avgOrganic = ours.length
-      ? Math.round(
-        ours.reduce((sum, o) => sum + o.score * Math.max(o.coverage, 25), 0) / weightSum
-      ) + ''
-      : '—';
-
-    // The organic model's own grades (organicFlowScore): weak < 45, fair 45-69,
-    // strong 70+. The gauge draws those zones; the split bar shows how the
-    // sampled tokens fall across them, so one average cannot hide a board that
-    // is half strong and half weak.
-    const ORGANIC_ZONES = [
-      { from: 0, to: 45, color: '#ff4fae', name: 'WEAK' },
-      { from: 45, to: 70, color: '#ffb454', name: 'FAIR' },
-      { from: 70, to: 100, color: '#3ddc97', name: 'STRONG' },
-    ];
-    const gradeOf = (score) => ORGANIC_ZONES.find((z) => score < z.to) || ORGANIC_ZONES[2];
-    const organicAvg = ours.length ? Number(avgOrganic) : null;
-    const gradeCounts = { STRONG: 0, FAIR: 0, WEAK: 0 };
-    ours.forEach((o) => { gradeCounts[gradeOf(o.score).name] += 1; });
+    // The DATA FLOW's AVG ORGANIC SCORE and ORGANIC GRADES boxes (flow/board-flow.js).
+    const avgOrganicBox = boardValue('AVG ORGANIC SCORE');
+    const gradeCounts = boardValue('ORGANIC GRADES') || { STRONG: 0, FAIR: 0, WEAK: 0 };
+    const gradeNote = boardNote('ORGANIC GRADES') || { sampled: 0, jupiterOnly: 0 };
+    const sampled = gradeNote.sampled;
+    const borrowed = gradeNote.jupiterOnly;
+    // The grades' colours; the zones themselves are the flow's (ORGANIC_ZONES).
+    const GRADE_COLOR = { WEAK: '#ff4fae', FAIR: '#ffb454', STRONG: '#3ddc97' };
+    const organicAvg = Number.isFinite(avgOrganicBox) ? avgOrganicBox : null;
     const organicTile = {
       // The DATA FLOW's AVG ORGANIC SCORE box.
-      label: 'AVG ORGANIC SCORE', value: boardValues()['f:pipe:AVG ORGANIC SCORE'] == null ? '—' : boardValues()['f:pipe:AVG ORGANIC SCORE'] + '%', mid: true,
-      color: organicAvg == null ? '#3a4568' : gradeOf(organicAvg).color,
-      verdict: organicAvg == null ? null : gradeOf(organicAvg).name.toLowerCase(),
-      subLine: ours.length ? [{ text: ours.length + ' of ' + this.assets.length + ' sampled' }] : null,
-      sub: ours.length ? null : (borrowed ? borrowed + ' Jupiter-only, excluded' : 'awaiting trade samples'),
+      label: 'AVG ORGANIC SCORE', value: organicAvg == null ? '—' : organicAvg + '%', mid: true,
+      color: organicAvg == null ? '#3a4568' : GRADE_COLOR[organicGradeOf(organicAvg).name],
+      verdict: organicAvg == null ? null : organicGradeOf(organicAvg).name.toLowerCase(),
+      subLine: sampled ? [{ text: sampled + ' of ' + (boardValue('TOKENS TRACKED') || 0) + ' sampled' }] : null,
+      sub: sampled ? null : (borrowed ? borrowed + ' Jupiter-only, excluded' : 'awaiting trade samples'),
       help: {
         title: 'Organic score',
         text: 'How much of the trading looks like a real crowd - many independent wallets, none dominating - ' +
@@ -1017,11 +928,10 @@ class App extends React.Component {
     // One tile for "what is on the board": the total as plain text, then a
     // toggle row per filter. The chain and stage rows each get a reset link
     // while anything in them is off, since ALL is no longer a button.
-    const perClass = {};
-    this.assets.forEach((x) => { perClass[x.cls] = (perClass[x.cls] || 0) + 1; });
+    const perClass = counts.type || {};
     const boardTile = {
       // The DATA FLOW's TOKENS TRACKED box.
-      label: 'TOKENS TRACKED', value: boardValues()['f:pipe:TOKENS TRACKED'] == null ? '—' : 'ALL ' + boardValues()['f:pipe:TOKENS TRACKED'], color: '#ffffff', wide: true, inlineValue: true,
+      label: 'TOKENS TRACKED', value: boardValue('TOKENS TRACKED') == null ? '—' : 'ALL ' + boardValue('TOKENS TRACKED'), color: '#ffffff', wide: true, inlineValue: true,
       rows: [
         {
           name: 'CHAIN',
@@ -1029,13 +939,18 @@ class App extends React.Component {
           reset: allOn ? null : () => this.setState({ chainSel: saveChains(allChains()) }),
         },
         {
-          name: 'STAGES',
-          help: { title: 'Stages', text: 'Stages are the score in bands: WATCH below 55, EMERGING 55-69, CONFIRMED 70-84, EXCEPTIONAL 85 and up. A token’s stage moves the moment its score crosses a band, in either direction. Click a stage to show or hide it on the board.' },
-          chips: stageTile.segments.map((g) => ({
-            label: g.name, count: g.count, go: g.go, fg: g.fg,
-            bg: g.on ? g.bg : '#0a1226', bd: g.on ? g.fg : '#1c2a4d', dim: !g.on,
-          })),
-          reset: stageTile.reset,
+          name: 'SIGNALS',
+          help: { title: 'Signals', text: 'Where each token is in its attention cycle, as a call. BUY: it has started to move and has not run yet. SELL: it has run hard and is still near its high - take profit. SHORT: the same, and a perp venue lists it. AVOID: the burst is over. WATCH: no call. Each is graded against what prices did next on the Evaluation tab. Click a signal to show or hide it.' },
+          chips: SIGNAL_KEYS.map((k) => {
+            const on = Boolean(st.signalSel[k]);
+            const info = signalInfo(k);
+            return {
+              label: k, count: overChains((counts.signal || {})[k]), fg: info.fg,
+              bg: on ? info.bg : '#0a1226', bd: on ? info.fg : '#1c2a4d', dim: !on,
+              go: () => this.setState((prev) => ({ signalSel: saveSignals(toggleSignal(prev.signalSel, k)) })),
+            };
+          }),
+          reset: signalsAll ? null : () => this.setState({ signalSel: saveSignals(allSignals()) }),
         },
         {
           // MEME / TOKEN, with the same toggle rules as the rows above. Two
@@ -1062,13 +977,12 @@ class App extends React.Component {
     const stats = [
       boardTile,
       organicTile,
-      Object.assign(precisionTile(st.precision), { help: precisionHelp(st.precision) })
+      Object.assign(precisionTile(boardNote('TOP 20 HIT RATE')), { help: precisionHelp(boardNote('TOP 20 HIT RATE')) })
     ];
     const storeStale = Number.isFinite(st.storeAgeMs) && st.storeAgeMs > STORE_STALE_MS;
     const tape = st.tape.map((e, i) => ({ ...e, kindColor: e.kc, chainColor: chainColor(e.chain), anim: i === 0 ? 'vsFlash 1s ease-out' : 'none' }));
     return {
       clock: st.clock, navItems,
-      tablePingAnim: st.tablePing ? 'vsTablePing .62s ease-in-out 3' : 'none',
       // The collector rewrites market files every few seconds, so old files
       // mean it has stopped. The board keeps showing the last write, but must
       // not call it live.
@@ -1083,24 +997,29 @@ class App extends React.Component {
       // the sidebar nests under ASSET DETAIL. ALERT CARDS, EVALUATION and
       // SYSTEM HEALTH describe the screener, not a token, so a symbol and a
       // score pinned above them would be captioning the wrong thing.
-      showAssetBar: Boolean(sel) && Boolean(SELECTION_TABS[st.page]),
-      needsSelection: !sel && Boolean(SELECTION_TABS[st.page]),
-      selectionTabLabel: SELECTION_TABS[st.page] || '',
-      isLive: st.page === 'live', isDetail: st.page === 'detail', isRotation: st.page === 'rotation', isEval: st.page === 'eval', isHealth: st.page === 'health',
-      goLive: nav('live'), stats: gateStats(stats), headers, rows, tape, d: gateDetail(d), rowCount: rows.length,
+      // Which window's full view is open. The tab components still gate on
+      // their is* flags, so these stay false here and the popup turns one on.
+      popup: sel && st.popup ? st.popup : null,
+      popupTitle: POPUPS[st.popup] || '',
+      openPopup: Object.keys(POPUPS).reduce((o, k) => { o[k] = () => this.setState({ popup: k }); return o; }, {}),
+      closePopup: () => this.setState({ popup: null }),
+      sortKey: st.sortKey, sortOptions: SORT_OPTIONS,
+      setSort: (k) => this.setState({ sortKey: k, sortDir: -1 }),
+      isLive: st.page === 'live', isDetail: false, isRotation: false, isEval: st.page === 'eval', isHealth: st.page === 'health',
+      goLive: nav('live'), stats: gateStats(stats), rows, tape, d: gateDetail(d), rowCount: rows.length,
       views, chainFilters,
       searchQ: st.searchQ,
       onSearch: (e) => this.setState({ searchQ: e.target.value }),
       clearSearch: () => this.setState({ searchQ: '' }),
       hasSearch: st.searchQ.trim().length > 0,
-      isAlerts: st.page === 'alerts', isSocial: st.page === 'social', isWallets: st.page === 'wallets',
+      isAlerts: st.page === 'alerts', isSocial: false, isWallets: false,
       toggleSound: () => this.setState(s => ({ soundOn: !s.soundOn })),
       soundLabel: st.soundOn ? 'SOUND ON' : 'SOUND OFF', soundFg: st.soundOn ? '#f06ee2' : '#6b7699',
       // Only the newest three reach the screen; the rest wait in the backlog.
       toasts: st.toasts.slice(0, TOAST_VISIBLE).map((t, i) => ({
         ...t, fresh: i === 0,
         dismiss: () => this.dismissToast(t.key),
-        open: () => this.openAlertCard(t.key)
+        open: t.go ? () => { this.dismissToast(t.key); t.go(); } : () => this.openAlertCard(t.key)
       })),
       toastBacklog: Math.max(0, st.toasts.length - TOAST_VISIBLE),
       closeAllToasts: () => this.dismissAllToasts(),
@@ -1110,57 +1029,60 @@ class App extends React.Component {
       ...this.chepePickVals(),
       // The header's ALERTS: the alert cards on the board now (the DATA FLOW's
       // ALERTS NOW box) - it used to be a fixed 47.
-      alertsNow: boardValues()['f:pipe:ALERTS NOW'],
-      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...marketRotationVals(this), ...evalVals(this), ...healthVals(this)
+      alertsNow: boardValue('ALERTS NOW'),
+      ...walletsVals(this, sel), ...socialVals(this, sel), ...alertsVals(this), ...rotationVals(this, sel), ...marketRotationVals(this), ...evalVals(this), ...healthVals(this), ...trackerVals(this)
     };
   }
 
 
 
-  /** The DATA FLOW's board boxes, over every token (flow/board-flow.js). */
+  /**
+   * The DATA FLOW's board boxes, over every token (flow/board-flow.js). It
+   * gets the raw reads only - every number the tabs show is computed there.
+   */
   runBoard(assets) {
-    const prev = this.assets;
-    this.assets = assets;
-    try {
-      const st = this.state || {};
-      const sel = this.selectedAsset && this.selectedAsset();
-      let socialStats = null;
-      let evalOutcome = null;
-      try { socialStats = socialVals(this, sel).socialStats; } catch (e) { socialStats = null; }
-      try { evalOutcome = evalVals(this).outcome; } catch (e) { evalOutcome = null; }
-      let health = null;
-      try { health = healthVals(this).health; } catch (e) { health = null; }
-      runBoardFlow(assets, {
-        alertColumns: alertsVals(this).alertColumns || [],
-        dailyPick: this.chepePickVals().chepePickSym,
-        precision: st.precision || null,
-        outcomes: st.tokenOutcomes || null,
-        socialStats,
-        evalOutcome,
-        health,
-        selected: sel ? sel.sym : null,
-      });
-    } finally {
-      this.assets = prev;
-    }
+    const st = this.state || {};
+    const sel = this.selectedAsset && this.selectedAsset();
+    let evalOutcome = null;
+    try { evalOutcome = evalVals(this).outcome; } catch (e) { evalOutcome = null; }
+    runBoardFlow(assets, {
+      selected: sel || null,
+      walletRead: st.apiWallets || null,
+      registry: st.registry || [],
+      system: st.apiSystem || null,
+      storageTimeline: st.storageTimeline || null,
+      serverError: st.serverError,
+      precisionRead: st.precisionRead || null,
+      outcomes: st.tokenOutcomes || null,
+      evalOutcome,
+    });
+  }
+
+  /** Re-runs the board once a slow read lands, instead of waiting for the next poll. */
+  rerunBoard() {
+    if (!this.ungatedAssets) return;
+    this.runBoard(this.ungatedAssets);
+    this.assets = gateAssets(this.ungatedAssets);
+    this.forceUpdate();
   }
 
   chepePickVals() {
     const day = new Date().toISOString().slice(0, 10);
-    const cands = this.assets.filter(a => (a.wash ?? 0) < 0.15 && a.stage >= 2 && a.score != null);
-    if (!cands.length) {
+    // The DATA FLOW's DAILY PICK box (flow/board-flow.js) picks it.
+    const picked = dailyPickAsset();
+    const a = picked && this.assets.find((x) => x.id === picked.id);
+    if (!a) {
       return {
         chepePickSym: '—', chepePickChain: '—', chepePickChainColor: '#a3aed0',
-        chepePickScore: '0', chepePickQuip: 'Server offline', openChepePick: () => {}
+        chepePickScore: '—', chepePickQuip: 'No BUY on the board right now', openChepePick: () => {}
       };
     }
-    const a = cands[this.h('chepe' + day) % cands.length];
-    const quips = ['Clean wash score, real buyers. Chepe approves.', 'Breadth is growing and the LPs are staying. Good dog energy.', 'Oracle fresh, contract canonical. Chepe sniffed it thoroughly.', 'Liquidity keeps arriving and nobody is rugging. Rare.'];
+    const quips = ['Waking up, not run yet. Chepe approves.', 'Room to run and real buyers. Good dog energy.', 'Off its low, under its high. Chepe sniffed it thoroughly.', 'Moving, safe, and nobody is rugging. Rare.'];
     return {
       chepePickSym: a.sym, chepePickChain: a.chain, chepePickChainColor: chainColor(a.chain),
-      chepePickScore: a.score == null ? '—' : String(Math.round(a.score)),
+      chepePickScore: 'BUY · EARLY ' + Math.round(a.score),
       chepePickQuip: quips[this.h(a.id + day) % quips.length],
-      openChepePick: () => this.setState({ page: 'detail', selectedId: a.id })
+      openChepePick: () => this.setState({ page: 'live', selectedId: a.id })
     };
   }
 
@@ -1168,7 +1090,7 @@ class App extends React.Component {
   render() {
     const v = this.renderVals(); return (
       <>
-        <div style={css("font-family:'Poppins',sans-serif;font-size:12px;background:#081736;min-height:100vh;display:flex;flex-direction:column", { v })}>
+        <div style={css("font-family:'Poppins',sans-serif;font-size:12px;background:#081736;height:100dvh;display:flex;flex-direction:column", { v })}>
           <AppHeader v={v} css={css} />
           {v.serverError ? (
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center' }}>
@@ -1206,23 +1128,25 @@ class App extends React.Component {
               </div>
             </div>
           ) : (
-            <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-              <SideNav v={v} />
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-              {v.showAssetBar && <AssetBar v={v} />}
+            // Whatever the navbar leaves of the viewport: the dashboard is sized
+            // to fit, and the other pages scroll inside their own panes.
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
               <LiveOpportunities v={v} css={css} />
+              <WalletTracker v={v} />
               <AlertCards v={v} css={css} />
-              {v.needsSelection ? <SelectAssetPrompt v={v} css={css} /> : (<>
-                <AssetDetail v={v} css={css} />
-                <Wallets v={v} css={css} />
-                <SocialScanner v={v} css={css} />
-              </>)}
-              <Rotation v={v} css={css} />
               <MarketRotation v={v} css={css} />
               <Evaluation v={v} css={css} />
               <SystemHealth v={v} css={css} />
-              </div>
+              {v.isHealth && <EventTape v={v} />}
             </div>
+          )}
+          {v.popup && (
+            <TabPopup v={v} title={v.popupTitle} onClose={v.closePopup}>
+              {v.popup === 'detail' && <AssetDetail v={{ ...v, isDetail: true }} css={css} />}
+              {v.popup === 'social' && <SocialScanner v={{ ...v, isSocial: true }} css={css} />}
+              {v.popup === 'wallets' && <Wallets v={{ ...v, isWallets: true }} css={css} />}
+              {v.popup === 'rotation' && <Rotation v={{ ...v, isRotation: true }} css={css} />}
+            </TabPopup>
           )}
           {!v.serverError && <AlertToasts v={v} css={css} />}
         </div>

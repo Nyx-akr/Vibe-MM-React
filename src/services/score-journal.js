@@ -26,8 +26,6 @@
 import * as historyStore from './storage/history-store';
 
 const STORAGE_KEY = 'score-journal';
-const STAGE_KEY = 'stage-memory';
-const SCORE_WINDOW_KEY = 'score-window';
 
 /* ------------------------------------------------------------- backends -- */
 
@@ -89,7 +87,7 @@ export function hydrateJournal() {
  * Records what we scored a token at. Keyed by chain and token so it lines up
  * with the server's observation series without any extra bookkeeping.
  */
-export function recordScore(chainKey, tokenAddress, { score, stage, flags }) {
+export function recordScore(chainKey, tokenAddress, { score, stage, flags, price }) {
   if (!tokenAddress || !Number.isFinite(score)) return;
   const key = chainKey + ':' + tokenAddress;
   const series = journal[key] || [];
@@ -97,19 +95,27 @@ export function recordScore(chainKey, tokenAddress, { score, stage, flags }) {
   const last = series[series.length - 1];
   if (last && now - last.t < MARK_GAP_MS) return;
 
-  const mark = { t: now, score, stage, flags: flags || [] };
+  // `stage` carries the SIGNAL; `price` lets an alert be closed out by what
+  // the price did, by the same target and stop the signal is graded on.
+  const mark = { t: now, score, stage, flags: flags || [], price: Number.isFinite(price) ? price : null };
   series.push(mark);
   if (series.length > MARK_MAX) series.shift();
   journal[key] = series;
   dirty = true;
 }
 
-/** The journal for one chain, shaped like the server's observations. */
+/**
+ * The journal for one chain, shaped like the server's observations - the
+ * current model's calls only. Marks from the retired fifteen-input score
+ * (recorded without a `price`) would otherwise be graded as if the model had
+ * made them; they age out of storage on their own.
+ */
 export function journalFor(chainKey) {
   const out = {};
   Object.keys(journal).forEach((key) => {
     if (!key.startsWith(chainKey + ':')) return;
-    out[key.slice(chainKey.length + 1)] = journal[key];
+    const marks = journal[key].filter((m) => 'price' in m);
+    if (marks.length) out[key.slice(chainKey.length + 1)] = marks;
   });
   return out;
 }
@@ -173,30 +179,3 @@ export function clearJournal() {
   ACTIVE_BACKEND.clear(STORAGE_KEY);
 }
 
-/* ------------------------------------------------------- stage memory --- */
-
-/**
- * The stage machine's memory rides in the same storage. The stage itself is
- * recomputed from the score every poll, so this is only about keeping "since
- * when" and the recent transitions across a reload.
- */
-export function loadStageMemory() {
-  return ACTIVE_BACKEND.load(STAGE_KEY) || null;
-}
-
-export function saveStageMemory(snapshot) {
-  return ACTIVE_BACKEND.save(STAGE_KEY, snapshot);
-}
-
-/**
- * The rolling score window, for the same reason as the stage: without it a
- * reload resets every token's average to its momentary value and the board
- * jitters again until the window refills.
- */
-export function loadScoreWindow() {
-  return ACTIVE_BACKEND.load(SCORE_WINDOW_KEY) || null;
-}
-
-export function saveScoreWindow(snapshot) {
-  return ACTIVE_BACKEND.save(SCORE_WINDOW_KEY, snapshot);
-}

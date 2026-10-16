@@ -1,226 +1,539 @@
 import React from 'react';
-import Help from '../components/Help';
+import TokenRail from '../components/TokenRail';
+import AssetBar from '../components/AssetBar';
+import ScoreHistoryChart from '../components/ScoreHistoryChart';
+import { signalInfo, phaseColor, PHASE_ORDER } from '../utils/formatters';
+import { modelEval, engineGrade, engineWindows, engineExitGrade } from '../services/model-eval';
+import { PHASE_RULES, ENGINES, TIME_FRAMES, DEFAULT_HOLD_HOURS, TRADE_SIZES, DEFAULT_TRADE_USD } from '../flow/score-flow';
+import { phaseRules, activeEngine } from '../flow/params';
+import { getSetting, setSetting, clearSetting } from '../admin/box-settings';
+import { useMobile } from '../utils/useMobile';
 
-export default function LiveOpportunities({ v, css }) {
-  return v.isLive && (<>
-          <div data-screen-label="Live opportunities" style={css("flex:1;display:flex;flex-direction:column;min-height:0", { v })}><div style={css("display:flex;gap:10px;padding:10px 14px;flex-shrink:0", { v })}>{(v.stats || []).map((s, i) => (<React.Fragment key={i}>
-            <div style={css("flex:{{ grow }};min-width:0;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;padding:8px 12px", { v, s, grow: s.wide ? '3' : s.mid ? '1.7' : '1' })}>{s.inlineValue ? (<div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-              <span style={{ fontSize: 9, letterSpacing: 1.2, color: '#8b96b8' }}>{s.label}</span>
-              <span style={{ fontSize: 15, fontWeight: 700, color: s.color }}>{s.value}</span>
-            </div>) : <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9, letterSpacing: 1.2, color: '#8b96b8' }}>{s.label}{s.help && <Help title={s.help.title} text={s.help.text} />}</div>}{s.rows && s.rows.map((row, ri) => (
-              <div key={ri} style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 7 }}>
-                <span style={{ width: 62, flexShrink: 0, fontSize: 8.5, letterSpacing: 1, color: '#6b7699', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}>{row.name}{row.help && <Help title={row.help.title} text={row.help.text} />}</span>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, flex: 1, minWidth: 0 }}>
-                  {row.chips.map((c, j) => (
-                    <div key={j} className="h3eb549cf" onClick={c.go}
-                      style={{ padding: '2px 8px', borderRadius: 999, fontSize: 9.5, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
-                        background: c.bg, color: c.fg, border: '1px solid ' + c.bd, opacity: c.dim ? 0.6 : 1 }}>
-                      {c.label} <span style={{ opacity: 0.75, fontWeight: 500 }}>{c.count}</span>
-                    </div>
-                  ))}
-                </div>
-                {row.reset && (<span className="h3eb549cf" onClick={row.reset} style={{ flexShrink: 0, fontSize: 9, color: '#8b96b8', cursor: 'pointer', whiteSpace: 'nowrap' }}>show all ✕</span>)}
-              </div>
-            ))}{s.reset && (<span className="h3eb549cf" onClick={s.reset} style={{ float: 'right', marginTop: -12, fontSize: 9, color: '#8b96b8', cursor: 'pointer' }}>show all ✕</span>)}{!s.hideValue && !s.inlineValue && (<div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 2 }}>
-              <span style={{ fontSize: 17, fontWeight: 600, color: s.color }}>{s.value}</span>
-              {s.verdict && (<span style={{ fontSize: 9.5, fontWeight: 600, color: s.color, letterSpacing: 0.4 }}>{s.verdict}</span>)}
-            </div>)}{s.gauge && (<div style={{ position: 'relative', height: 8, marginTop: 7, marginBottom: s.gauge.ticks ? 10 : 2, borderRadius: 999, background: '#16223f' }}>
-              {/* Zoned gauge: coloured bands, a marker for the value. */}
-              {s.gauge.zones && s.gauge.zones.map((z, j) => (
-                <div key={j} style={{ position: 'absolute', top: 0, bottom: 0, left: z.from + '%', width: (z.to - z.from) + '%', background: z.color, opacity: 0.35,
-                  borderRadius: j === 0 ? '999px 0 0 999px' : j === s.gauge.zones.length - 1 ? '0 999px 999px 0' : 0 }} />
-              ))}
-              {s.gauge.marker != null && (<div style={{ position: 'absolute', top: -3, bottom: -3, width: 3, borderRadius: 2, background: '#ffffff',
-                left: 'calc(' + Math.min(Math.max(s.gauge.marker, 0), 100) + '% - 1.5px)', boxShadow: '0 0 0 2px #0a1226' }} />)}
-              {/* Filled gauge: the value as a bar, reference ticks on top. */}
-              {s.gauge.fill != null && (<div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: Math.min(s.gauge.fill, 100) + '%', background: s.gauge.color, borderRadius: 999 }} />)}
-              {(s.gauge.ticks || []).map((t, j) => (
-                <React.Fragment key={j}>
-                  <div style={{ position: 'absolute', top: -2, bottom: -2, left: t.at + '%', width: 1, background: '#8b96b8' }} />
-                  <span style={{ position: 'absolute', top: 10, left: t.at + '%', transform: j ? 'none' : 'translateX(-100%)', paddingLeft: j ? 3 : 0, paddingRight: j ? 0 : 3,
-                    fontSize: 7.5, color: '#6b7699', whiteSpace: 'nowrap' }}>{t.label}</span>
-                </React.Fragment>
-              ))}
-            </div>)}{s.segments && (<>
-              {/* One continuous bar: each stage's width is its share of the
-                  board. A stage switched off stays in place, dimmed, so the bar
-                  never reflows under the pointer. */}
-              {!s.noBar && (<div style={{ display: 'flex', height: 10, marginTop: 9, borderRadius: 999, overflow: 'hidden', background: '#16223f' }}>
-                {s.segments.map((g, j) => g.count > 0 && (
-                  <div key={j} className={g.go ? 'h3eb549cf' : undefined} onClick={g.go}
-                    title={g.name + ': ' + g.count + (g.go ? (g.on ? ' - click to hide' : ' - click to show') : '')}
-                    style={{ width: (g.share * 100) + '%', background: g.fg, opacity: g.on ? 1 : 0.18, cursor: g.go ? 'pointer' : 'default',
-                      borderRight: j < s.segments.length - 1 ? '1px solid #0a1226' : 'none' }} />
-                ))}
-              </div>)}
-              {/* Names and counts sit beside the bar, not in it. Every stage is
-                  listed - a stage with none still reads 0 and can be toggled. */}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px 10px', marginTop: 6 }}>
-                {s.segments.map((g, j) => (
-                  // Clickable stages read as buttons: a pill in the stage's own
-                  // badge colours when on, an outline when off. Display-only
-                  // splits (the organic grades) stay a plain legend.
-                  <span key={j} className={g.go ? 'h3eb549cf' : undefined} onClick={g.go}
-                    style={g.go ? {
-                      display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer', fontSize: 9, fontWeight: 600,
-                      whiteSpace: 'nowrap', padding: '3px 9px', borderRadius: 999,
-                      background: g.on ? g.bg : '#0a1226', border: '1px solid ' + (g.on ? g.fg : '#1c2a4d'), opacity: g.on ? 1 : 0.6,
-                    } : { display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'default', fontSize: 9, whiteSpace: 'nowrap', opacity: g.on ? 1 : 0.4 }}>
-                    <span style={{ width: 7, height: 7, borderRadius: 2, background: g.fg }} />
-                    <span style={{ color: '#8b96b8', letterSpacing: 0.6 }}>{g.name}</span>
-                    <span style={{ color: '#ffffff', fontWeight: 600 }}>{g.count}</span>
-                  </span>
-                ))}
-              </div>
-            </>)}{s.chips && (<div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, marginTop: 6 }}>{s.chips.map((c, j) => (
-              <React.Fragment key={j}>
-                <div className="h3eb549cf" onClick={c.go} style={{ padding: c.big ? '4px 14px' : '2px 8px', borderRadius: 999, fontSize: c.big ? 13 : 9.5, fontWeight: c.big ? 700 : 600, cursor: 'pointer', background: c.bg, color: c.fg, border: '1px solid ' + c.bd, whiteSpace: 'nowrap' }}>{c.label} <span style={{ opacity: 0.75, fontWeight: 500 }}>{c.count}</span></div>
-                {/* ALL sits on its own line; the chains wrap underneath it. */}
-                {c.big && <div style={{ flexBasis: '100%', height: 0 }} />}
-              </React.Fragment>
-            ))}</div>)}{s.subLine && (<div style={{ fontSize: 9, color: '#8b96b8', marginTop: 4 }}>{s.subLine.map((part, j) => (
-              <span key={j}>{j ? ' · ' : ''}<span style={{ color: part.color || '#8b96b8', fontWeight: part.color ? 600 : 400 }}>{part.text}</span></span>
-            ))}</div>)}{s.facts && (<div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 7 }}>{s.facts.map((fct, j) => (
-              <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 9 }}>
-                <span style={{ color: '#6b7699', width: 46, flexShrink: 0, letterSpacing: 0.4 }}>{fct.k}</span>
-                <span style={{ color: fct.color || '#dfe6f6', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}>{fct.v}</span>
-                {fct.bar != null && (<div style={{ flex: 1, minWidth: 20, height: 4, borderRadius: 999, background: '#16223f', overflow: 'hidden' }}>
-                  <div style={{ width: Math.min(fct.bar, 100) + '%', height: '100%', background: '#4d8dff' }} /></div>)}
-              </div>
-            ))}</div>)}{s.note && (<div style={{ fontSize: 8.5, color: '#6b7699', marginTop: 5, fontStyle: 'italic' }}>{s.note}</div>)}{s.sub && (<div style={css("font-size:8.5px;color:#3a4568;margin-top:2px", { v, s })}>{s.sub}</div>)}</div>
-          </React.Fragment>))}</div><div style={css("display:flex;align-items:center;gap:6px;padding:0 14px 10px;flex-shrink:0;flex-wrap:wrap", { v })}>{(v.views || []).map((v, i) => (<React.Fragment key={i}>
-            <div className="h3eb549cf" onClick={v.go} style={css("padding:4px 12px;border-radius:999px;font-size:10px;font-weight:600;cursor:pointer;background:{{ v.bg }};color:{{ v.fg }};border:1px solid {{ v.bd }}", { v, v })}>{v.label}</div>
-          </React.Fragment>))}<div style={css("flex:1", { v })}></div><div style={css("display:flex;align-items:center;gap:6px;margin-left:auto;background:#0a1226;border:1px solid {{ searchBd }};border-radius:999px;padding:3px 10px;flex-shrink:0", { v, searchBd: v.hasSearch ? "#f06ee2" : "#1c2a4d" })}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={v.hasSearch ? "#f06ee2" : "#6b7699"} strokeWidth="2.5" strokeLinecap="round" style={{ flexShrink: 0 }}><circle cx="11" cy="11" r="7" /><path d="M20 20l-4.3-4.3" /></svg><input value={v.searchQ} onChange={v.onSearch} placeholder="Search symbol or name" spellCheck={false} style={css("width:170px;background:transparent;border:none;outline:none;color:#dfe6f6;font-family:inherit;font-size:10px;padding:1px 0", { v })} />{v.hasSearch && (<span className="h3eb549cf" onClick={v.clearSearch} style={css("cursor:pointer;color:#6b7699;font-size:11px;line-height:1;flex-shrink:0", { v })}>✕</span>)}</div><span style={css("font-size:10px;color:#6b7699", { v })}>{v.rowCount} assets shown</span></div><div style={css("flex:1;margin:0 14px;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;overflow:auto;min-height:0;animation:{{ v.tablePingAnim }}", { v })}><div><div className="vs-feed-head" style={css("padding:8px 12px;border-bottom:1px solid #1c2a4d;position:sticky;top:0;background:#0d1730;z-index:2", { v })}>{(v.headers || []).map((h, i) => (<React.Fragment key={i}>
-            <div className={(h.sortable ? 'h3eb549cf ' : '') + 'vs-feed-c-' + h.col + (h.num ? ' vs-feed-num' : '')} onClick={h.sort} style={css("font-size:8.5px;letter-spacing:1.1px;font-weight:700;color:{{ h.fg }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:{{ cur }}", { v, h, cur: h.sortable ? 'pointer' : 'default' })}>{h.label}{h.arrow}</div>
-          </React.Fragment>))}</div>{(v.rows || []).map((r, i) => (<React.Fragment key={i}>
-            <div
-              className="vs-feed-row"
-              onClick={r.open}
-              style={{
-                padding: '7px 12px', borderBottom: '1px solid #16223f',
-                borderLeft: `2px solid ${r.selBar}`, cursor: 'pointer', animation: r.anim,
-                // Only a SELECTED row paints its own background. Leaving it
-                // inline-transparent otherwise would outrank the :hover rule.
-                ...(r.selected ? { background: r.selBg, boxShadow: r.selRing } : null)
-              }}
-            >
-              {/* watchlist + focus */}
-              <div className="vs-feed-c-mark" style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                <span className="h7a920191" onClick={r.star} style={{ fontSize: 13, lineHeight: 1, cursor: 'pointer', color: r.starColor }}>{r.starGlyph}</span>
-                {r.selected && (<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><title>Focused — the token the scoped tabs are showing</title><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" /><circle cx="12" cy="12" r="3" /></svg>)}
-              </div>
+/** True inside the phone layout: windows size to their content instead of the viewport. */
+const MobileCtx = React.createContext(false);
 
-              {/* identity: symbol on top, then the three things that qualify it */}
-              <div className="vs-feed-c-asset" style={{ minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 5, minWidth: 0 }}>
-                  <span style={{ fontWeight: 700, color: '#ffffff', fontSize: 12.5, flexShrink: 0 }}>{r.sym}</span>
-                  <span style={{ fontSize: 10, color: '#6b7699', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 2, fontSize: 8.5, whiteSpace: 'nowrap' }}>
-                  <span style={{ fontWeight: 700, color: r.chainColor }}>{r.chain}</span>
-                  <span style={{ color: '#39445f' }}>·</span>
-                  <span style={{ color: r.clsColor }}>{r.cls}</span>
-                  <span style={{ color: '#39445f' }}>·</span>
-                  <span style={{ color: '#6b7699' }}>{r.age}</span>
-                </div>
-              </div>
+/**
+ * LIVE OPPORTUNITIES - the dashboard.
+ *
+ * The token list sits on the left; the token selected there fills four
+ * windows on the right, every value read from the model (flow/score-flow.js):
+ *
+ *   DETAIL         price & EARLY chart · the SIGNAL and its reason · the
+ *                  attention-cycle track · warnings
+ *   CYCLE          where the price sits in its burst, against the thresholds
+ *                  the PHASE is drawn with
+ *   TRADE PLAN     entry, target, stop and horizon · how this signal has
+ *                  graded · what moves EARLY
+ *   SAFETY & FLOW  the safety gates · smart money · flow, impact, organic
+ *                  flow and wallet quality · Social, Wallets and Rotation
+ *                  one click away
+ *
+ * Colour carries one meaning everywhere: blue = in / helping / buying, pink =
+ * out / holding back / selling, and status colours (green / amber / red) only
+ * ever for a verdict, always next to its word. On a desktop the page never
+ * scrolls.
+ *
+ * On a phone (utils/useMobile) it is two screens instead: the token list, and
+ * - after a tap - that token's screen, the same four windows stacked full
+ * width and scrolling, with a back bar on top. The browser's back button
+ * returns to the list.
+ */
 
-              {/* stage */}
-              <div className="vs-feed-c-stage">
-                <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.6, padding: '2.5px 7px', borderRadius: 10, background: r.stageBg, color: r.stageFg, whiteSpace: 'nowrap' }}>{r.stage}</span>
-              </div>
+const C = {
+  card: '#0a1226', line: '#16223f', track: '#16223f', mid: '#8b96b8', dim: '#6b7699', faint: '#3a4568',
+  text: '#dfe6f6', white: '#ffffff', up: '#4d8dff', down: '#ff4fae',
+  good: '#3ddc97', warn: '#ffb454', bad: '#ff4d5e',
+};
+const CAP = { fontSize: 9, letterSpacing: 1.2, color: C.mid, fontWeight: 700 };
+const SMALL_CAP = { fontSize: 7.5, letterSpacing: 0.9, color: C.dim, fontWeight: 700 };
 
-              {/* score, with confidence beneath it - the number and how much to trust it */}
-              <div
-                className="vs-feed-c-score vs-feed-num"
-                title={r.partialScore ? 'Scored without contract, holder and routed-impact data yet - the enrichment loop has not reached this token' : 'Scored on the full input set'}
-              >
-                <div style={{ fontSize: 15, fontWeight: 700, color: r.scoreColor, lineHeight: 1.1 }}>
-                  {r.score}{r.partialScore && (<span style={{ fontSize: 9, color: '#3a4568', verticalAlign: 'super', marginLeft: 2 }}>○</span>)}
-                </div>
-                {/* labelled, or a second bare number under the score reads as part of it */}
-                <div style={{ fontSize: 8.5, color: '#6b7699' }}>conf {r.conf}</div>
-              </div>
+function fmtUsd(n) {
+  if (!Number.isFinite(n)) return '—';
+  const a = Math.abs(n);
+  const s = a >= 1e6 ? (a / 1e6).toFixed(1) + 'M' : a >= 1e3 ? (a / 1e3).toFixed(1) + 'K' : String(Math.round(a));
+  return '$' + s;
+}
 
-              {/* price over its 5m move */}
-              <div className="vs-feed-c-price vs-feed-num">
-                <div style={{ color: '#dfe6f6', fontSize: 11.5, lineHeight: 1.1 }}>{r.price}</div>
-                <div style={{ fontSize: 9.5, fontWeight: 600, color: r.chgColor }}>{r.chg}</div>
-              </div>
+/* ------------------------------------------------------------ primitives -- */
 
-              <div className="vs-feed-c-liq vs-feed-num" style={{ fontSize: 11 }}>{r.liq}</div>
+function Win({ title, onOpen, children, style }) {
+  const mobile = React.useContext(MobileCtx);
+  return (
+    <div style={{
+      background: C.card, border: '1px solid #1c2a4d', borderRadius: mobile ? 14 : 10,
+      display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: mobile ? undefined : 0, overflow: 'hidden', ...style,
+      ...(mobile ? { gridColumn: undefined, flexShrink: 0 } : null)
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: mobile ? '10px 12px 10px 14px' : '7px 10px 7px 12px', borderBottom: '1px solid ' + C.line, flexShrink: 0 }}>
+        <span style={mobile ? { ...CAP, fontSize: 11 } : CAP}>{title}</span>
+        <span style={{ flex: 1 }} />
+        <div className="hf6f5791f" onClick={onOpen} title={'Open the full ' + title + ' view'} style={{
+          padding: mobile ? '7px 13px' : '3px 10px', borderRadius: 999, border: '1px solid #2b3a60', color: '#b6c2de',
+          fontSize: mobile ? 11 : 9, fontWeight: 700, letterSpacing: 0.6, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0
+        }}>DETAILS ⤢</div>
+      </div>
+      {/* On a phone the body text is scaled up a step (zoom) so the 9-10px
+          desktop type reads at 11-12px; the chart is kept out of it, since a
+          zoomed canvas misplaces its own crosshair. */}
+      <div style={mobile
+        ? { padding: '12px 14px 14px', display: 'flex', flexDirection: 'column', gap: 12 }
+        : { flex: 1, minHeight: 0, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
+        {children}
+      </div>
+    </div>
+  );
+}
 
-              <div className="vs-feed-c-vol vs-feed-num" style={{ fontSize: 11 }}>
-                {r.vol}{r.volTag && (<span style={{ fontSize: 8.5, color: '#6b7699', marginLeft: 3 }}>{r.volTag}</span>)}
-              </div>
+/** Wraps phone-layout text blocks in the type-size step described in Win. */
+function Readable({ children, style }) {
+  const mobile = React.useContext(MobileCtx);
+  if (!mobile) return children;
+  return <div style={{ zoom: 1.2, display: 'flex', flexDirection: 'column', gap: 10, ...style }}>{children}</div>;
+}
 
-              <div className="vs-feed-c-risk vs-feed-num" style={{ fontSize: 11, fontWeight: 600, color: r.washColor }}>{r.wash}</div>
+function Note({ children }) {
+  return <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.5, overflow: 'hidden' }}>{children}</div>;
+}
 
-              {/* net flow over the buyer count behind it */}
-              <div className="vs-feed-c-flow vs-feed-num">
-                <div style={{ fontSize: 11, fontWeight: 600, color: r.nfColor, lineHeight: 1.1 }}>{r.netflow}</div>
-                <div style={{ fontSize: 8.5, color: '#6b7699' }}>{r.buyers} buyers</div>
-              </div>
+/** The window's answer: a big value and the word that explains it. */
+function Headline({ value, word, color, label, title }) {
+  return (
+    <div title={title || ''} style={{ flexShrink: 0 }}>
+      {label && <div style={SMALL_CAP}>{label}</div>}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+        {value != null && <span style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, color }}>{value}</span>}
+        {word && <span style={{ fontSize: 12, fontWeight: 800, letterSpacing: 0.8, color, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{word}</span>}
+      </div>
+    </div>
+  );
+}
 
-              <div className="vs-feed-c-trend" style={css("align-items:flex-end;gap:1.5px;height:20px;padding-bottom:2px", { v, r })}>{(r.trend || []).map((tb, i) => (<React.Fragment key={i}>
-              <div style={css("width:3.5px;height:{{ tb.h }};background:{{ tb.c }};border-radius:1px", { v, r, tb })}></div>
-            </React.Fragment>))}</div>
-            </div>{r.expanded && (<>
-              <div style={{ padding: '12px 16px 13px', background: '#0d1730', borderBottom: '1px solid #16223f' }}>
+/**
+ * A 0..max track split into named zones, with a white marker at the value.
+ * The zone the value is in is drawn solid; the rest stay faint, so the eye
+ * lands on "where it is" before reading any label.
+ */
+function Meter({ value, max = 100, zones, height = 8 }) {
+  const at = Number.isFinite(value) ? Math.min(Math.max(value / max, 0), 1) * 100 : null;
+  let from = 0;
+  return (
+    <div style={{ flexShrink: 0 }}>
+      <div style={{ position: 'relative', height, display: 'flex', gap: 2 }}>
+        {zones.map((z, i) => {
+          const start = from; from = z.to;
+          const inZone = at != null && at >= (start / max) * 100 && (at < (z.to / max) * 100 || i === zones.length - 1);
+          return <div key={i} style={{ flex: (z.to - start), background: z.color, opacity: inZone ? 1 : 0.22, borderRadius: i === 0 ? '4px 0 0 4px' : i === zones.length - 1 ? '0 4px 4px 0' : 0 }} />;
+        })}
+        {at != null && (
+          <div style={{ position: 'absolute', top: -3, bottom: -3, width: 3, borderRadius: 2, background: C.white,
+            left: 'calc(' + at + '% - 1.5px)', boxShadow: '0 0 0 2px ' + C.card }} />
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 2, marginTop: 3 }}>
+        {zones.map((z, i) => (
+          <span key={i} style={{ flex: z.to - (i ? zones[i - 1].to : 0), fontSize: 7.5, letterSpacing: 0.5, color: C.dim, textAlign: 'center', whiteSpace: 'nowrap', overflow: 'hidden' }}>{z.label}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-                {/* The plain sentence the table no longer has room for. */}
-                {r.reason && (
-                  <div style={{ fontSize: 11.5, color: '#dfe6f6', lineHeight: 1.5, marginBottom: 11 }}>
-                    {r.reason}
-                  </div>
-                )}
+/** A verdict: icon + word in a status colour. Never colour alone. */
+function Status({ kind, children, title }) {
+  const s = { good: [C.good, '✓'], warn: [C.warn, '!'], bad: [C.bad, '✕'], none: [C.dim, '·'] }[kind] || [C.dim, '·'];
+  return (
+    <span title={title || ''} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 9.5, fontWeight: 600, color: C.text,
+      padding: '3px 9px 3px 4px', borderRadius: 999, background: '#101c38', whiteSpace: 'nowrap', maxWidth: '100%', overflow: 'hidden'
+    }}>
+      <span style={{ width: 14, height: 14, borderRadius: '50%', background: s[0], color: '#081736', fontSize: 9, fontWeight: 900, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{s[1]}</span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{children}</span>
+    </span>
+  );
+}
 
-                {/* Every figure captioned, so none of them needs prior knowledge. */}
-                <div className="vs-peek-stats">
-                  {(r.peekStats || []).map((ps, i) => (
-                    <div key={i}>
-                      <div style={{ fontSize: 8, letterSpacing: 1.1, fontWeight: 700, color: '#5c6684' }}>{ps.label}</div>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: ps.color, marginTop: 1, fontVariantNumeric: 'tabular-nums' }}>{ps.value}</div>
-                      <div style={{ fontSize: 8.5, color: '#6b7699', marginTop: 1 }}>{ps.sub}</div>
-                    </div>
-                  ))}
-                </div>
+/** Small horizontal bars of one quantity, one hue - longer is more. */
+function Bars({ rows, color = C.up, labelWidth = 70 }) {
+  const max = Math.max(1, ...rows.map((r) => r.value));
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minHeight: 0, overflow: 'hidden' }}>
+      {rows.map((r) => (
+        <div key={r.key} title={r.title || ''} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ width: labelWidth, flexShrink: 0, fontSize: 9.5, color: '#a3aed0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.label}</span>
+          <div style={{ flex: 1, height: 8, minWidth: 0 }}>
+            <div style={{ width: Math.max((r.value / max) * 100, 2) + '%', height: '100%', background: r.color || color, borderRadius: '0 4px 4px 0' }} />
+          </div>
+          {r.end != null && <span style={{ width: 34, textAlign: 'right', fontSize: 9, color: C.mid, flexShrink: 0 }}>{r.end}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
 
-                {(r.peekFlags || []).length > 0 && (
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 11 }}>
-                    {r.peekFlags.map((pf, i) => (
-                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#101c38', borderRadius: 999, padding: '3px 10px 3px 4px' }}>
-                        <span style={{ fontSize: 8, fontWeight: 700, padding: '2px 7px', borderRadius: 999, background: pf.bg, color: pf.fg, flexShrink: 0 }}>{pf.sev}</span>
-                        <span style={{ fontSize: 10, color: '#c6d1ea' }}>{pf.text}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
+/* ---------------------------------------------------------------- DETAIL -- */
 
-                {/* One jump per token-scoped tab, in sidebar order. They are
-                    peers, so they are drawn as peers: DETAIL used to carry a
-                    gradient fill and every label an arrow, which made one
-                    destination look like the primary action and the rest like
-                    afterthoughts. */}
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
-                  {[
-                    ['DETAIL', r.goDetail],
-                    ['SOCIAL', r.goSocial],
-                    ['WALLETS', r.goWallets],
-                    ['ROTATION', r.goRotation],
-                  ].map(([label, go]) => (
-                    <div
-                      key={label} className="hf6f5791f" onClick={go}
-                      style={{ padding: '5px 14px', borderRadius: 999, border: '1px solid #1c2a4d', color: '#b6c2de', fontSize: 10, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
-                    >{label}</div>
-                  ))}
-                </div>
-              </div>
-            </>)}
-          </React.Fragment>))}</div></div><div style={css("display:flex;gap:10px;height:170px;margin:10px 14px 12px;flex-shrink:0", { v })}><div style={css("flex:1;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;display:flex;flex-direction:column;min-width:0", { v })}><div style={css("padding:6px 12px;border-bottom:1px solid #1c2a4d;font-size:9px;letter-spacing:1.2px;color:#8b96b8;font-weight:600", { v })}>EVENT TAPE — RAW INGESTION (LAYER A)</div><div style={css("flex:1;overflow:hidden;padding:4px 12px", { v })}>{(v.tape || []).map((e, i) => (<React.Fragment key={i}>
-            <div style={css("display:flex;gap:12px;padding:2.5px 0;font-size:10.5px;animation:{{ e.anim }}", { v, e })}><span style={css("color:#6b7699", { v, e })}>{e.ts}</span><span style={css("width:74px;font-weight:700;color:{{ e.kindColor }}", { v, e })}>{e.kind}</span><span style={css("width:52px;color:{{ e.chainColor }}", { v, e })}>{e.chain}</span><span style={css("color:#c6d1ea", { v, e })}>{e.text}</span></div>
-          </React.Fragment>))}</div></div><div style={css("width:330px;background:#0a1226;border:1px solid #1c2a4d;border-radius:10px;display:flex;flex-shrink:0;overflow:hidden", { v })}><div style={css("flex:1;padding:10px 4px 10px 14px;min-width:0", { v })}><div className="h1813ba3e" onClick={v.openChepePick} style={css("display:flex;align-items:center;gap:5px;margin-bottom:5px;padding:4px 9px;border-radius:999px;background:linear-gradient(135deg,rgba(43,107,255,.25),rgba(227,95,242,.25));border:1px solid #e35ff2;cursor:pointer;white-space:nowrap;overflow:hidden", { v })}><span style={css("font-size:8px;font-weight:800;letter-spacing:.5px;color:#f06ee2;flex-shrink:0", { v })}>DAILY PICK</span><span style={css("font-weight:800;color:#ffffff;font-size:10.5px", { v })}>{v.chepePickSym}</span><span style={css("font-size:9px;color:#8b96b8", { v })}>· {v.chepePickScore}</span></div><div style={css("font-size:8.5px;color:#a3aed0;line-height:1.35;margin-bottom:5px;font-style:italic;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical", { v })}>"{v.chepePickQuip}" — not financial advice</div><div style={css("font-size:9px;letter-spacing:1.2px;color:#f06ee2;font-weight:700;margin-bottom:4px", { v })}>CHEPE'S VETO LOG</div>{(v.chepeStats || []).map((cs, i) => (<React.Fragment key={i}>
-            <div style={css("display:flex;justify-content:space-between;gap:8px;padding:1.5px 0;font-size:9.5px", { v, cs })}><span style={css("color:#8b96b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis", { v, cs })}>{cs.k}</span><span style={css("font-weight:700;color:#ffffff;flex-shrink:0", { v, cs })}>{cs.v}</span></div>
-          </React.Fragment>))}</div><img src="/assets/chepe.png" alt="Chepe" style={css("width:108px;height:100%;object-fit:cover;object-position:center bottom;flex-shrink:0", { v })} /></div></div></div>
-        </>);
+
+/**
+ * The attention cycle as five steps, the token's step lit. Reads left to
+ * right the way a meme's burst runs: quiet, waking, running, peaking, fading.
+ */
+function PhaseTrack({ phase }) {
+  return (
+    <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+      {PHASE_ORDER.map((p) => {
+        const on = p === phase;
+        return (
+          <div key={p} style={{ flex: 1, minWidth: 0, textAlign: 'center' }}>
+            <div style={{ height: 6, borderRadius: 3, background: on ? phaseColor(p) : C.track, opacity: on ? 1 : 0.7 }} />
+            <div style={{ fontSize: 7, letterSpacing: 0.6, fontWeight: 700, marginTop: 3, color: on ? phaseColor(p) : C.faint,
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DetailWin({ v }) {
+  const mobile = React.useContext(MobileCtx);
+  const d = v.d || {};
+  const sig = signalInfo(d.signal);
+  const flags = d.flags || [];
+  const sevKind = (sev) => (sev === 'HIGH' ? 'bad' : sev === 'MED' ? 'warn' : 'none');
+  return (
+    <Win title="DETAIL" onOpen={v.openPopup.detail} style={{ gridColumn: '1 / -1' }}>
+      <div style={mobile
+        ? { display: 'flex', flexDirection: 'column-reverse', gap: 14 }
+        : { flex: 1, minHeight: 0, display: 'flex', gap: 16 }}>
+        <div style={mobile ? { height: 360, minWidth: 0 } : { flex: 1.75, minWidth: 0, minHeight: 0 }}>
+          {d.chartPool
+            ? <ScoreHistoryChart compact chain={d.chartChain} pool={d.chartPool} token={d.chartToken} />
+            : <Note>No pool to chart for this token yet.</Note>}
+        </div>
+
+        <Readable>
+        <div style={mobile
+          ? { display: 'flex', flexDirection: 'column', gap: 10 }
+          : { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 10, minHeight: 0, borderLeft: '1px solid ' + C.line, paddingLeft: 16 }}>
+          {/* The model's call (flow/score-flow.js SIGNAL and PHASE). */}
+          <Headline label="SIGNAL" value={d.signal || '—'} word={d.phase || 'NO PHASE YET'}
+            color={sig.fg} title={(d.signalWhy || sig.text) + (d.phaseWhy ? '\n' + d.phaseWhy : '')} />
+          <PhaseTrack phase={d.phase} />
+          <div style={{ fontSize: 10, color: C.text, lineHeight: 1.4 }}>
+            {d.signalWhy || sig.text}{d.phaseWhy ? <span style={{ color: C.dim }}> · {d.phaseWhy}</span> : null}
+          </div>
+          <div style={{ display: 'flex', gap: 10, fontSize: 9, color: C.dim, flexWrap: 'wrap' }}>
+            <span>EARLY <b style={{ color: C.white }}>{Number.isFinite(d.early) ? d.early : '—'}</b></span>
+            <span>smart buyers 1h <b style={{ color: C.white }}>{Number.isFinite(d.smartBuyers) ? d.smartBuyers : '—'}</b></span>
+            <span>smart sellers 1h <b style={{ color: C.white }}>{Number.isFinite(d.smartSellers) ? d.smartSellers : '—'}</b></span>
+            <span>perp <b style={{ color: C.white }}>{d.shortable === true ? 'listed' : d.shortable === false ? 'none' : '—'}</b></span>
+          </div>
+
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 'auto' }}>
+            {flags.length
+              ? flags.slice(0, 2).map((f, i) => <Status key={i} kind={sevKind(f.sev)} title={f.sev + ' · ' + f.text}>{f.text}</Status>)
+              : <Status kind="good">No risk flags</Status>}
+            {flags.length > 2 && <span style={{ fontSize: 9, color: C.dim, alignSelf: 'center' }}>+{flags.length - 2} more</span>}
+          </div>
+        </div>
+        </Readable>
+      </div>
+    </Win>
+  );
+}
+
+/* ----------------------------------------------------------------- CYCLE -- */
+
+/**
+ * Where the token sits in its attention burst - the measures PHASE is made
+ * of, drawn against the thresholds PHASE uses (the same PARAMETERS boxes).
+ */
+function CycleWin({ v }) {
+  const d = v.d || {};
+  const m = d.measures || {};
+  const r = phaseRules(PHASE_RULES);
+  const up = m.aboveLow6hPct; const off = m.belowHigh6hPct; const range = m.range1hPct;
+  const span = Math.max(r.runPct * 1.4, Number.isFinite(up) ? up * 1.1 : 0);
+  const zones = [
+    { to: r.runningPct, color: phaseColor('WAKING'), label: 'WAKING' },
+    { to: r.runPct, color: phaseColor('RUNNING'), label: 'RUNNING' },
+    { to: span, color: phaseColor('PEAKING'), label: 'RAN' },
+  ];
+  const pct = (x, dp = 1) => (Number.isFinite(x) ? (x >= 0 ? '+' : '') + x.toFixed(dp) + '%' : '—');
+  const mult = (x) => (Number.isFinite(x) ? x.toFixed(2) + '×' : '—');
+  return (
+    <Win title="CYCLE" onOpen={v.openPopup.detail}>
+      <Readable>
+      {!Number.isFinite(up) ? <Note>Needs an hour of price history to place it on its cycle.</Note> : (<>
+        <Headline label="ABOVE ITS 6H LOW" value={pct(up)} word={d.phase || ''} color={phaseColor(d.phase)}
+          title={d.phaseWhy || ''} />
+        <Meter value={Math.min(up, span)} max={span} zones={zones} />
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8, color: C.dim }}>
+          <span>low</span><span>runs at {pct(r.runningPct, 0)}</span><span>has run at {pct(r.runPct, 0)}</span>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 12px', fontSize: 10 }}>
+          <div><div style={SMALL_CAP}>FROM 6H HIGH</div><b style={{ color: Number.isFinite(off) && off <= -r.fadeOffHighPct ? C.bad : C.text }}>{pct(off)}</b></div>
+          <div><div style={SMALL_CAP}>LAST HOUR RANGE</div><b style={{ color: Number.isFinite(range) && range < r.quietRangePct ? C.dim : C.text }}>{pct(range, 2).replace('+', '')}</b></div>
+          <div><div style={SMALL_CAP}>VOLUME 15M vs 1H</div><b style={{ color: C.text }}>{mult(m.volAccel)}</b></div>
+          <div><div style={SMALL_CAP}>BUYERS 1H vs 6H</div><b style={{ color: C.text }}>{mult(m.buyerTrend)}</b></div>
+        </div>
+        <div style={{ fontSize: 9.5, color: C.dim, lineHeight: 1.4, marginTop: 'auto' }}>{d.phaseWhy || ''}</div>
+      </>)}
+      </Readable>
+    </Win>
+  );
+}
+
+/* ------------------------------------------------------------ TRADE PLAN -- */
+
+/**
+ * The trade the signal is graded on, and how that signal has actually done:
+ * the report card (/raw/model-eval.json) for this call, against every token
+ * taken the same way.
+ */
+function PlanWin({ v }) {
+  const d = v.d || {};
+  const p = d.plan;
+  const sig = signalInfo(d.signal);
+  const report = modelEval();
+  const side = report && report.signalSide ? report.signalSide[d.signal] : null;
+  const graded = report && report.signals && d.signal && side ? (report.signals[d.signal] || {})[side] : null;
+  const g = graded ? graded.swing || graded.fast : null;
+  const base = report && report.everyone && side ? (report.everyone[side].swing || report.everyone[side].fast) : null;
+  const px = (n) => (Number.isFinite(n) ? '$' + (n >= 1 ? n.toFixed(4) : n.toPrecision(4)) : '—');
+  const pc = (x) => (Number.isFinite(x) ? (x >= 0 ? '+' : '') + x.toFixed(1) + '%' : '—');
+  const earlyRows = (d.earlyParts || []).filter((x) => !x.pending && Number.isFinite(x.value))
+    .map((x) => ({ key: x.key, label: x.label, value: x.value, end: x.value, color: x.value >= 60 ? C.good : x.value >= 35 ? C.warn : C.bad,
+      title: x.label + ' ' + x.value + '/100 · weight ' + x.weight }));
+  // THE TIME FRAME: how long the call is held (the DATA FLOW's HORIZON box,
+  // flow/score-flow.js tradePlanRules). AUTO is DEFAULT_HOLD_HOURS for every
+  // engine. Each chip's number: the active engine's BUY entries held that
+  // long, minus every token over the same hours (npm run backtest, holds).
+  const engKey = activeEngine();
+  const chosen = getSetting('param:plan.horizonHours', { n: null }).n;
+  const hours = Number.isFinite(chosen) ? chosen : DEFAULT_HOLD_HOURS;
+  const wins = engineWindows(engKey) || {};
+  // THE TRADE SIZE: what the plan and EXECUTION COST are figured at (param:plan.tradeUsd).
+  const sizeSet = getSetting('param:plan.tradeUsd', { n: null }).n;
+  const tradeUsd = Number.isFinite(sizeSet) ? sizeSet : DEFAULT_TRADE_USD;
+  const eg = engineGrade(engKey, hours, tradeUsd);
+  const xg = d.signal === 'SELL' || d.signal === 'SHORT' ? engineExitGrade(engKey, hours) : null;
+  const engLabel = (ENGINES.find((e) => e.key === engKey) || ENGINES[0]).label;
+  const usdShort = (n) => '$' + (n >= 1000 ? n / 1000 + 'K' : n);
+  const tfChip = (label, h, on, title, settingId = 'param:plan.horizonHours') => (
+    <span key={label} title={title} onClick={() => { if (h === null) clearSetting(settingId); else setSetting(settingId, { n: h }); }}
+      style={{ cursor: 'pointer', fontSize: 8.5, fontWeight: 700, padding: '2px 6px', borderRadius: 5,
+        border: `1px solid ${on ? '#4dd0e1' : '#1c2a4d'}`, background: on ? 'rgba(77,208,225,0.16)' : '#0a1226', color: on ? '#4dd0e1' : C.dim }}>{label}</span>
+  );
+  return (
+    <Win title="TRADE PLAN" onOpen={v.openPopup.detail}>
+      <Readable>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+        <span style={{ ...SMALL_CAP, marginRight: 2 }}>TIME FRAME</span>
+        {tfChip('AUTO · ' + DEFAULT_HOLD_HOURS + 'H', null, !Number.isFinite(chosen), 'The same ' + DEFAULT_HOLD_HOURS + 'h window for every engine - it held up best on unseen hours.')}
+        {TIME_FRAMES.map((f) => {
+          const w = wins[f.hours + 'h'];
+          return tfChip(f.hours + 'H', f.hours, chosen === f.hours, (w ? engLabel + ' BUY entries held ' + f.hours + 'h: ' + pc(w.avg) + ' vs every token, ' + Math.round(w.win) + '% won (' + w.n + ')' : 'not graded yet') + ' · target +' + f.targetPct + '% / stop −' + f.stopPct + '%');
+        })}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+        <span style={{ ...SMALL_CAP, marginRight: 2 }}>TRADE SIZE</span>
+        {TRADE_SIZES.map((x) => {
+          const g = engineGrade(engKey, hours, x);
+          return tfChip(usdShort(x) + (x === DEFAULT_TRADE_USD ? ' (default)' : ''), x === DEFAULT_TRADE_USD && !Number.isFinite(sizeSet) ? null : x, tradeUsd === x,
+            (g ? engLabel + ' BUY entries held ' + hours + 'h, after the round trip at ' + usdShort(x) + ': ' + pc(g.avg) + ', ' + Math.round(g.win) + '% won (' + g.n + ')' : 'not graded yet') +
+            '. A BUY needs the round trip at or under the cost cap.', 'param:plan.tradeUsd');
+        })}
+      </div>
+      {p ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, fontSize: 10 }}>
+          <div><div style={SMALL_CAP}>{p.side}</div><b style={{ color: sig.fg }}>{px(p.entry)}</b></div>
+          <div><div style={SMALL_CAP}>TARGET</div><b style={{ color: C.good }}>{px(p.target)}</b></div>
+          <div><div style={SMALL_CAP}>STOP</div><b style={{ color: C.bad }}>{px(p.stop)}</b></div>
+          <div><div style={SMALL_CAP}>WITHIN</div><b style={{ color: C.text }}>{p.horizonHours}h</b></div>
+        </div>
+      ) : null}
+      {p && Number.isFinite(p.costPct) ? (
+        <div style={{ fontSize: 9.5, color: C.mid }} title={'EXECUTION COST on the DATA FLOW: ' + (p.costBasis === 'quote' ? 'from this token\'s real $10K route quote, scaled to the size' : 'from pool depth (no route quote yet), calibrated on real quotes') + ', plus 0.6% fees'}>
+          Round trip at {usdShort(p.tradeUsd)}: <b style={{ color: p.costPct <= 1 ? C.good : p.costPct <= 2 ? C.warn : C.bad }}>{p.costPct.toFixed(2)}%</b>
+          {' '}({p.costBasis === 'quote' ? 'real quote' : 'depth estimate'}) · the target has to clear this first
+        </div>
+      ) : null}
+      {p ? null : <Note>{d.signal ? d.signal + ' is not a trade: ' + (d.signalWhy || '') : 'No call yet.'}</Note>}
+      {d.signal === 'BUY' && eg ? (
+        <div title={'BUY entries of ' + engLabel + ' held ' + hours + 'h - see Evaluation'} style={{ fontSize: 9.5, color: C.mid, lineHeight: 1.45 }}>
+          <span style={{ color: sig.fg, fontWeight: 800 }}>{engLabel} BUY</span> held {hours}h has graded{' '}
+          <b style={{ color: eg.avg > (eg.board ? eg.board.avg : 0) ? C.good : C.bad }}>{pc(eg.avg)}</b>{eg.net ? ' after a ' + usdShort(tradeUsd) + ' round trip' : ''}, {Math.round(eg.win)}% won ({eg.n.toLocaleString()} entries)
+          {eg.board ? ' · every token: ' + pc(eg.board.avg) + ', ' + Math.round(eg.board.win) + '%' : ''}
+        </div>
+      ) : xg ? (
+        <div title={engLabel + ' SELL / SHORT calls taken as a short and held ' + hours + 'h - see Evaluation'} style={{ fontSize: 9.5, color: C.mid, lineHeight: 1.45 }}>
+          <span style={{ color: sig.fg, fontWeight: 800 }}>{engLabel} {d.signal}</span> as a short held {hours}h has graded{' '}
+          <b style={{ color: xg.avg >= 0 ? C.good : C.bad }}>{pc(xg.avg)}</b>, {Math.round(xg.win)}% won ({xg.n.toLocaleString()} calls)
+          {Number.isFinite(xg.vsMarket) ? ' · ' + pc(xg.vsMarket) + ' vs every token' : ''}
+        </div>
+      ) : g ? (
+        <div title={'From ' + report.moments.toLocaleString() + ' graded moments - see Evaluation'} style={{ fontSize: 9.5, color: C.mid, lineHeight: 1.45 }}>
+          <span style={{ color: sig.fg, fontWeight: 800 }}>{d.signal}</span> has graded{' '}
+          <b style={{ color: g.avgPct > (base ? base.avgPct : 0) ? C.good : C.bad }}>{pc(g.avgPct)}</b> over {graded.swing ? '24h' : '6h'},{' '}
+          {Math.round(g.winPct)}% won ({g.n.toLocaleString()} calls){base ? ' · every token: ' + pc(base.avgPct) + ', ' + Math.round(base.winPct) + '%' : ''}
+        </div>
+      ) : <div style={{ fontSize: 9.5, color: C.dim }}>No grading for this call yet - run the backtest (Evaluation).</div>}
+      <div style={{ ...SMALL_CAP, marginTop: 2 }}>WHAT MOVES THE ENTRY · EARLY {Number.isFinite(d.early) ? d.early : '—'}</div>
+      {earlyRows.length ? <Bars rows={earlyRows} labelWidth={92} /> : <Note>Not enough price history for EARLY yet.</Note>}
+      </Readable>
+    </Win>
+  );
+}
+
+/* --------------------------------------------------------- SAFETY & FLOW -- */
+
+/** Can it be traded safely, and who is moving it - the gates and the flow. */
+function SafetyWin({ v }) {
+  const d = v.d || {};
+  const m = d.measures || {};
+  const gates = d.gateChecks || [];
+  const n = (x, dp = 0) => (Number.isFinite(x) ? x.toFixed(dp) : '—');
+  const flow = m.netFlow;
+  const more = [['SOCIAL', v.openPopup.social], ['WALLETS', v.openPopup.wallets], ['ROTATION', v.openPopup.rotation]].filter(([, go]) => go);
+  return (
+    <Win title="SAFETY & FLOW" onOpen={v.openPopup.wallets}>
+      <Readable>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+        {gates.length ? gates.map((g) => (
+          <Status key={g.key} kind={g.ok === true ? 'good' : g.ok === false ? 'bad' : 'none'} title={g.detail || ''}>
+            {g.label.toLowerCase()}{g.ok === null ? ' · not checked' : ''}
+          </Status>
+        )) : <Note>Safety not checked yet.</Note>}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 12px', fontSize: 10 }}>
+        <div><div style={SMALL_CAP}>SMART BUYERS 1H</div><b style={{ color: C.text }}>{n(d.smartBuyers)}</b></div>
+        <div><div style={SMALL_CAP}>SMART SELLERS 1H</div><b style={{ color: (d.smartSellers || 0) >= 2 ? C.bad : C.text }}>{n(d.smartSellers)}</b></div>
+        <div><div style={SMALL_CAP}>NET FLOW</div><b style={{ color: Number.isFinite(flow) ? (flow >= 0 ? C.up : C.down) : C.dim }}>{Number.isFinite(flow) ? (flow >= 0 ? '+' : '') + (flow * 100).toFixed(0) + '%' : '—'}</b></div>
+        <div><div style={SMALL_CAP}>$10K IMPACT</div><b style={{ color: Number.isFinite(d.impactPct) && d.impactPct > 2 ? C.warn : C.text }}>{Number.isFinite(d.impactPct) ? d.impactPct.toFixed(2) + '%' : '—'}</b></div>
+        <div><div style={SMALL_CAP}>ORGANIC FLOW</div><b style={{ color: Number.isFinite(d.organicScore) && d.organicScore < 40 ? C.bad : C.text }}>{n(d.organicScore)}</b></div>
+        <div><div style={SMALL_CAP}>WALLET QUALITY</div><b style={{ color: C.text }}>{n(d.walletQualityScore)}</b></div>
+      </div>
+      {more.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 'auto', alignItems: 'center' }}>
+          <span style={{ ...SMALL_CAP, marginRight: 2 }}>MORE</span>
+          {more.map(([label, go]) => (
+            <span key={label} className="hf6f5791f" onClick={go} style={{ padding: '3px 9px', borderRadius: 999, border: '1px solid #2b3a60',
+              color: '#b6c2de', fontSize: 9, fontWeight: 700, letterSpacing: 0.5, cursor: 'pointer' }}>{label} ⤢</span>
+          ))}
+        </div>
+      )}
+      </Readable>
+    </Win>
+  );
+}
+
+/* ------------------------------------------------------------------ page -- */
+
+/** The phone token screen's top bar: back to the list, the token, its call. */
+function MobileTokenBar({ v, onBack }) {
+  const d = v.d || {};
+  const sig = signalInfo(d.signal);
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px 10px 6px', background: '#0a1226',
+      borderBottom: '1px solid #1c2a4d', flexShrink: 0
+    }}>
+      <button type="button" onClick={onBack} aria-label="Back to the token list" style={{
+        display: 'flex', alignItems: 'center', gap: 4, height: 40, padding: '0 10px 0 6px', background: 'none',
+        border: 'none', color: '#6ea0ff', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', flexShrink: 0
+      }}>
+        <svg width="10" height="16" viewBox="0 0 10 16"><path d="M8 2L2 8l6 6" fill="none" stroke="#6ea0ff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        Tokens
+      </button>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 17, fontWeight: 800, color: C.white, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.sym || '—'}</div>
+        <div style={{ fontSize: 10.5, color: C.mid, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.name || ''}</div>
+      </div>
+      <div style={{ textAlign: 'right', flexShrink: 0 }} title={d.signalWhy || ''}>
+        <div style={{ fontSize: 9, letterSpacing: 1, fontWeight: 700, color: phaseColor(d.phase) }}>{d.phase || 'NO PHASE YET'}</div>
+        <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 0.8, color: sig.fg }}>{d.signal || '—'}</div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The phone layout: the list, or one token's screen. Opening a token pushes a
+ * history entry, so the system back gesture returns to the list instead of
+ * leaving the app.
+ */
+function MobileLive({ v }) {
+  const [view, setView] = React.useState('list');
+  const scrollRef = React.useRef(null);
+  React.useEffect(() => {
+    const onPop = () => setView('list');
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+  const openToken = () => {
+    if (view !== 'token') window.history.pushState({ vsToken: true }, '');
+    setView('token');
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  };
+  const back = () => {
+    if (window.history.state && window.history.state.vsToken) window.history.back();
+    else setView('list');
+  };
+
+  if (view === 'list' || !v.hasSelection) {
+    return (
+      <div data-screen-label="Live opportunities" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <TokenRail v={v} mobile onPick={openToken} />
+      </div>
+    );
+  }
+  return (
+    <MobileCtx.Provider value>
+      <div data-screen-label="Live opportunities" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <MobileTokenBar v={v} onBack={back} />
+        <div ref={scrollRef} style={{
+          flex: 1, minHeight: 0, overflowY: 'auto', WebkitOverflowScrolling: 'touch',
+          padding: '12px 12px calc(16px + env(safe-area-inset-bottom))', display: 'flex', flexDirection: 'column', gap: 12
+        }}>
+          <DetailWin v={v} />
+          <CycleWin v={v} />
+          <PlanWin v={v} />
+          <SafetyWin v={v} />
+        </div>
+      </div>
+    </MobileCtx.Provider>
+  );
+}
+
+export default function LiveOpportunities({ v }) {
+  const mobile = useMobile();
+  if (!v.isLive) return false;
+  if (mobile) return <MobileLive v={v} />;
+  return (
+    <div data-screen-label="Live opportunities" style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+      <TokenRail v={v} />
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+        {v.hasSelection ? (<>
+          <AssetBar v={v} />
+          <div style={{
+            flex: 1, minHeight: 0, display: 'grid', gap: 10, padding: '10px 14px 12px',
+            gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gridTemplateRows: 'minmax(0, 1.3fr) minmax(0, 1fr)'
+          }}>
+            {/* The call on top; under it the three things a buy or sell rests on.
+                Social, wallets and rotation stay one click away (SAFETY & FLOW). */}
+            <DetailWin v={v} />
+            <CycleWin v={v} />
+            <PlanWin v={v} />
+            <SafetyWin v={v} />
+          </div>
+        </>) : (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: '#6b7699' }}>
+            {(v.rows || []).length ? 'Pick a token from the list.' : 'Waiting for the board to load…'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }

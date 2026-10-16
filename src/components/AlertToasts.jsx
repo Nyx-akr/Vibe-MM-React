@@ -1,4 +1,5 @@
 import React from 'react';
+import { useMobile } from '../utils/useMobile';
 
 /**
  * The three most recent ALERT CARDS, mirrored bottom-right.
@@ -14,20 +15,25 @@ import React from 'react';
  * this file knowing those classes exist.
  */
 export default function AlertToasts({ v, css }) {
-  const toasts = v.toasts || [];
+  // A phone has room for one card without hiding the page: the newest shows,
+  // the rest are counted in +N MORE and step up as each is closed.
+  const mobile = useMobile();
+  const all = v.toasts || [];
+  const toasts = mobile ? all.slice(0, 1) : all;
+  const backlog = (v.toastBacklog || 0) + (all.length - toasts.length);
   if (!toasts.length) return null;
 
   return (
     <div style={{
-      position: 'fixed', right: 18, bottom: 18, zIndex: 60,
+      position: 'fixed', right: 'min(18px, 3vw)', bottom: 'calc(min(18px, 3vw) + env(safe-area-inset-bottom))', zIndex: 60,
       display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8,
       pointerEvents: 'none'
     }}>
       {/* Sits above the stack so it never moves when a card is dismissed. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, pointerEvents: 'auto' }}>
-        {v.toastBacklog > 0 && (
+        {backlog > 0 && (
           <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.6, color: '#6b7699' }}>
-            +{v.toastBacklog} MORE
+            +{backlog} MORE
           </span>
         )}
         <span
@@ -50,7 +56,7 @@ export default function AlertToasts({ v, css }) {
         <div
           key={t.key}
           style={{
-            width: 340, display: 'flex', pointerEvents: 'auto',
+            width: 'min(340px, 94vw)', display: 'flex', pointerEvents: 'auto',
             background: 'rgba(13,23,48,.97)', border: `1px solid ${t.accent}`,
             borderRadius: 14, overflow: 'hidden',
             boxShadow: '0 12px 40px rgba(0,0,0,.55)',
@@ -103,7 +109,7 @@ export default function AlertToasts({ v, css }) {
                   letterSpacing: 0.6, color: t.accent, flexShrink: 0
                 }}
               >
-                OPEN CARD →
+                {t.openLabel || 'OPEN CARD →'}
               </span>
             </div>
           </div>

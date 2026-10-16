@@ -25,6 +25,7 @@
  */
 
 import { storeOrigin } from './storage/raw-store';
+import { PHASES, SIGNALS, ENGINES } from '../flow/score-flow';
 
 const DB_NAME = 'vibescreener-trails';
 const STORE = 'trail';
@@ -77,9 +78,26 @@ export function recordTrail(chainKey, tokenAddress, full) {
   if (now - (lastMarkAt.get(id) || 0) < MARK_GAP_MS) return;
   lastMarkAt.set(id, now);
 
-  const parts = [...(full.scoreModel || []), ...(full.scoreModifiers || [])];
-  const keys = parts.map((p) => p.key);
-  const mark = [now, round1(full.score), round1(full.scoreNow), ...parts.map((p) => (p.pending ? null : round1(p.value)))];
+  // A mark is [t, EARLY, EARLY RAW, ...the EARLY inputs, then the call]:
+  // WHICH safety gates vetoed (a bitmask in GATES order, 0 = none), the phase
+  // and signal as their index in PHASES / SIGNALS (numbers, like every other
+  // column; null when there is none), and the smart-money counts.
+  const parts = full.scoreModel || [];
+  const checks = (full.gates && full.gates.checks) || [];
+  const vetoMask = checks.reduce((m, c, n) => (c.ok === false ? m | (1 << n) : m), 0);
+  const code = (list, x) => { const n = list.indexOf(x); return n >= 0 ? n : null; };
+  const smart = full.smart || {};
+  // Then every engine's own call and score (flow/score-flow.js ENGINES), so
+  // all six are graded on what was live, not only the profile that was on.
+  const engines = full.engines || {};
+  const engineKeys = ENGINES.map((e) => e.key);
+  const keys = [...parts.map((p) => p.key), 'vetoMask', 'phaseCode', 'signalCode', 'smartBuyers', 'smartSellers',
+    ...engineKeys.flatMap((k) => ['call.' + k, 'score.' + k])];
+  const mark = [now, round1(full.score), round1(full.rawScore),
+    ...parts.map((p) => (p.pending ? null : round1(p.value))),
+    vetoMask, code(PHASES, full.phase), code(SIGNALS, full.signal),
+    Number.isFinite(smart.buyers) ? smart.buyers : null, Number.isFinite(smart.sellers) ? smart.sellers : null,
+    ...engineKeys.flatMap((k) => { const e = engines[k] || {}; return [code(SIGNALS, e.signal), Number.isFinite(e.score) ? round1(e.score) : null]; })];
   const entry = pending.get(id) || { keys, marks: [] };
   entry.keys = keys;
   entry.marks.push(mark);

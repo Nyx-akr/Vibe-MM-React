@@ -1,9 +1,7 @@
 import React from 'react';
 import { fmtUsd, chainColor } from '../utils/formatters';
 import { chainKeyToName } from '../data/chains';
-import {
-  rotationChains, rotationGraphFor, rotationIntelStatus,
-} from '../services/rotation-intel';
+import { boardValue } from '../flow/board-flow';
 
 /**
  * Where capital is rotating across every chain we watch, as ribbons.
@@ -93,38 +91,25 @@ const span = (fromMs, toMs) => {
 /* -------------------------------------------------------------- flows --- */
 
 /**
- * One chain's graph as directed flows, labelled.
- *
- * Tickers that repeat within the chain get their address tail, for the same
- * reason the ROTATION tab does it: "$STONK -> $STONK" is two pools, not one.
+ * A label per pool of one chain. Tickers that repeat within the chain get
+ * their address tail, for the same reason the ROTATION tab does it:
+ * "$STONK -> $STONK" is two pools, not one.
  */
-function chainFlows(graph) {
+function labellerFor(nodes) {
   const tickerCount = new Map();
   const symbolOf = new Map();
-  (graph.nodes || []).forEach((n) => {
+  (nodes || []).forEach((n) => {
     symbolOf.set(n.poolAddress, n.symbol);
     if (!n.symbol) return;
     const k = tick(n.symbol);
     tickerCount.set(k, (tickerCount.get(k) || 0) + 1);
   });
-  const labelFor = (pool) => {
+  return (pool) => {
     const symbol = symbolOf.get(pool);
     if (!symbol) return poolLabel(pool);
     const base = tick(symbol);
     return (tickerCount.get(base) || 0) < 2 ? base : base + '·' + String(pool).slice(-4);
   };
-
-  const flows = [];
-  (graph.edges || []).forEach((e) => {
-    if (e.dominantUsd > 0) {
-      flows.push({ from: e.sourcePool, to: e.targetPool, usd: e.dominantUsd, wallets: e.sharedWallets });
-    }
-    if (e.counterUsd > 0) {
-      flows.push({ from: e.targetPool, to: e.sourcePool, usd: e.counterUsd, wallets: e.sharedWallets });
-    }
-  });
-  flows.sort((a, b) => b.usd - a.usd);
-  return { flows, labelFor };
 }
 
 /**
@@ -211,22 +196,19 @@ function layoutChain(drawn, labelFor, scale) {
 export function marketRotationVals(app) {
   if (app.state.page !== 'market') return { isMarket: false };
 
-  const svc = rotationIntelStatus();
+  // The DATA FLOW's ROTATION SERVICE and MARKET ROTATION boxes
+  // (flow/board-flow.js): every chain's directed flows, busiest chain first,
+  // the net gainers and losers, the totals. This tab lays them out.
+  const svc = boardValue('ROTATION SERVICE') || {};
+  const market = boardValue('MARKET ROTATION') || { chains: [], gainers: [], losers: [], poolsSampled: 0, rotatedUsd: 0, parallelUsd: 0 };
   const assets = app.assets || [];
   const openFor = (poolAddress) => {
     const hit = assets.find((a) => a.poolAddress === poolAddress);
-    return hit ? () => app.setState({ page: 'rotation', selectedId: hit.id }) : null;
+    return hit ? () => app.setState({ page: 'live', popup: 'rotation', selectedId: hit.id }) : null;
   };
 
-  const held = rotationChains()
-    .map((c) => ({ ...c, graph: rotationGraphFor(c.chain) }))
-    .filter((c) => c.graph);
-
-  const built = held.map((c) => {
-    const { flows, labelFor } = chainFlows(c.graph);
-    const drawn = flows.slice(0, FLOWS_PER_CHAIN);
-    return { ...c, flows, drawn, labelFor };
-  });
+  const held = market.chains.map((c) => ({ ...c, graph: c, labelFor: labellerFor(c.nodes) }));
+  const built = held.map((c) => ({ ...c, drawn: c.flows.slice(0, FLOWS_PER_CHAIN) }));
   const rotating = built.filter((c) => c.drawn.length);
   const quiet = built.filter((c) => !c.drawn.length);
 
@@ -277,30 +259,23 @@ export function marketRotationVals(app) {
 
   // Net winners and losers, from the same graphs the ribbons came from, so the
   // list and the chart describe one moment rather than two.
-  const nodes = held.flatMap((c) => {
-    const { labelFor } = chainFlows(c.graph);
-    return (c.graph.nodes || [])
-      .filter((n) => n.rotatedUsd > 0 && n.netRotationUsd !== 0)
-      .map((n) => {
-        const name = chainKeyToName[c.chain] || c.chain.toUpperCase();
-        return {
-          key: c.chain + ':' + n.poolAddress,
-          label: labelFor(n.poolAddress),
-          chain: name,
-          chainColor: chainColor(name),
-          net: n.netRotationUsd,
-          val: signed(n.netRotationUsd),
-          open: openFor(n.poolAddress),
-          tip: 'took in ' + fmtUsd(n.inUsd) + ', gave up ' + fmtUsd(n.outUsd) + ' on ' + c.chain,
-        };
-      });
-  });
-  const gainers = nodes.filter((n) => n.net > 0).sort((a, b) => b.net - a.net).slice(0, 6);
-  const losers = nodes.filter((n) => n.net < 0).sort((a, b) => a.net - b.net).slice(0, 6);
-
-  const poolsSampled = held.reduce((s, c) => s + (c.graph.poolsSampled || 0), 0);
-  const rotatedUsd = held.reduce((s, c) => s + (c.graph.rotatedUsd || 0), 0);
-  const parallelUsd = held.reduce((s, c) => s + (c.graph.parallelUsd || 0), 0);
+  const labelOn = new Map(held.map((c) => [c.chain, c.labelFor]));
+  const mover = (n) => {
+    const name = chainKeyToName[n.chain] || n.chain.toUpperCase();
+    return {
+      key: n.chain + ':' + n.poolAddress,
+      label: labelOn.get(n.chain)(n.poolAddress),
+      chain: name,
+      chainColor: chainColor(name),
+      net: n.net,
+      val: signed(n.net),
+      open: openFor(n.poolAddress),
+      tip: 'took in ' + fmtUsd(n.inUsd) + ', gave up ' + fmtUsd(n.outUsd) + ' on ' + n.chain,
+    };
+  };
+  const gainers = market.gainers.map(mover);
+  const losers = market.losers.map(mover);
+  const { poolsSampled, rotatedUsd, parallelUsd } = market;
 
   return {
     isMarket: true,

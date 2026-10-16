@@ -1,6 +1,6 @@
 import React from 'react';
 import { fetchChartHistory, CHART_RANGES } from '../services/api';
-import { SCORE_MODEL, SCORE_MODIFIERS } from '../calculations/asset-detail';
+import { EARLY_MODEL } from '../flow/score-flow';
 
 const PriceChart = React.lazy(() => import('./PriceChart'));
 
@@ -18,20 +18,20 @@ const PriceChart = React.lazy(() => import('./PriceChart'));
  * not - the caption says how much of the range the trail covers.
  */
 
-const AVG = { key: '__avg', label: 'Avg score', color: '#f06ee2', width: 2 };
-const NOW = { key: '__now', label: 'Score (this poll)', color: '#c9a2ff', width: 1, dashed: true };
+// The trail's two headline columns (services/score-trail.js): EARLY as the
+// model scored it, and EARLY RAW - the same before the safety gates.
+const AVG = { key: '__avg', label: 'EARLY', color: '#f06ee2', width: 2 };
+const NOW = { key: '__now', label: 'EARLY before safety', color: '#c9a2ff', width: 1, dashed: true };
 
 // Fourteen components need fourteen hues that stay apart on a near-black
 // surface. Grouped loosely: flow (blues), market (greens), holders/wallets
 // (ambers), confirmation (teals), quality (greys/violets).
 const PALETTE = {
-  volumeAnomaly: '#4d8dff', tradeActivity: '#7fb0ff', buyerBreadth: '#3ddc97', netDemand: '#9be37a',
-  liquidity: '#4fc3f7', priceConfirmation: '#ffd166', holderGrowth: '#ffb454', walletQuality: '#ff8a5c',
-  capitalRotation: '#ff5f7e', crossVenue: '#5ee6d0', usdReference: '#a0e8ff', dataQuality: '#a3aed0',
-  organicFlow: '#b38bff', contractSafety: '#e6e6e6',
+  earlyRoom: '#3ddc97', earlyWaking: '#4d8dff', earlySeasoning: '#ffb454', earlyHolding: '#ff8a5c',
+  earlyInterest: '#4fc3f7', earlyHolders: '#b38bff', earlyRepeat: '#a3aed0',
 };
 
-const COMPONENTS = [...SCORE_MODEL, ...SCORE_MODIFIERS].map((c) => ({
+const COMPONENTS = EARLY_MODEL.map((c) => ({
   key: c.key, label: c.label, color: PALETTE[c.key] || '#a3aed0', weight: c.weight,
 }));
 
@@ -46,8 +46,8 @@ function savePrefs(p) {
 const REFRESH_MS = 30000;
 
 const NOTES = {
-  not_collected: 'The collector has not pulled bars for this pool yet — the 7-day history fills in within a couple of hours of a pool reaching the board',
-  local_history: 'Drawn from our own 15s price samples until GeckoTerminal bars arrive',
+  not_collected: 'No price recorded for this pool yet — the collector is fetching its candles now',
+  local_history: 'Drawn from our own recorded prices (every minute since the token reached our board) until GeckoTerminal candles arrive',
 };
 
 function ago(ms) {
@@ -57,7 +57,15 @@ function ago(ms) {
   return h < 48 ? h + 'h' : Math.round(h / 24) + 'd';
 }
 
-export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) {
+/**
+ * `compact` is the dashboard window: no card of its own (the window is the
+ * card), the chart fills whatever height the window leaves it, and the line
+ * toggles shrink to one tight block under it.
+ *
+ * `touch` (with compact) is the phone layout: a fixed-height plot with the
+ * toggles flowing below it at finger size, instead of sharing one height.
+ */
+export default function ScoreHistoryChart({ chain, pool, token, height = 360, compact = false, touch = false }) {
   const saved = React.useMemo(loadPrefs, []);
   const [range, setRange] = React.useState((saved && saved.range) || '6H');
   const [shown, setShown] = React.useState(() => new Set((saved && saved.shown) || [AVG.key]));
@@ -127,13 +135,13 @@ export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) 
   const firstComponent = marks.find((m) => !m.fromJournal);
   const coverage = !marks.length
     ? 'no scores recorded for this token in range yet — they fill while the app is open'
-    : (trailSpan >= rangeMs * 0.9 ? 'avg score covers the full range'
-      : 'avg score from the last ' + ago(Date.now() - marks[0].t)) +
+    : (trailSpan >= rangeMs * 0.9 ? 'EARLY covers the full range'
+      : 'EARLY from the last ' + ago(Date.now() - marks[0].t)) +
       (firstComponent && firstComponent.t - marks[0].t > 5 * 60000
         ? ' · components from the last ' + ago(Date.now() - firstComponent.t) + ' (not saved before)'
         : '') +
       ' · gaps = app closed';
-  const title = 'PRICE & SCORE · ' + ((data && data.interval) || '') + ' CANDLES';
+  const title = 'PRICE & EARLY · ' + ((data && data.interval) || '') + ' CANDLES';
   // What each chip reads right now: the latest mark's value.
   const latest = marks[marks.length - 1] || null;
   const valueOf = (key) => {
@@ -151,7 +159,7 @@ export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) 
         title={on ? 'Hide ' + item.label : 'Show ' + item.label}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer',
-          padding: '3px 8px', borderRadius: 999, fontSize: 9.5, fontFamily: 'inherit',
+          padding: touch ? '6px 10px' : compact ? '1.5px 6px' : '3px 8px', borderRadius: 999, fontSize: touch ? 11.5 : compact ? 8.5 : 9.5, fontFamily: 'inherit',
           border: '1px solid ' + (on ? item.color : '#1c2a4d'),
           background: on ? item.color + '1f' : 'transparent',
           color: on ? '#dfe6f6' : '#6b7699',
@@ -168,13 +176,15 @@ export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) 
   };
 
   return (
-    <div style={{ background: '#0a1226', border: '1px solid #1c2a4d', borderRadius: 10, padding: 12 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
-        <span style={{ fontSize: 9, letterSpacing: 1.2, color: '#8b96b8', fontWeight: 600 }}>{title}</span>
-        <div style={{ display: 'flex', gap: 4 }}>
+    <div style={compact
+      ? (touch ? { display: 'flex', flexDirection: 'column' } : { height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 })
+      : { background: '#0a1226', border: '1px solid #1c2a4d', borderRadius: 10, padding: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: compact ? 6 : 8, flexShrink: 0 }}>
+        <span style={{ fontSize: touch ? 11 : 9, letterSpacing: 1.2, color: '#8b96b8', fontWeight: 600 }}>{title}</span>
+        <div style={{ display: 'flex', gap: touch ? 6 : 4 }}>
           {Object.keys(CHART_RANGES).map((r) => (
             <button key={r} type="button" onClick={() => setRange(r)} style={{
-              padding: '3px 10px', borderRadius: 6, fontSize: 10, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+              padding: touch ? '8px 14px' : '3px 10px', borderRadius: touch ? 8 : 6, fontSize: touch ? 12.5 : 10, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
               border: '1px solid ' + (r === range ? '#4d8dff' : '#1c2a4d'),
               background: r === range ? '#0e2a5c' : 'transparent', color: r === range ? '#dfe6f6' : '#6b7699',
             }}>{r}</button>
@@ -182,24 +192,38 @@ export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) 
         </div>
       </div>
 
-      <React.Suspense fallback={<div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: '#3a4568' }}>Loading chart…</div>}>
+      <div style={touch ? { height: 260 } : compact ? { flex: 1, minHeight: 0 } : undefined}>
+      <React.Suspense fallback={<div style={{ height: compact ? '100%' : height, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: '#3a4568' }}>Loading chart…</div>}>
         <PriceChart
           bars={bars}
           lines={lines}
-          height={height}
+          height={compact ? '100%' : height}
           hasVolume={hasVolume}
           fitKey={chain + ':' + pool + ':' + range}
           note={loading ? 'Loading ' + range + ' history…' : bars.length > 1 ? (NOTES[data && data.reason] || '') : (NOTES[data && data.reason] || 'No price history for this pool in range')}
         />
       </React.Suspense>
+      </div>
 
+      {/* The dashboard keeps the same toggles, just tighter, under the chart. */}
+      {compact && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: touch ? 6 : 3, marginTop: touch ? 12 : 6, flexShrink: 0 }}>
+          {chip(AVG)}
+          {chip(NOW)}
+          {COMPONENTS.map(chip)}
+          <button type="button" onClick={() => setAll(true)} style={{ ...linkBtn, fontSize: touch ? 12 : 8.5, marginLeft: 4, padding: touch ? '6px 4px' : 0 }}>all</button>
+          <button type="button" onClick={() => setAll(false)} style={{ ...linkBtn, fontSize: touch ? 12 : 8.5, padding: touch ? '6px 4px' : 0 }}>EARLY only</button>
+        </div>
+      )}
+
+      {!compact && (<>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, margin: '10px 0 6px', flexWrap: 'wrap' }}>
         <span style={{ fontSize: 9.5, color: '#6b7699' }}>
-          Left axis: score 0–100 · right axis: price · {coverage}
+          Left axis: EARLY 0–100 · right axis: price · {coverage}
         </span>
         <span style={{ display: 'flex', gap: 6 }}>
           <button type="button" onClick={() => setAll(true)} style={linkBtn}>show all</button>
-          <button type="button" onClick={() => setAll(false)} style={linkBtn}>score only</button>
+          <button type="button" onClick={() => setAll(false)} style={linkBtn}>EARLY only</button>
         </span>
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
@@ -207,6 +231,7 @@ export default function ScoreHistoryChart({ chain, pool, token, height = 360 }) 
         {chip(NOW)}
         {COMPONENTS.map(chip)}
       </div>
+      </>)}
     </div>
   );
 }

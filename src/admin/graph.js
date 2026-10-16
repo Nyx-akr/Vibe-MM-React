@@ -23,7 +23,7 @@ import { dashboardItems } from './dashboard-items';
 import { SHOWN_PAGES } from './pipeline-shown';
 import { boardValues } from '../flow/board-flow';
 // Registers PAGES.pipe - the score pipeline - before anything walks PAGES.
-import { RAW } from './pipeline';
+import { RAW, SOURCE_STORES } from './pipeline';
 
 /* ------------------------------------------------------------- stores --- */
 
@@ -158,11 +158,11 @@ export const PAGE_COLORS = {
  * the number the whole map is for.
  */
 export const STAGES = {
-  1: { title: '1 · TOKEN LIST', color: '#e2e8f0' },
-  2: { title: '2 · READINGS', color: '#e2e8f0' },
+  1: { title: '1 · SOURCES & HISTORY', color: '#e2e8f0' },
+  2: { title: '2 · MEASURES', color: '#e2e8f0' },
   3: { title: '3 · ENGINES', color: '#f43f5e' },
-  4: { title: '4 · GATES', color: '#94a3b8' },
-  5: { title: '5 · COMBINE', color: '#ffd60a' },
+  4: { title: '4 · SAFETY', color: '#94a3b8' },
+  5: { title: '5 · THE CALL', color: '#ffd60a' },
 };
 
 export const KIND_COLORS = {
@@ -202,6 +202,8 @@ export const FILE_SOURCES = {
   '/raw/ethos.json': ['ethos'],
   '/raw/social.json': ['reddit', '4chan', 'mastodon', 'warpcast', 'bluesky'],
 };
+SOURCE_STORES.forEach((st) => { FILE_SOURCES[st.path] = [st.from]; });
+
 /** Files the server builds from another file rather than from an API. */
 const FILE_FROM_FILE = [
   ['/raw/<chain>/observations.json', '/raw/<chain>/observations-48h.json'],
@@ -317,7 +319,7 @@ export function buildGraph(v) {
                 value: o.id === field.ops.out ? field.value : o.value, note: o.note || null,
                 weight: o.id === field.ops.out ? field.weight : null },
               stage: group.stage || null, flat: true, calcGroup, home,
-              calcParent: calcGroup ? group.parent || null : null,
+              calcParent: calcGroup ? group.parent || null : null, calcGroupLabel: calcGroup ? group.label || null : null,
               opGroup: fid, opGroupLabel: field.label,
             });
           });
@@ -339,7 +341,7 @@ export function buildGraph(v) {
           id: fid, kind: 'field', page, group: group.group,
           label: field.label, status: field.status || 'live', field,
           stage: group.stage || null, flat: Boolean(group.flat || calcGroup || home), calcGroup, home,
-          calcParent: calcGroup ? group.parent || null : null,
+          calcParent: calcGroup ? group.parent || null : null, calcGroupLabel: calcGroup ? group.label || null : null,
         });
 
         const toks = tokensOf(field);
@@ -806,5 +808,52 @@ export function layout(graph) {
   return {
     nodes: placed, edges: graph.edges, back, captions,
     width: Math.max(x - COL_GAP, 1), height: HEADER + tallest,
+  };
+}
+
+/**
+ * AN ENGINE PROFILE'S MAP: only what its call is made of. Every box upstream
+ * of SIGNAL and TRADE PLAN (SIGNAL is wired to the profile's engine alone, so
+ * this is that engine's own chain: its sources, measures, score, call and
+ * parameters; the phase and safety every engine shares appear as their
+ * result boxes only), where the call goes next
+ * (one step downstream), the token list, and the stores of the sources it
+ * reads. Nothing is cut - a hidden box still runs; it is just not drawn here.
+ */
+export function focusGraph(graph) {
+  const seeds = ['f:pipe:SIGNAL', 'f:pipe:TRADE PLAN'];
+  const ins = new Map();
+  graph.edges.forEach((e) => { if (e.soft) return; if (!ins.has(e.to)) ins.set(e.to, []); ins.get(e.to).push(e.from); });
+  // Every engine reads the same phase, gates and perp check; drawn as the
+  // boxes they are, without their own (identical) upstream, so what is left
+  // is what makes this engine different.
+  const shared = new Set(['f:pipe:PHASE', 'f:pipe:VETO LOG', 'f:pipe:PERP LISTED', 'f:pipe:ABOVE 6H LOW', 'f:pipe:PRICE']);
+  const keep = new Set();
+  const queue = seeds.filter((id) => graph.nodes.some((n) => n.id === id));
+  queue.forEach((id) => keep.add(id));
+  while (queue.length) {
+    const id = queue.shift();
+    if (shared.has(id)) continue;
+    (ins.get(id) || []).forEach((f) => { if (!keep.has(f)) { keep.add(f); queue.push(f); } });
+  }
+  graph.edges.forEach((e) => { if (seeds.indexOf(e.from) !== -1) keep.add(e.to); });
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  graph.nodes.forEach((n) => {
+    if (n.page === 'pipe' && n.stage === 1 && !n.home) keep.add(n.id);                         // the token list
+    if (n.kind === 'file' && /^\/history\//.test(n.path || '')) {                              // a kept source's store
+      if ((ins.get(n.id) || []).some((p) => keep.has(p) && (byId.get(p) || {}).kind === 'provider')) keep.add(n.id);
+    }
+  });
+  // A store's box, and the grading that reads the stores, follow their files.
+  graph.edges.forEach((e) => {
+    const from = byId.get(e.from);
+    if (from && from.kind === 'file' && keep.has(e.from) && /^\/history\//.test(from.path || '')) keep.add(e.to);
+  });
+  keep.add('f:pipe:ENGINE GRADING');
+  return {
+    ...graph,
+    nodes: graph.nodes.filter((n) => keep.has(n.id)),
+    edges: graph.edges.filter((e) => keep.has(e.from) && keep.has(e.to)),
+    focused: true,
   };
 }

@@ -2,11 +2,7 @@ import React from 'react';
 import { UNAVAILABLE, fmtUsd } from '../utils/formatters';
 import { explorerAddressUrl } from '../data/chains';
 import { shortAddress, normalizeRegistry } from '../data/wallet-registry';
-import {
-  walletIntelForPool, walletProfile, walletIntelStatus, recentClusters,
-} from '../services/wallet-intel';
-import { walletQualityScore } from '../calculations/core';
-import { rotationForPool } from '../services/rotation-intel';
+import { boardValue } from '../flow/board-flow';
 import { packBubbles } from '../utils/bubble-layout';
 import WalletBubbleMap from '../components/WalletBubbleMap';
 import { setInput } from '../services/storage/input-store';
@@ -144,27 +140,16 @@ export function walletsVals(app, sel) {
 
   const ticker = String((sel.sym || '')).replace(/^\$/, '').toUpperCase();
 
-  // Two sources for the same token, preferred in this order:
-  //
-  //   1. the on-demand read, which forced a fresh sample of THIS pool and is
-  //      the only one that carries the holder list;
-  //   2. the background service, which has been processing every held pool all
-  //      along - so switching token usually paints immediately instead of
-  //      sitting on "sampling..." until the next poll returns.
-  //
-  // A payload for the previously selected token is neither: showing it under
-  // this token's name would caption the wrong data.
-  const onDemand = api && api.server === 'ok' &&
-    (!sel.tokenAddress || !api.tokenAddress || api.tokenAddress === sel.tokenAddress)
-    ? api : null;
-  const fromStore = walletIntelForPool(sel.poolAddress);
-  const source = onDemand || fromStore;
+  // The selected token's trade sample - the on-demand read of this pool, or
+  // the background service's - is the DATA FLOW's TOKEN WALLETS box, and every
+  // number below is one of its WALLET boxes (flow/board-flow.js). This tab
+  // only lays them out.
+  const source = boardValue('TOKEN WALLETS');
 
-  if (!source || !source.rows || !source.rows.length) {
+  if (!source) {
     // How far the collector's first lap has got on the board, so a queued pool
     // reads as queued rather than stuck.
-    const board = (app.assets || []).filter((a) => a.poolAddress);
-    const covered = board.filter((a) => walletIntelForPool(a.poolAddress)).length;
+    const cov = boardValue('WALLET COVERAGE') || { covered: 0, pools: 0 };
     return {
       ...shell,
       walletsReady: false,
@@ -172,7 +157,7 @@ export function walletsVals(app, sel) {
       walletsNotice: st.serverError
         ? 'The raw store is unreachable, so no trade samples could be read. Nothing is shown rather than simulated.'
         : 'Waiting for this pool’s trades — the collector samples every board pool in turn, never-sampled pools first. ' +
-          covered + ' of ' + board.length + ' board pools have trades so far; GeckoTerminal allows roughly ' +
+          cov.covered + ' of ' + cov.pools + ' board pools have trades so far; GeckoTerminal allows roughly ' +
           'ten pools a minute, so a full lap takes ~15 minutes after a fresh start (a restart keeps what it has).',
     };
   }
@@ -180,27 +165,22 @@ export function walletsVals(app, sel) {
   const chainKey = (sel.rawServerRow && sel.rawServerRow.chain) || source.chain;
   const w = source.window;
   const flow = source.flow;
-  const counts = source.counts;
   const filter = st.walletFilter || 'ALL';
 
-  // WALLET QUALITY is produced by the wallets module (walletQualityScore in
-  // core.js) and consumed by the score model - not the other way round.
-  //
-  // The scoring pass runs it for every row with the fullest input set it has,
-  // and the result rides along on the asset, so the preferred move here is to
-  // display that object rather than run the function again: recomputing with
-  // whatever context this tab happens to hold produced a DIFFERENT number for
-  // the same token whenever the provider holder list was missing and only the
-  // score's Jupiter fallback filled the gap. Recomputing locally is the
-  // fallback, for a pool the board has not scored.
-  const quality = sel.walletQuality || walletQualityScore(source, {
-    topHolderSharePct: source.holderSharePct,
-    holderSource: source.holderSharePct === null ? null : 'GoPlus, pool excluded',
-  });
+  // WALLET QUALITY is the score flow's Wallet quality box, riding on the asset.
+  const quality = sel.walletQuality || { score: null, grade: null, parts: [], measured: 0, total: 0 };
 
-  // Turnover between this token and the others we sample. Read, not fetched:
-  // the rotation service builds its graph from the same trade sample.
-  const rot = rotationForPool(sel.poolAddress);
+  // Turnover between this token and the others we sample: TOKEN ROTATION.
+  const rot = boardValue('TOKEN ROTATION');
+  const ranks = boardValue('WALLET RANKS') || { byTurnover: [], byNet: [] };
+  const groups = boardValue('WALLET GROUPS') || {};
+  const history = boardValue('WALLET HISTORY') || {};
+  const activeWallets = boardValue('ACTIVE WALLETS');
+  const netFlow = boardValue('WALLET NET FLOW');
+  const buyers = boardValue('BUYER WALLETS');
+  const sellers = boardValue('SELLER WALLETS');
+  const topShare = boardValue('TOP WALLET SHARE');
+  const coEntry = boardValue('CO-ENTRY WALLETS');
 
   // The pool contract trades against everybody, so it is excluded from the
   // behavioural table; it stays visible in the holder panel, labelled.
@@ -256,7 +236,8 @@ export function walletsVals(app, sel) {
   // half and draws a seven-wallet group as six. The cluster is the most
   // interesting thing on the chart; it is never the thing that gets trimmed.
   const BUBBLE_CAP = 90;
-  const byTurnover = [...visible].sort((a, b) => b.grossUsd - a.grossUsd);
+  const shown = new Map(visible.map((r) => [r.address, r]));
+  const byTurnover = ranks.byTurnover.filter((addr) => shown.has(addr)).map((addr) => shown.get(addr));
   const bubbleSource = (() => {
     const head = byTurnover.slice(0, BUBBLE_CAP);
     const chosen = new Set(head.map((r) => r.address));
@@ -339,9 +320,9 @@ export function walletsVals(app, sel) {
   // the wallet's NET: a net buyer is pulled out of the pool, a net seller
   // pushes back into it. Thickness is how much, on the same square-root scale
   // the bubbles use, so a thick arrow and a big bubble mean the same thing.
-  const byFlow = [...packed.bubbles]
-    .filter((b) => Math.abs(b.data.netUsd) > 0)
-    .sort((a, b) => Math.abs(b.data.netUsd) - Math.abs(a.data.netUsd))
+  // In the flow's WALLET RANKS order (largest |net| first).
+  const packedAt = new Map(packed.bubbles.map((b) => [b.id, b]));
+  const byFlow = ranks.byNet.filter((addr) => packedAt.has(addr)).map((addr) => packedAt.get(addr))
     .slice(0, MAX_ARROWS);
   const flowPeak = byFlow.length ? Math.abs(byFlow[0].data.netUsd) : 1;
   const poolX = BUBBLE_W / 2;
@@ -379,8 +360,8 @@ export function walletsVals(app, sel) {
     y: poolY,
     r: POOL_R,
     label: ticker.slice(0, 7),
-    netC: netColor(flow.netUsd),
-    net: signed(flow.netUsd),
+    netC: netColor(netFlow),
+    net: signed(netFlow),
   };
 
   // A co-entry group is drawn as an enclosing HALO, not as spokes.
@@ -442,8 +423,8 @@ export function walletsVals(app, sel) {
       // What the background service has learned about this wallet everywhere
       // else, over every sample since it started - not just in this window.
       history: (() => {
-        const p = walletProfile(r.address);
-        if (!p || (p.tokensTouched <= 1 && !p.clusterHits)) return null;
+        const p = history[r.address];
+        if (!p) return null;
         const parts = [];
         if (p.tokensTouched > 1) parts.push(p.tokensTouched + ' tokens seen');
         if (p.clusterHits) parts.push(p.clusterHits + '× co-entry');
@@ -506,15 +487,16 @@ export function walletsVals(app, sel) {
     };
   });
 
-  // Which of the user's tracked wallets turned up in THIS token.
-  const seenHere = new Set(source.rows.map((r) => r.address.toLowerCase()));
+  // Which of the user's tracked wallets turned up in THIS token: TRACKED HERE.
+  const hereBy = new Map((boardValue('TRACKED HERE') || []).map((h) => [h.address, h]));
   const trackedHere = tracked.map((t) => {
-    const hit = source.rows.find((r) => r.address.toLowerCase() === t.address.toLowerCase());
+    const hit = hereBy.get(t.address);
+    const here = Boolean(hit && hit.here);
     return {
       ...t,
-      here: seenHere.has(t.address.toLowerCase()),
-      detail: hit ? signed(hit.netUsd) + ' · ' + hit.buys + ' buys / ' + hit.sells + ' sells' : 'not in this window',
-      detailC: hit ? netColor(hit.netUsd) : UNAVAILABLE,
+      here,
+      detail: here ? signed(hit.netUsd) + ' · ' + hit.buys + ' buys / ' + hit.sells + ' sells' : 'not in this window',
+      detailC: here ? netColor(hit.netUsd) : UNAVAILABLE,
     };
   });
 
@@ -552,23 +534,25 @@ export function walletsVals(app, sel) {
       coverageTxt: quality.measured + ' of ' + quality.total + ' checks measurable',
     },
 
+    // Raw figures for the dashboard window's split bar and chips.
+    flowSplit: { buyers: buyers || 0, sellers: sellers || 0, netUsd: netFlow },
+    coEntryCount: coEntry || 0,
+
     walletStats: [
-      stat('ACTIVE WALLETS', w.wallets, '#ffffff',
+      stat('ACTIVE WALLETS', activeWallets, '#ffffff',
         flow.onceOnlyPct === null ? '' : flow.onceOnlyPct + '% traded once'),
-      stat('NET FLOW', flow.netUsd === null ? null : signed(flow.netUsd), netColor(flow.netUsd),
+      stat('NET FLOW', netFlow === null ? null : signed(netFlow), netColor(netFlow),
         flow.buySharePct === null ? '' : flow.buySharePct + '% of volume was buys'),
-      stat('BUYERS / SELLERS', flow.buyerWallets + ' / ' + flow.sellerWallets, '#4d8dff',
+      stat('BUYERS / SELLERS', buyers + ' / ' + sellers, '#4d8dff',
         'distinct wallets each side'),
-      stat('TOP WALLET SHARE', flow.topWalletSharePct === null ? null : flow.topWalletSharePct + '%',
-        flow.topWalletSharePct >= 25 ? '#ff4fae' : '#c6d1ea', 'of window volume'),
-      stat('CO-ENTRY WALLETS', counts.coEntry, counts.coEntry ? '#ff4fae' : '#4fd6c1',
+      stat('TOP WALLET SHARE', topShare === null ? null : topShare + '%',
+        topShare >= 25 ? '#ff4fae' : '#c6d1ea', 'of window volume'),
+      stat('CO-ENTRY WALLETS', coEntry, coEntry ? '#ff4fae' : '#4fd6c1',
         source.clusters.length + (source.clusters.length === 1 ? ' burst' : ' bursts')),
     ],
 
     walletFilters: FILTERS.map((f) => {
-      const n = f.key === 'ALL'
-        ? source.rows.filter((r) => !r.isPool).length
-        : source.rows.filter((r) => !r.isPool && r.tags.includes(f.key)).length;
+      const n = groups[f.key] || 0;
       return {
         ...f, count: n, active: (st.walletFilter || 'ALL') === f.key,
         pick: () => app.setState({ walletFilter: f.key }),
@@ -622,8 +606,8 @@ export function walletsVals(app, sel) {
     // A reference for what the areas mean. Without it the sizes are only
     // relative to each other and the reader has to hover to calibrate.
     bubbleScale: (() => {
-      const top = bubbleSource.length
-        ? Math.max(...bubbleSource.map((r) => r.grossUsd)) : 0;
+      // The head of the turnover ranking is the largest drawn.
+      const top = bubbleSource.length ? bubbleSource[0].grossUsd : 0;
       if (!top) return null;
       return [1, 0.25, 0.0625].map((f) => ({
         // Radius on the same sqrt curve the bubbles use, so the swatch is the
@@ -686,16 +670,15 @@ export function walletsVals(app, sel) {
     // open, so the user should be able to see that it is working and how far
     // its coverage currently reaches.
     intelLine: (() => {
-      const s = walletIntelStatus();
+      const s = boardValue('WALLET INTEL') || {};
       if (!s.running) return 'Background wallet service is not running.';
       return s.poolsHeld + ' pools watched · ' + s.walletsKnown.toLocaleString() +
         ' wallets in memory · ' + s.clusters + ' clusters logged · refreshed ' +
         ago(s.lastTickAt);
     })(),
-    intelLive: walletIntelStatus().running && !walletIntelStatus().lastError,
-    // Clusters found on OTHER tokens while this tab was closed.
-    elsewhereClusters: recentClusters({ limit: 6, minConfidence: 'medium' })
-      .filter((c) => c.poolAddress !== sel.poolAddress)
+    intelLive: Boolean((boardValue('WALLET INTEL') || {}).running && !(boardValue('WALLET INTEL') || {}).lastError),
+    // Clusters found on OTHER tokens while this tab was closed: CLUSTERS ELSEWHERE.
+    elsewhereClusters: (boardValue('CLUSTERS ELSEWHERE') || [])
       .map((c) => ({
         key: c.id,
         sym: c.symbol ? '$' + c.symbol : c.poolAddress.slice(0, 6),

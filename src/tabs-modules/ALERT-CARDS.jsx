@@ -1,246 +1,47 @@
 import React from 'react';
-import { stageInfo, chainColor } from '../utils/formatters';
-import {
-  ALERT_CLASSES, EVIDENCE_FAMILIES, RESOLUTIONS,
-  strengthOf, combineConfidence, validateAlert,
-  constitutingRisk, valueFromPenalty
-} from '../calculations/alert-schema';
-import { journalFor } from '../services/score-journal';
-import { chainKeys } from '../data/chains';
+import { chainColor, signalInfo } from '../utils/formatters';
+import { ALERT_CLASSES, strengthOf, boardValue, boardNote } from '../flow/board-flow';
 
 /**
  * What the bot would actually have sent, grouped by the claim it makes.
  *
- * Three columns, three classes. OPPORTUNITY is the score model as before.
- * RISK fires off the risk families directly, because a token that looks like
- * a rug scores LOW - if risk only ever subtracted from the opportunity score
- * the worst tokens would be the quietest ones. RESOLUTION closes prior alerts
- * out of the score journal.
- *
- * Nothing here is composed. Every evidence line is what a family reported and
- * every card carries the condition that would prove it wrong.
+ * The cards are the DATA FLOW's ALERT ENGINE box (flow/board-flow.js): which
+ * tokens alert, their evidence families, confidence and invalidations are
+ * all computed there, from the model's own call. This tab only lays them out.
  */
 
-const OPP_HORIZON_MS = 6 * 3600e3;
-const RISK_HORIZON_MS = 4 * 3600e3;
-
-/** Which risk family each existing risk-flag code belongs to. */
-const FLAG_FAMILY = {
-  CONTRACT_CHECKS: 'contract',
-  THIN_LIQUIDITY: 'liquidity',
-  EXTREME_TURNOVER: 'liquidity',
-  VOLUME_CONCENTRATED: 'holders',
-  LOW_ORGANIC_FLOW: 'integrity',
-  SINGLE_SOURCE: 'integrity',
-  NEW_POOL: 'integrity'
+const EMPTY = {
+  OPPORTUNITY: () => 'No token is a BUY right now: nothing is waking with a high enough EARLY and clean safety checks.',
+  EXIT: () => 'No token is PEAKING right now, so no SELL or SHORT alert would have been sent.',
+  RISK: () => 'No token has two independent risk families above 60. Only contract, liquidity and holders can constitute a risk claim today — deployer history is not wired, and integrity moves confidence rather than the claim.',
+  RESOLUTION: (plan) => 'No BUY call has hit its target, its stop or its ' + plan.horizonHours + 'h horizon yet.',
 };
+const COLUMN_LABEL = { OPPORTUNITY: 'BUY', EXIT: 'EXIT', RISK: 'RISK', RESOLUTION: 'RESOLUTION' };
 
-const familySpec = (key) => EVIDENCE_FAMILIES.find((f) => f.key === key);
-
-/**
- * An opportunity family, averaged over the score components it owns.
- * Confidence is how much of the family actually reported - a family speaking
- * from one of its three inputs is not as sure as one speaking from all three.
- */
-function opportunityFamily(row, key) {
-  const spec = familySpec(key);
-  const owned = (row.scoreModel || []).filter((c) => spec.components.indexOf(c.key) !== -1);
-  const live = owned.filter((c) => !c.pending && c.value != null);
-  if (!live.length) return { key, label: spec.label, value: null, confidence: 0, evidence: null };
-
-  const weight = live.reduce((t, c) => t + c.weight, 0);
-  const value = Math.round(live.reduce((t, c) => t + c.value * c.weight, 0) / (weight || 1));
-  const lead = live.slice().sort((x, y) => (y.value * y.weight) - (x.value * x.weight))[0];
+/** One alert from the engine, dressed for its card. */
+function cardOf(a) {
+  const si = a.stage ? signalInfo(a.stage) : null;
+  const look = a.cls === 'RISK' ? { stageBg: '#45103a', stageFg: '#ff4fae' }
+    : a.cls === 'RESOLUTION' ? { stageBg: '#1a2440', stageFg: a.outcome === 'CONFIRMED' ? '#4d8dff' : '#ff4fae' }
+      : { stageBg: si.bg, stageFg: si.fg };
   return {
-    key, label: spec.label, value,
-    confidence: owned.length ? live.length / owned.length : 0,
-    evidence: lead && lead.evidence ? lead.evidence : lead.label + ' scored ' + lead.value
+    ...a, ...look,
+    accent: ALERT_CLASSES[a.cls].accent,
+    chainColor: chainColor(a.chain),
+    ts: new Date(a.at).toISOString().slice(11, 19),
   };
 }
 
-/** A risk family, built from the flags that fired inside it. */
-function riskFamilies(row) {
-  const byFamily = {};
-  for (const flag of row.riskFlags || []) {
-    const key = FLAG_FAMILY[flag.code];
-    if (!key) continue;
-    const value = valueFromPenalty(flag.penalty);
-    const current = byFamily[key];
-    if (!current || value > current.value) {
-      byFamily[key] = {
-        key, label: familySpec(key).label, value,
-        confidence: flag.severity === 'HIGH' ? 0.8 : 0.55,
-        evidence: flag.detail || flag.code
-      };
-    }
-  }
-  return Object.keys(byFamily).map((k) => byFamily[k]);
-}
-
-export function alertsVals(app) {
-  const assets = app.assets || [];
-  const now = Date.now();
-
-  /* ---------------------------------------------------------- opportunity */
-
-  const opportunities = assets
-    .filter((a) => a.stage >= 3 && a.score != null)
-    .sort((x, y) => y.score - x.score)
-    .slice(0, 4)
-    .map((a) => {
-      const row = a.rawServerRow || {};
-      const si = stageInfo(a.stage);
-      const families = ['flow', 'breadth', 'liquidity', 'rotation', 'integrity']
-        .map((k) => opportunityFamily(row, k))
-        .filter((f) => f.value != null);
-
-      const floor = a.stage >= 4 ? 85 : 70;
-      return {
-        cls: 'OPPORTUNITY', accent: ALERT_CLASSES.OPPORTUNITY.accent,
-        stage: si.n, stageBg: si.bg, stageFg: si.fg,
-        sym: a.sym, chain: a.chain, chainColor: chainColor(a.chain),
-        claim: si.n + ' on ' + a.sym + ' — score ' + a.score + ' across ' +
-          families.length + ' independent famil' + (families.length === 1 ? 'y' : 'ies') + '.',
-        families,
-        conf: a.conf == null ? combineConfidence(families) : a.conf,
-        invalidations: [
-          'score falls below ' + floor + ' within ' + (OPP_HORIZON_MS / 3600e3) + 'h',
-          'liquidity drops under $50K before the horizon'
-        ],
-        horizon: (OPP_HORIZON_MS / 3600e3) + 'h',
-        ts: new Date(Number.isFinite(row.stageSince) ? row.stageSince : now)
-          .toISOString().slice(11, 19),
-        id: 'alert ' + String(row.tokenAddress || a.id).slice(0, 8),
-        slug: String(a.sym || '').replace(/^\$/, '').toLowerCase()
-      };
-    });
-
-  /* ----------------------------------------------------------------- risk */
-
-  const risks = assets
-    .map((a) => {
-      const row = a.rawServerRow || {};
-      const families = riskFamilies(row);
-      // Integrity is shown but never counts toward the trigger - see the
-      // schema. Coverage and immaturity move confidence, not the claim.
-      const firing = constitutingRisk(families);
-      return { a, row, families, firing };
-    })
-    // The schema's own rule: two independent risk families, not one.
-    .filter((r) => r.firing.length >= 2)
-    .sort((x, y) => y.firing.length - x.firing.length ||
-      (y.row.riskPenalty || 0) - (x.row.riskPenalty || 0))
-    .slice(0, 4)
-    .map(({ a, row, families, firing }) => {
-      const worst = firing.slice().sort((x, y) => y.value - x.value)[0];
-      return {
-        cls: 'RISK', accent: ALERT_CLASSES.RISK.accent,
-        stage: null, stageBg: '#45103a', stageFg: '#ff4fae',
-        sym: a.sym, chain: a.chain, chainColor: chainColor(a.chain),
-        claim: firing.length + ' independent risk families fired on ' + a.sym +
-          ' — led by ' + worst.label.toLowerCase() + '.',
-        families,
-        conf: combineConfidence(firing),
-        invalidations: firing.map((f) => f.label.toLowerCase() + ' clears within ' +
-          (RISK_HORIZON_MS / 3600e3) + 'h'),
-        horizon: (RISK_HORIZON_MS / 3600e3) + 'h',
-        ts: new Date(now).toISOString().slice(11, 19),
-        id: 'alert ' + String(row.tokenAddress || a.id).slice(0, 8),
-        slug: String(a.sym || '').replace(/^\$/, '').toLowerCase()
-      };
-    });
-
-  /* ----------------------------------------------------------- resolution */
-
-  // Symbols for tokens that may have left the live table since they alerted.
-  const symbolFor = {};
-  for (const a of assets) {
-    const addr = (a.rawServerRow || {}).tokenAddress;
-    if (addr) symbolFor[addr] = a.sym;
-  }
-
-  const resolutions = [];
-  for (const chainKey of chainKeys) {
-    const journal = journalFor(chainKey);
-    for (const addr of Object.keys(journal)) {
-      const series = journal[addr] || [];
-      if (series.length < 2) continue;
-
-      const alerted = series.findIndex((m) => m.stage >= 3);
-      if (alerted === -1) continue;
-      const opened = series[alerted];
-      const latest = series[series.length - 1];
-      const elapsed = latest.t - opened.t;
-
-      let outcome = null;
-      if (latest.stage < 3) outcome = RESOLUTIONS.INVALIDATED;
-      else if (elapsed >= OPP_HORIZON_MS) outcome = RESOLUTIONS.CONFIRMED;
-      if (!outcome) continue;
-
-      const delta = latest.score - opened.score;
-      resolutions.push({
-        cls: 'RESOLUTION', accent: ALERT_CLASSES.RESOLUTION.accent,
-        stage: null, stageBg: '#1a2440',
-        stageFg: outcome === RESOLUTIONS.CONFIRMED ? '#4d8dff' : '#ff4fae',
-        outcome: outcome.toUpperCase(),
-        sym: symbolFor[addr] || ('$' + addr.slice(0, 4).toUpperCase()),
-        chain: chainKey.toUpperCase().slice(0, 4),
-        chainColor: chainColor(chainKey.toUpperCase().slice(0, 4)),
-        claim: outcome === RESOLUTIONS.CONFIRMED
-          ? 'Held ' + stageInfo(Math.max(3, latest.stage)).n + ' through the ' +
-            (OPP_HORIZON_MS / 3600e3) + 'h horizon.'
-          : 'Fell out of CONFIRMED after ' + (elapsed / 3600e3).toFixed(1) + 'h.',
-        families: [{
-          key: 'flow', label: 'Score path', value: Math.max(0, Math.min(100, latest.score)),
-          confidence: 0.9,
-          evidence: 'Opened at ' + opened.score + ', now ' + latest.score +
-            ' (' + (delta >= 0 ? '+' : '') + delta + ') over ' +
-            (elapsed / 3600e3).toFixed(1) + 'h'
-        }],
-        conf: 0.9,
-        invalidations: ['resolved — the journal is the record, nothing further to check'],
-        horizon: 'closed',
-        sortT: latest.t,
-        ts: new Date(latest.t).toISOString().slice(11, 19),
-        id: 'alert ' + addr.slice(0, 8),
-        slug: addr.slice(0, 8)
-      });
-    }
-  }
-  resolutions.sort((x, y) => y.sortT - x.sortT);
-
-  /* ----------------------------------------------------------- validation */
-
-  // The contract is enforced here, not assumed. A card that fails validation
-  // is a bug in this file, and the column footer says so rather than hiding it.
-  const invalid = [];
-  for (const card of [...opportunities, ...risks, ...resolutions]) {
-    const check = validateAlert({
-      id: card.id, class: card.cls, claim: card.claim,
-      families: card.families, invalidations: card.invalidations
-    });
-    if (!check.ok) invalid.push(card.id + ': ' + check.problems[0]);
-  }
-
-  const columns = [
-    {
-      key: 'OPPORTUNITY', label: 'OPPORTUNITY', accent: ALERT_CLASSES.OPPORTUNITY.accent,
-      cards: opportunities,
-      empty: 'Nothing is at CONFIRMED or above right now, so no opportunity alert would have been sent.'
-    },
-    {
-      key: 'RISK', label: 'RISK', accent: ALERT_CLASSES.RISK.accent,
-      cards: risks.slice(0, 4),
-      empty: 'No token has two independent risk families above 60. Only contract, liquidity and holders can constitute a risk claim today — deployer history is not wired, and integrity moves confidence rather than the claim.'
-    },
-    {
-      key: 'RESOLUTION', label: 'RESOLUTION', accent: ALERT_CLASSES.RESOLUTION.accent,
-      cards: resolutions.slice(0, 4),
-      empty: 'No prior alert has reached its horizon yet. Resolutions appear once a scored token has been tracked for ' + (OPP_HORIZON_MS / 3600e3) + 'h.'
-    }
-  ];
-
-  return { alertColumns: columns, alertInvalid: invalid };
+export function alertsVals() {
+  const engine = boardValue('ALERT ENGINE');
+  const note = boardNote('ALERT ENGINE') || {};
+  const plan = note.plan || { horizonHours: 24 };
+  const columns = engine ? Object.keys(COLUMN_LABEL).map((key) => ({
+    key, label: COLUMN_LABEL[key], accent: ALERT_CLASSES[key].accent,
+    cards: (engine[key] || []).map(cardOf),
+    empty: EMPTY[key](plan),
+  })) : [];
+  return { alertColumns: columns, alertInvalid: note.invalid || [] };
 }
 
 /* ============================================================ the cards ==== */
@@ -329,7 +130,8 @@ function AlertCard({ c, css, ping }) {
 
 export default function AlertCards({ v, css }) {
   const columns = v.alertColumns || [];
-  const total = columns.reduce((t, col) => t + col.cards.length, 0);
+  // The DATA FLOW's ALERTS NOW box.
+  const total = v.alertsNow || 0;
 
   return v.isAlerts && <>
     <div data-screen-label="Alert cards" style={css("flex:1;overflow:auto;padding:12px 14px;min-height:0", { v })}>

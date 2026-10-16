@@ -1,17 +1,17 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
 import { getSetting, setSetting, clearSetting, subscribeSettings, applyFilter, filterSetting, FILTER_MODES } from './box-settings';
-import { activeFlow, activeFlowId, updateFlow, subscribeFlows, DEFAULT_FLOW, flowHistoryVersion, undoFlow, redoFlow } from './flow-store';
+import { activeFlow, activeFlowId, updateFlow, subscribeFlows, DEFAULT_FLOW, flowHistoryVersion, undoFlow, redoFlow, isEngineProfile } from './flow-store';
 import { userWires as applyUserWires } from '../flow/wires';
 import { WIRE_TYPES, typeOfValue, showValue, describeValue, coerce } from '../flow/types';
-import { boardValues } from '../flow/board-flow';
+import { boardValues, BOARD_TYPES } from '../flow/board-flow';
 import { NODE_TYPES } from '../flow/score-flow';
-import { buildGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, STORES, STAGES, CONNECTOR_W, CONNECTOR_H } from './graph';
+import { buildGraph, focusGraph, collapse, layout, PAGE_TITLES, PAGE_COLORS, KIND_COLORS, STORES, STAGES, CONNECTOR_W, CONNECTOR_H } from './graph';
 import { C, WorkedSteps } from './Explain';
 import { fieldValues } from './provenance';
 import {
   ROOT, ENGINE, loadConfig, saveConfig, emptyConfig, hierarchy, viewGraph, orderPortsLikeInside, portPoint, sketchEdges,
-  rowsTop,
+  rowsTop, DEFAULT_ENGINES,
 } from './engines';
 
 /**
@@ -148,6 +148,7 @@ const wireOf = (n) => {
 /** The type a box SENDS, declared: the engine's, else its box type's. */
 const declaredType = (id, meta) => {
   if (NODE_TYPES[id]) return NODE_TYPES[id];
+  if (BOARD_TYPES[id]) return BOARD_TYPES[id];
   const n = meta && meta.kind ? meta : null;
   if (!n) return null;
   if (n.kind === 'file' || n.kind === 'store' || n.kind === 'provider' || n.kind === 'panel') return 'dict';
@@ -898,10 +899,11 @@ function SelectorBody({ spec, v, col }) {
         style={{ width: '100%', boxSizing: 'border-box', background: '#0d1730', color: C.text, border: `1px solid ${C.border}`,
           borderRadius: 5, padding: '4px 7px', fontFamily: 'inherit', fontSize: 9.5, outline: 'none', marginBottom: 4 }} />
       <div ref={listRef} data-card="1" style={{ maxHeight: 200, overflowY: 'auto', border: `1px solid ${C.line}`, borderRadius: 5 }}>
-        {shown.map((o) => {
+        {shown.map((o, i) => {
           const on = o.id === selected;
+          // The same token can be listed twice (two pools): the row index keeps keys unique.
           return (
-            <div key={o.id} data-picked={on ? '1' : '0'} onClick={() => spec.pick(v, o.id)} style={{
+            <div key={o.id + '|' + i} data-picked={on ? '1' : '0'} onClick={() => spec.pick(v, o.id)} style={{
               display: 'flex', alignItems: 'baseline', gap: 6, padding: '3px 7px', cursor: 'pointer',
               background: on ? col + '22' : 'transparent', borderLeft: `2px solid ${on ? col : 'transparent'}`,
             }}>
@@ -1312,6 +1314,17 @@ function CalcBox({ n, pos, col, dim, isSel, isNear, inGroup, onMouseDown, onClic
         <span style={{ flex: 1, minWidth: 0, fontSize: 9.5, fontWeight: 800, letterSpacing: 0.5, color: '#e7edff',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.label}</span>
         {f.weight && <span title="its weight in the score" style={{ fontSize: 8.5, color: C.faint }}>{f.weight}</span>}
+        {(() => {
+          // How this box's value related to the trade that followed - the
+          // report card (services/model-eval.js). Absent until it has run.
+          const m = live(f.measured);
+          if (!m) return null;
+          const tone = m.tone === 'good' ? '#4ade80' : m.tone === 'bad' ? WIRE_BAD : C.faint;
+          return (
+            <span title={m.title} style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.4, color: tone, fontFamily: MONO_STACK,
+              padding: '1px 5px', borderRadius: 6, border: `1px solid ${tone}66`, cursor: 'help', whiteSpace: 'nowrap' }}>{m.text}</span>
+          );
+        })()}
         {alert && (
           <span title={alert.join('\n')} style={{ fontSize: 7.5, fontWeight: 800, letterSpacing: 0.6, color: WIRE_BAD,
             padding: '1px 5px', borderRadius: 6, border: `1px solid ${WIRE_BAD}88`, cursor: 'help' }}>MISSING DATA</span>
@@ -1701,7 +1714,16 @@ export default function FlowChart({ v }) {
   // what. That changes when a generated group gains a card, not on every
   // poll - so it is rebuilt on a slow timer rather than on every render, and
   // the drawer reads live values straight off the viewmodel instead.
-  const rebuild = React.useCallback(() => setFull(buildGraph(liveV.current)), []);
+  // An ENGINE profile draws its own engine's chain (graph.js focusGraph);
+  // ALL BOXES shows the whole map again.
+  const [allBoxes, setAllBoxes] = React.useState(false);
+  const allBoxesRef = React.useRef(false);
+  allBoxesRef.current = allBoxes;
+  const rebuild = React.useCallback(() => {
+    const g = buildGraph(liveV.current);
+    setFull(isEngineProfile(activeFlowId()) && !allBoxesRef.current ? focusGraph(g) : g);
+  }, []);
+  React.useEffect(() => { rebuild(); }, [allBoxes, rebuild]);
   React.useEffect(() => {
     rebuild();
     const t = setInterval(rebuild, 10000);
@@ -1749,6 +1771,9 @@ export default function FlowChart({ v }) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+  // A profile wires SIGNAL to its own engine (pipeline.js ENGINES), so the
+  // graph itself is rebuilt on a switch, not only the user's layer.
+  React.useEffect(() => { rebuild(); }, [flowId, rebuild]);
   React.useEffect(() => subscribeFlows(() => {
     const id = activeFlowId();
     setFlowId((cur) => {
@@ -1963,7 +1988,16 @@ export default function FlowChart({ v }) {
   }, [full, expanded, cfg]);
   const base = edited ? edited.base : null;
   const missingOf = (id) => (edited && edited.missing.has(id) ? Array.from(edited.missing.get(id)) : null);
-  const H = React.useMemo(() => (base ? hierarchy(cfg, base.nodes) : null), [base, cfg]);
+  // An engine profile's map is drawn open: the step containers (SOURCES,
+  // MEASURES, ENGINES...) are unfolded so the top level IS the engine's chain,
+  // its own engine group and stores still grouped.
+  const H = React.useMemo(() => {
+    if (!base) return null;
+    if (!(full && full.focused)) return hierarchy(cfg, base.nodes);
+    const removed = { ...cfg.removed };
+    DEFAULT_ENGINES.forEach((d) => { if (d.id !== 'eng:history') removed[d.id] = true; });
+    return hierarchy({ ...cfg, removed }, base.nodes);
+  }, [base, cfg, full]);
   const brokenGroups = React.useMemo(() => {
     const m = new Map();
     if (!edited || !H) return m;
@@ -1981,7 +2015,9 @@ export default function FlowChart({ v }) {
   // written once, when the flow is first opened - from then on the flow no
   // longer follows the default's rules, it is its own.
   React.useEffect(() => {
-    if (!base || !H || flowId === DEFAULT_FLOW) return;
+    // An ENGINE profile is built in code, like DEFAULT: it follows the code's
+    // arrangement and keeps only what the user changed.
+    if (!base || !H || flowId === DEFAULT_FLOW || isEngineProfile(flowId)) return;
     if (activeFlow().arrangement) return;
     const assign = {};
     base.nodes.forEach((n) => { assign[n.id] = H.parentOf(n.id); });
@@ -2779,6 +2815,12 @@ export default function FlowChart({ v }) {
             )}
             {pickedWire && (
               <Button onClick={() => deleteWire(pickedWire)} active title="or press Delete">DELETE WIRE</Button>
+            )}
+            {isEngineProfile(flowId) && (
+              <Button onClick={() => setAllBoxes((x) => !x)} active={!allBoxes}
+                title={allBoxes ? 'draw only what this engine’s call is made of' : 'draw every box, not only this engine’s'}>
+                {allBoxes ? 'THIS ENGINE ONLY' : 'ALL BOXES'}
+              </Button>
             )}
             {cfgTouched && (
               <Button onClick={() => {

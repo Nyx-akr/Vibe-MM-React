@@ -4,8 +4,8 @@
  * The DATA FLOW map is the app's wiring, not a picture of it: a box deleted
  * or a wire cut on the map (in the active flow) cuts the data off downstream,
  * exactly as the map draws it in red - and a DASHBOARD ITEM that no longer
- * receives its data shows nothing in the app. Cut FINAL from the board's
- * SCORE and the score disappears from the board and the navbar.
+ * receives its data shows nothing in the app. Cut SIGNAL from the board's
+ * SIGNAL and the call disappears from the board and the navbar.
  *
  * This is the same propagation FlowChart.jsx draws (its `edited` memo): from
  * every deleted box and every cut wire, everything downstream is missing.
@@ -17,6 +17,7 @@ import { hierarchy } from '../admin/engines.js';
 import { userWires } from './wires';
 import { coerce } from './types';
 import { boardValues } from './board-flow';
+import { connectFlow } from './score-flow';
 
 let cache = { key: null, missing: new Set(), cut: new Set(), reroute: new Map() };
 
@@ -80,7 +81,7 @@ const isCut = (tab, panel, label) => cutItems().has(item(tab, panel, label));
  * on every token, which every view of it then shows as '—'.
  */
 const BOARD_FIELDS = [
-  ['SCORE', ['score']], ['CONF', ['conf']], ['PRICE', ['price']], ['DELTA 5M', ['chg']],
+  ['SIGNAL', ['signal', 'signalRank']], ['PHASE', ['phase']], ['CONF', ['conf']], ['PRICE', ['price']], ['DELTA 5M', ['chg']],
   ['LIQUIDITY', ['liq']], ['VOL 5M', ['vol', 'adj']], ['WASH', ['wash']], ['BUYERS', ['buyers']],
   ['AGE', ['age']],
 ];
@@ -132,12 +133,19 @@ export function gateStats(stats) {
   });
 }
 
-/** The token detail's score numbers as the flow delivers them. */
+/** The token detail's call and EARLY numbers as the flow delivers them. */
 export function gateDetail(d) {
   if (!d || !cutItems().size) return d;
   const next = { ...d };
-  if (isCut('TOKEN DETAIL', 'SCORE DECOMPOSITION', 'FINAL') || isCut('TOKEN DETAIL', 'SCORE', 'SCORE GAUGE')) next.score = '—';
-  if (isCut('TOKEN DETAIL', 'SCORE DECOMPOSITION', 'RAW')) next.raw = '—';
-  if (isCut('TOKEN DETAIL', 'SCORE DECOMPOSITION', 'RISK PENALTY')) next.penalty = '—';
+  if (isCut('TOKEN DETAIL', 'EARLY INPUTS', 'EARLY') || isCut('TOKEN DETAIL', 'SCORE', 'EARLY')) next.score = '—';
+  if (isCut('TOKEN DETAIL', 'EARLY INPUTS', 'EARLY RAW')) next.raw = '—';
+  if (isCut('TOKEN DETAIL', 'SCORE', 'SIGNAL')) next.signal = null;
+  if (isCut('TOKEN DETAIL', 'SCORE', 'CYCLE GAUGE')) next.phase = null;
+  if (isCut('TOKEN DETAIL', 'TRADE PLAN · SAFETY', 'TRADE PLAN')) next.plan = null;
   return next;
 }
+
+// The model runs with the map's edits: what is deleted or cut produces
+// nothing, what is re-fed reads its new source (flow/score-flow.js). Read
+// lazily - board-flow imports this file, so its exports may not exist yet.
+connectFlow({ missingIds: () => missingIds(), reroutes: () => reroutes(), boardValues: () => boardValues() });

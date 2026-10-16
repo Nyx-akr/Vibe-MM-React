@@ -194,7 +194,7 @@ export const PAGES = {
           evidence: c.window,
           note: c.drawnNote,
           feeds: [ref('market', 'MEASURED ROTATION')],
-          where: 'services/rotation-intel.js rotationGraphFor()',
+          where: 'flow/board-flow.js MARKET ROTATION',
         })),
       },
       {
@@ -208,7 +208,7 @@ export const PAGES = {
             note: 'It polls nothing of its own - it rides the wallet sample, so the coverage ' +
               'of that sampler is the ceiling on everything this tab can see.',
             feeds: [ref('market', 'MEASURED ROTATION'), ref('rotation', 'ROTATION SERVICE')],
-            where: 'services/rotation-intel.js rotationIntelStatus()',
+            where: 'flow/board-flow.js ROTATION SERVICE',
           },
         ],
       },
@@ -487,7 +487,7 @@ export const PAGES = {
   health: {
     title: 'SYSTEM HEALTH',
     blurb: 'One verdict, the seven parts it is made of, and the detail behind each. Every ' +
-      'level is judged in calculations/system-health.js from what the collector reports ' +
+      'level is judged in flow/board-flow.js SYSTEM HEALTH from what the collector reports ' +
       'about itself and what the browser services report - nothing on the tab is a constant.',
     groups: [
       {
@@ -500,7 +500,7 @@ export const PAGES = {
               op('\u00b7 "unknown" never raises it'),
               op('\u00b7 only the critical source group ( market data ) may reach down')],
             feeds: [],
-            where: 'calculations/system-health.js systemHealth()',
+            where: 'flow/board-flow.js SYSTEM HEALTH systemHealth()',
           },
         ],
       },
@@ -520,10 +520,10 @@ export const PAGES = {
             files: [api('/raw/system.json', 'raw.failing'), op('- a file failing lately with no good write since')],
             archive: [api('/raw/system.json', 'store.health.level')],
             browser: [op('walletIntelStatus(), socialIntelStatus(), rotationIntelStatus(), storageStats()')],
-          }[part.key] || [op('see system-health.js')],
+          }[part.key] || [op('see flow/board-flow.js SYSTEM HEALTH')],
           note: part.problems && part.problems.length ? part.problems.join(' · ') : undefined,
           feeds: [],
-          where: 'calculations/system-health.js',
+          where: 'flow/board-flow.js SYSTEM HEALTH',
         })),
       },
       {
@@ -553,10 +553,10 @@ export const PAGES = {
               return s ? s.detail : '—';
             },
             calc: [op('chains held and pools connected by'), ref('rotation', 'ROTATION SERVICE')],
-            note: 'If it stalls, every panel reading rotationForPool() goes quietly stale and ' +
+            note: 'If it stalls, every panel reading TOKEN ROTATION goes quietly stale and ' +
               'nothing else would say so.',
             feeds: [ref('rotation', 'NET ROTATION')],
-            where: 'services/rotation-intel.js rotationIntelStatus()',
+            where: 'flow/board-flow.js ROTATION SERVICE',
           },
         ],
       },
@@ -568,14 +568,14 @@ export const PAGES = {
             value: (v) => (v.health && v.health.resources ? v.health.resources.historyPools : '—'),
             calc: [api('/raw/system.json', 'cache.historyPools')],
             feeds: [],
-            where: 'calculations/system-health.js resources',
+            where: 'flow/board-flow.js SYSTEM HEALTH resources',
           },
           {
             label: 'ARCHIVE', status: 'live',
             value: (v) => (v.health && v.health.resources ? v.health.resources.archiveBytes : '—'),
             calc: [api('/raw/system.json', 'store.usage.bytes')],
             feeds: [],
-            where: 'calculations/system-health.js resources',
+            where: 'flow/board-flow.js SYSTEM HEALTH resources',
           },
         ],
       },
